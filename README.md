@@ -24,6 +24,69 @@ dotnet run --project src/Gateway.Api   # serves /api/health
 dotnet test
 ```
 
+### Proxy-only dev mode (no database)
+
+With `GATEWAY_DB_CONNECTION` unset the gateway boots with an in-memory manifest
+seeded from the `Manifest` section of `appsettings.Development.json`, so you can
+develop the proxy without Postgres, Docker, or AWS:
+
+```json
+{
+  "Manifest": [
+    {
+      "Name": "svc-a",
+      "Image": "registry/svc-a",
+      "Tag": "latest",
+      "Port": 3001,
+      "DesiredStatus": "running",
+      "IncludeInHealth": true,
+      "UpdatedBy": "dev",
+      "UpdatedAt": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+Requests to `/svc-a/*` proxy to `http://svc-a:3001`; `/mgmt/*` returns 503
+until a Cognito authority is configured.
+
+## Configuration
+
+All settings are environment variables (or equivalent configuration keys); every
+feature degrades gracefully when its variable is unset, so a bare
+`dotnet run` always boots.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GATEWAY_DB_CONNECTION` | unset | Postgres connection string. Unset → in-memory manifest, DB features (fleet status, deploy history, leader election) inactive. |
+| `GATEWAY_RECONCILER_ENABLED` | `false` | Enable the node reconciler (requires the Docker socket). |
+| `GATEWAY_BOOTSTRAP_ENABLED` | `false` | Run the idempotent node-bootstrap pipeline at startup. |
+| `GATEWAY_COGNITO_AUTHORITY` | unset | Cognito issuer URL for the management plane. Unset → `/mgmt/*` returns 503. |
+| `GATEWAY_REDIS_ENDPOINT` | unset | Redis endpoint for the SignalR backplane. Unset → hub runs without a backplane (single instance). |
+| `GATEWAY_REDIS_SSL` | `true` | TLS for the Redis backplane connection. |
+| `GATEWAY_INTERNAL_BIND` | `0.0.0.0:8080` | Bind address of the internal listener hosting `POST /internal/publish` (never routed by the load balancer). |
+| `GATEWAY_INSTANCE_ID` | unset | Instance identity fallback when EC2 IMDS is unreachable (local dev). |
+| `GATEWAY_PRIVATE_IP` | unset | Private IP fallback for local dev. |
+| `GATEWAY_PUBLIC_IP` | unset | Public IP fallback for local dev. |
+
+`ASPNETCORE_URLS` controls the public listener as usual; under systemd,
+`NOTIFY_SOCKET`/`WATCHDOG_USEC` are provided by the unit for the watchdog
+self-check.
+
+## CI
+
+`.github/workflows/ci.yml`:
+
+- **test** — every push and pull request: restore, build, and run the full test
+  suite on .NET 10. The suite needs no Postgres, Docker, or AWS (all external
+  systems are faked), so forks and fresh clones pass out of the box.
+- **package** — pushes to `main` only, after tests pass: runs
+  `scripts/package.sh` to produce the self-contained `linux-arm64` tarball and
+  uploads it as a workflow artifact. If the `ARTIFACT_BUCKET` repo variable and
+  AWS credentials secrets are configured, the tarball is also synced to S3
+  (including a `gateway-api-latest.tar.gz` alias pulled by instance user-data);
+  otherwise that step is skipped and CI stays green.
+
 ## Packaging & deploy
 
 The gateway runs on the host via systemd (it manages Docker) and provisions the
@@ -44,4 +107,7 @@ Docker log-rotation config, ensures the internal network, logs in to the registr
 
 ## Status
 
-Phase 0 (scaffold) of the build plan in `docs/tech-spec.md` §10.
+Core build complete through §10 Phase 5 equivalents: proxy, health, reconciler,
+fleet status + leader election, real-time hub, management plane, packaging, CI.
+See [`docs/tech-spec.md`](docs/tech-spec.md) for the design; the ops dashboard
+lives at [gateway-api-admin](https://github.com/benjaminfkile/gateway-api-admin).

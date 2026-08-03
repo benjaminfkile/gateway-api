@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Test
+        run: dotnet test -c Release --no-build
+
+  package:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Package (linux-arm64 self-contained)
+        run: ./scripts/package.sh "${GITHUB_SHA::7}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-api-linux-arm64
+          path: artifacts/gateway-api-*.tar.gz
+          if-no-files-found: error
+
+      # Optional: sync the release tarball to the artifact bucket pulled by
+      # instance user-data. Skipped entirely when AWS credentials or the bucket
+      # variable are not configured, so forks and fresh clones stay green.
+      - name: Sync to S3
+        if: env.ARTIFACT_BUCKET != '' && env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != ''
+        run: |
+          TARBALL=$(ls artifacts/gateway-api-*.tar.gz)
+          aws s3 cp "$TARBALL" "s3://${ARTIFACT_BUCKET}/$(basename "$TARBALL")"
+          aws s3 cp "$TARBALL" "s3://${ARTIFACT_BUCKET}/gateway-api-latest.tar.gz"
