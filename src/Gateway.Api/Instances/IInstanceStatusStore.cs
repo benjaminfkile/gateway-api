@@ -15,6 +15,13 @@ public interface IInstanceStatusStore
     Task UpsertAsync(InstanceStatus status, CancellationToken ct = default);
 
     /// <summary>
+    /// All fleet rows, in no particular order. Read by the Management API to answer
+    /// fleet-wide queries (tech-spec §4.5) and by the leader to decide when a deploy
+    /// has converged everywhere.
+    /// </summary>
+    Task<IReadOnlyList<InstanceStatus>> GetAllAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Delete rows whose <see cref="InstanceStatus.HeartbeatAt"/> is strictly older
     /// than <paramref name="cutoff"/> (departed instances). Returns the number of
     /// rows removed. Leader-only duty.

@@ -1,6 +1,7 @@
 using Gateway.Api.Containers;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
+using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Microsoft.Extensions.DependencyInjection;
@@ -133,6 +134,11 @@ public sealed class ReconcilerService : BackgroundService
         // After converging, publish this instance's heartbeat + inventory so any
         // instance can answer fleet-wide queries (tech-spec §4.3, §4.4).
         await HeartbeatAsync(isLeader, ct);
+
+        // Close the deploy loop (tech-spec §4.5, §7): report this instance's
+        // per-deploy convergence and — as leader — mark a deploy done/partial once
+        // every live instance has converged.
+        await ReconcileDeployProgressAsync(isLeader, ct);
     }
 
     private async Task<bool> TryAcquireLeadershipAsync(CancellationToken ct)
@@ -195,6 +201,110 @@ public sealed class ReconcilerService : BackgroundService
             // A heartbeat failure must not crash the loop; the next tick retries.
             _logger.LogError(ex, "Failed to publish instance_status heartbeat");
         }
+    }
+
+    /// <summary>
+    /// Drive in-progress deploys toward completion (tech-spec §4.5, §7). Every
+    /// instance upserts its own <c>deploy_instance_status</c> row once it is running
+    /// the deploy's target digest; the leader then marks the <c>deploy_history</c>
+    /// row <c>done</c> when every live instance has converged, or <c>partial</c> when
+    /// a live instance has reported a failure. Optional: when no <see cref="IDeployStore"/>
+    /// is registered (DB-less box / minimal test host) this is a no-op.
+    /// </summary>
+    private async Task ReconcileDeployProgressAsync(bool isLeader, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var deployStore = scope.ServiceProvider.GetService<IDeployStore>();
+        if (deployStore is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var inProgress = await deployStore.ListInProgressAsync(ct);
+            if (inProgress.Count == 0)
+            {
+                return;
+            }
+
+            var identity = await _metadata.GetAsync(ct);
+            var containers = await _runtime.ListManagedContainersAsync(ct);
+
+            // This instance's running digest per canonical service name.
+            var running = containers
+                .Where(c => string.Equals(c.State, "running", StringComparison.OrdinalIgnoreCase))
+                .GroupBy(c => c.Name, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First().Digest, StringComparer.Ordinal);
+
+            foreach (var deploy in inProgress)
+            {
+                if (running.TryGetValue(deploy.Service, out var digest)
+                    && string.Equals(digest, deploy.ToDigest, StringComparison.Ordinal))
+                {
+                    await deployStore.UpsertInstanceStatusAsync(new DeployInstanceStatus
+                    {
+                        DeployId = deploy.Id,
+                        InstanceId = identity.InstanceId,
+                        Status = DeployInstanceState.Converged,
+                        UpdatedAt = DateTimeOffset.UtcNow,
+                    }, ct);
+                }
+            }
+
+            if (!isLeader)
+            {
+                return;
+            }
+
+            // Leader: complete deploys once the whole live fleet has converged.
+            var statusStore = scope.ServiceProvider.GetRequiredService<IInstanceStatusStore>();
+            var cutoff = DateTimeOffset.UtcNow - _options.InstanceStaleThreshold;
+            var live = (await statusStore.GetAllAsync(ct))
+                .Where(i => i.HeartbeatAt >= cutoff)
+                .ToList();
+
+            if (live.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var deploy in inProgress)
+            {
+                var converged = live.Count(i => InstanceRunsDigest(i, deploy.Service, deploy.ToDigest));
+                if (converged == live.Count)
+                {
+                    await MarkDeployAsync(deployStore, deploy, DeployStatus.Done, ct);
+                    continue;
+                }
+
+                var childStatuses = await deployStore.ListInstanceStatusesAsync(deploy.Id, ct);
+                if (childStatuses.Any(s => string.Equals(s.Status, DeployInstanceState.Failed, StringComparison.Ordinal)))
+                {
+                    await MarkDeployAsync(deployStore, deploy, DeployStatus.Partial, ct);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Deploy-progress bookkeeping must never crash the loop; retry next tick.
+            _logger.LogError(ex, "Failed to reconcile deploy progress");
+        }
+    }
+
+    private static bool InstanceRunsDigest(InstanceStatus instance, string service, string? digest)
+    {
+        return InstanceServicesJson.Parse(instance.Services).Any(e =>
+            string.Equals(e.Name, service, StringComparison.Ordinal)
+            && string.Equals(e.State, "running", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(e.Digest, digest, StringComparison.Ordinal));
+    }
+
+    private static Task MarkDeployAsync(IDeployStore store, DeployHistory deploy, string status, CancellationToken ct)
+    {
+        deploy.Status = status;
+        deploy.FinishedAt = DateTimeOffset.UtcNow;
+        return store.UpdateAsync(deploy, ct);
     }
 
     private async Task<IReadOnlyList<DesiredService>> BuildDesiredAsync(CancellationToken ct)

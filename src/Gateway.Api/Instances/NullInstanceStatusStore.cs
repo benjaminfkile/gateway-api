@@ -12,5 +12,8 @@ public sealed class NullInstanceStatusStore : IInstanceStatusStore
 {
     public Task UpsertAsync(InstanceStatus status, CancellationToken ct = default) => Task.CompletedTask;
 
+    public Task<IReadOnlyList<InstanceStatus>> GetAllAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<InstanceStatus>>(Array.Empty<InstanceStatus>());
+
     public Task<int> DeleteStaleAsync(DateTimeOffset cutoff, CancellationToken ct = default) => Task.FromResult(0);
 }
