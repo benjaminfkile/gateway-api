@@ -1,4 +1,6 @@
 using Gateway.Api.Containers;
+using Gateway.Api.Data;
+using Gateway.Api.Instances;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Microsoft.Extensions.DependencyInjection;
@@ -29,6 +31,8 @@ public sealed class ReconcilerService : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IReadinessProber _readinessProber;
     private readonly IReconcileReporter _reporter;
+    private readonly InstanceMetadataProvider _metadata;
+    private readonly ILeaderElection _leaderElection;
     private readonly ReconcilerOptions _options;
     private readonly ILogger<ReconcilerService> _logger;
 
@@ -39,6 +43,8 @@ public sealed class ReconcilerService : BackgroundService
         IServiceScopeFactory scopeFactory,
         IReadinessProber readinessProber,
         IReconcileReporter reporter,
+        InstanceMetadataProvider metadata,
+        ILeaderElection leaderElection,
         ReconcilerOptions options,
         ILogger<ReconcilerService> logger)
     {
@@ -48,6 +54,8 @@ public sealed class ReconcilerService : BackgroundService
         _scopeFactory = scopeFactory;
         _readinessProber = readinessProber;
         _reporter = reporter;
+        _metadata = metadata;
+        _leaderElection = leaderElection;
         _options = options;
         _logger = logger;
     }
@@ -108,6 +116,10 @@ public sealed class ReconcilerService : BackgroundService
     /// </summary>
     public async Task RunOnceAsync(CancellationToken ct = default)
     {
+        // Determine leadership up front: it is re-verified every loop and gates the
+        // fleet-wide duties in the heartbeat step below.
+        var isLeader = await TryAcquireLeadershipAsync(ct);
+
         var desired = await BuildDesiredAsync(ct);
         var actual = await _runtime.ListManagedContainersAsync(ct);
         var plan = ReconcilePlanner.Plan(desired, actual);
@@ -116,6 +128,72 @@ public sealed class ReconcilerService : BackgroundService
         {
             ct.ThrowIfCancellationRequested();
             await ExecuteAsync(action, ct);
+        }
+
+        // After converging, publish this instance's heartbeat + inventory so any
+        // instance can answer fleet-wide queries (tech-spec §4.3, §4.4).
+        await HeartbeatAsync(isLeader, ct);
+    }
+
+    private async Task<bool> TryAcquireLeadershipAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await _leaderElection.TryAcquireAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Never let a leadership hiccup stop convergence; just run as a follower.
+            _logger.LogWarning(ex, "Leader election failed; running as non-leader this loop.");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Upsert this instance's <c>instance_status</c> row (ips, gateway version,
+    /// leader flag, per-service inventory, heartbeat=now). When this instance is the
+    /// leader, also prune rows whose heartbeat has gone stale — the only fleet-wide
+    /// duty in this task (tech-spec §4.3, §4.4).
+    /// </summary>
+    private async Task HeartbeatAsync(bool isLeader, CancellationToken ct)
+    {
+        try
+        {
+            var identity = await _metadata.GetAsync(ct);
+            var containers = await _runtime.ListManagedContainersAsync(ct);
+
+            var status = new InstanceStatus
+            {
+                InstanceId = identity.InstanceId,
+                PrivateIp = identity.PrivateIp,
+                PublicIp = identity.PublicIp,
+                GatewayVer = GatewayVersion.Current,
+                IsLeader = isLeader,
+                Services = InstanceServicesJson.Build(containers),
+                HeartbeatAt = DateTimeOffset.UtcNow,
+            };
+
+            using var scope = _scopeFactory.CreateScope();
+            var store = scope.ServiceProvider.GetRequiredService<IInstanceStatusStore>();
+
+            await store.UpsertAsync(status, ct);
+
+            if (isLeader)
+            {
+                var cutoff = DateTimeOffset.UtcNow - _options.InstanceStaleThreshold;
+                var pruned = await store.DeleteStaleAsync(cutoff, ct);
+                if (pruned > 0)
+                {
+                    _logger.LogInformation(
+                        "Leader pruned {Count} stale instance_status row(s) older than {Threshold}.",
+                        pruned, _options.InstanceStaleThreshold);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A heartbeat failure must not crash the loop; the next tick retries.
+            _logger.LogError(ex, "Failed to publish instance_status heartbeat");
         }
     }
 

@@ -48,4 +48,10 @@ public sealed class ReconcilerOptions
 
     /// <summary>Log driver applied to every container the reconciler starts (awslogs in production).</summary>
     public LogDriverConfig LogDriver { get; set; } = new();
+
+    /// <summary>
+    /// Age past which an <c>instance_status</c> row is considered a departed
+    /// instance and pruned by the leader (tech-spec §4.4: rows stale &gt; 90s).
+    /// </summary>
+    public TimeSpan InstanceStaleThreshold { get; set; } = TimeSpan.FromSeconds(90);
 }
