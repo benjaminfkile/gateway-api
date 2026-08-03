@@ -1,4 +1,5 @@
 using Gateway.Api.Auth;
+using Gateway.Api.Bootstrap;
 using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Instances;
@@ -7,6 +8,7 @@ using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
+using Gateway.Api.Systemd;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -83,6 +85,17 @@ builder.Services.AddManagementAuthentication();
 // so a region-less box still boots; the deploy store defaults to a no-op unless the
 // DB branch above wired the EF-backed one.
 builder.Services.AddManagementServices();
+
+// Node bootstrap (tech-spec §4.3, §2): the idempotent pipeline that provisions the
+// box (Docker daemon log rotation, internal network, registry login refreshed on a
+// timer, CloudWatch agent config) — replacing hand-rolled user-data bash. Every
+// host/process operation is behind ILinuxHost. Off unless GATEWAY_BOOTSTRAP_ENABLED
+// =true, so the build/test box (no Docker, no AWS, no root FS) is never touched.
+builder.Services.AddNodeBootstrap(builder.Configuration);
+
+// systemd watchdog self-check (tech-spec §6): pings WATCHDOG=1 only while the health
+// report keeps building. Inert unless run under systemd with the watchdog enabled.
+builder.Services.AddSystemdWatchdog();
 
 var app = builder.Build();
 

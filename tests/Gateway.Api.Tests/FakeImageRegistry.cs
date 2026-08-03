@@ -21,6 +21,30 @@ public sealed class FakeImageRegistry : IImageRegistry
     /// <summary>Tags that should be treated as missing (resolve throws).</summary>
     public HashSet<string> MissingTags { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>Credentials returned by <see cref="GetCredentialsAsync"/>; settable to simulate rotation.</summary>
+    public RegistryCredentials Credentials { get; set; } =
+        new("AWS", "fake-token", "https://123456789012.dkr.ecr.us-east-1.amazonaws.com");
+
+    /// <summary>When set, <see cref="GetCredentialsAsync"/> throws it (simulates no-registry / unreachable).</summary>
+    public Exception? CredentialsError { get; set; }
+
+    /// <summary>Number of times credentials were requested.</summary>
+    public int CredentialRequests { get; private set; }
+
+    public Task<RegistryCredentials> GetCredentialsAsync(CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            CredentialRequests++;
+            if (CredentialsError is not null)
+            {
+                throw CredentialsError;
+            }
+
+            return Task.FromResult(Credentials);
+        }
+    }
+
     public Task<string> ResolveDigestAsync(string image, string tag, CancellationToken ct = default)
     {
         lock (_gate)

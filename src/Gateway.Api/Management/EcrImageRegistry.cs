@@ -1,3 +1,4 @@
+using System.Text;
 using Amazon.ECR;
 using Amazon.ECR.Model;
 
@@ -54,6 +55,24 @@ public sealed class EcrImageRegistry : IImageRegistry
         {
             throw new ImageNotFoundException($"Repository '{repository}' not found in registry.");
         }
+    }
+
+    public async Task<RegistryCredentials> GetCredentialsAsync(CancellationToken ct = default)
+    {
+        var response = await _ecr.GetAuthorizationTokenAsync(new GetAuthorizationTokenRequest(), ct);
+
+        var data = response.AuthorizationData?.FirstOrDefault()
+            ?? throw new InvalidOperationException("ECR returned no authorization data.");
+
+        // The token is base64("user:password"); ECR uses the fixed user "AWS".
+        var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(data.AuthorizationToken));
+        var sep = decoded.IndexOf(':');
+        if (sep < 0)
+        {
+            throw new InvalidOperationException("Malformed ECR authorization token.");
+        }
+
+        return new RegistryCredentials(decoded[..sep], decoded[(sep + 1)..], data.ProxyEndpoint);
     }
 
     /// <summary>

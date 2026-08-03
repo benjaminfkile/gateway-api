@@ -1,0 +1,39 @@
+[Unit]
+Description=gateway-api node agent (edge proxy, real-time hub, node reconciler, management plane)
+Documentation=https://github.com/example/gateway-api/blob/main/docs/tech-spec.md
+# The gateway manages Docker, so it must start after the daemon is up (tech-spec §3).
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Self-contained single-file publish (tech-spec §6); no runtime dependency on a
+# system-wide .NET install.
+ExecStart=/opt/gateway/gateway-api
+WorkingDirectory=/opt/gateway
+
+# Config/secrets are injected via the environment file, never baked into the unit
+# (tech-spec §6, §8). GATEWAY_* flags (bootstrap, reconciler, DB connection, Cognito
+# authority, Redis endpoint, …) live here.
+EnvironmentFile=/etc/gateway-api/env
+
+# Survive crashes; the load balancer covers cutovers during a restart (tech-spec §6, §7).
+Restart=always
+RestartSec=5
+
+# WatchdogSec is wired to an application self-check (tech-spec §6): the process pings
+# WATCHDOG=1 only while its health report keeps building. If it wedges, systemd
+# restarts it. Grace on stop so in-flight requests can drain.
+WatchdogSec=30
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# The gateway is the single privileged process (Docker socket = root-equivalent,
+# tech-spec §8); downstream containers it starts run unprivileged.
+User=root
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
