@@ -3,10 +3,16 @@ using Gateway.Api.Health;
 using Gateway.Api.Instances;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
+using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Internal publish listener (tech-spec §4.2, §8): a second Kestrel endpoint bound
+// from GATEWAY_INTERNAL_BIND, added alongside the public URLs. It hosts only
+// POST /internal/publish and is never routed by the load balancer.
+builder.AddGatewayInternalListener();
 
 // Desired-state / fleet-status store (tech-spec §4.4). The connection string
 // comes from GATEWAY_DB_CONNECTION. When it is set, the manifest is read from
@@ -54,10 +60,20 @@ builder.Services.AddAggregatedHealth();
 // where the daemon is present — so the gateway boots cleanly without Docker.
 builder.Services.AddNodeReconciler(builder.Configuration);
 
+// Real-time hub + optional Redis backplane (tech-spec §4.2). SignalR groups back
+// the {app}:{topic} channels; the backplane activates only when
+// GATEWAY_REDIS_ENDPOINT is set, so single-node/dev/test boots without Redis.
+builder.Services.AddGatewayRealtime(builder.Configuration);
+
 var app = builder.Build();
 
+// Keep the public and internal listeners' surfaces disjoint before any endpoint
+// runs (tech-spec §8): /internal/* only on the internal port, nothing else there.
+app.UseInternalListenerIsolation();
+
 // WebSocket passthrough is native to YARP; enabling this ensures Upgrade
-// requests flow through to downstream services untouched (tech-spec §4.1).
+// requests flow through to downstream services untouched (tech-spec §4.1). The
+// SignalR hub's WebSocket transport rides the same middleware.
 app.UseWebSockets();
 
 // Aggregated health: reports the gateway plus a per-service probe rollup. The
@@ -81,6 +97,12 @@ app.MapGet("/api/health", async (HealthAggregator aggregator, CancellationToken 
             }),
     });
 });
+
+// Real-time hub at /hub and the internal publish endpoint (tech-spec §4.2). The
+// isolation middleware above ensures /internal/publish is reachable only on the
+// internal listener.
+app.MapGatewayHub();
+app.MapInternalPublish();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.
