@@ -1,4 +1,5 @@
 using Gateway.Api.Data;
+using Gateway.Api.Health;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Microsoft.EntityFrameworkCore;
@@ -30,17 +31,38 @@ else
 // built in-memory and swapped at runtime via a change token — no restart.
 builder.Services.AddManifestProxy();
 
+// Aggregated health check (tech-spec §4.1): probes health-participating,
+// running services in parallel behind IHealthProber and folds the results into
+// the /api/health response below.
+builder.Services.AddAggregatedHealth();
+
 var app = builder.Build();
 
 // WebSocket passthrough is native to YARP; enabling this ensures Upgrade
 // requests flow through to downstream services untouched (tech-spec §4.1).
 app.UseWebSockets();
 
-app.MapGet("/api/health", () => Results.Json(new
+// Aggregated health: reports the gateway plus a per-service probe rollup. The
+// gateway is always "up" here and the response is always 200 — a down service
+// is surfaced under "services" but never fails the load balancer's own check
+// (tech-spec §4.1). Shape is fixed for LB + ops v1 compatibility.
+app.MapGet("/api/health", async (HealthAggregator aggregator, CancellationToken ct) =>
 {
-    gateway = "up",
-    timestamp = DateTime.UtcNow,
-}));
+    var report = await aggregator.BuildAsync(ct);
+    return Results.Json(new
+    {
+        gateway = report.Gateway,
+        timestamp = report.Timestamp,
+        services = report.Services.ToDictionary(
+            kvp => kvp.Key,
+            kvp => new
+            {
+                status = kvp.Value.Status,
+                httpStatus = kvp.Value.HttpStatus,
+                responseTimeMs = kvp.Value.ResponseTimeMs,
+            }),
+    });
+});
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.
