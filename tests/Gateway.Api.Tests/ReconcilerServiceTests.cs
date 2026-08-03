@@ -1,5 +1,6 @@
 using Gateway.Api.Containers;
 using Gateway.Api.Data;
+using Gateway.Api.Instances;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.Reconcile;
@@ -69,11 +70,14 @@ public class ReconcilerServiceTests
         public FakeReadinessProber Prober { get; } = new();
         public FakeReporter Reporter { get; } = new();
         public FakeEnvProvider EnvProvider { get; } = new();
+        public FakeInstanceStatusStore StatusStore { get; } = new();
+        public InMemoryLeaderElection Leader { get; }
         public ReconcilerOptions Options { get; }
         public ReconcilerService Service { get; }
 
-        public Harness(bool enabled = true)
+        public Harness(bool enabled = true, bool isLeader = true)
         {
+            Leader = new InMemoryLeaderElection(isLeader);
             Options = new ReconcilerOptions
             {
                 Enabled = enabled,
@@ -86,10 +90,17 @@ public class ReconcilerServiceTests
             var services = new ServiceCollection();
             services.AddSingleton<IManifestStore>(Store);
             services.AddSingleton<IServiceEnvProvider>(EnvProvider);
+            services.AddSingleton<IInstanceStatusStore>(StatusStore);
             services.AddSingleton<IServiceAddressResolver, ContainerDnsAddressResolver>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             var provider = services.BuildServiceProvider();
+
+            var metadata = new InstanceMetadataProvider(
+                new IInstanceMetadata[]
+                {
+                    new StubInstanceMetadata(new InstanceIdentity("i-test", "10.0.0.9", "203.0.113.9")),
+                });
 
             Service = new ReconcilerService(
                 Runtime,
@@ -98,6 +109,8 @@ public class ReconcilerServiceTests
                 provider.GetRequiredService<IServiceScopeFactory>(),
                 Prober,
                 Reporter,
+                metadata,
+                Leader,
                 Options,
                 NullLogger<ReconcilerService>.Instance);
         }
@@ -286,5 +299,78 @@ public class ReconcilerServiceTests
         // No mutating container operations, no outcomes recorded for a no-op.
         Assert.Empty(harness.Runtime.Operations);
         Assert.Empty(harness.Reporter.Outcomes);
+    }
+
+    [Fact]
+    public async Task Heartbeat_UpsertsInstanceStatus_WithServicesJson()
+    {
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+
+        await harness.Service.RunOnceAsync();
+
+        var status = Assert.Single(harness.StatusStore.Upserts);
+        Assert.Equal("i-test", status.InstanceId);
+        Assert.Equal("10.0.0.9", status.PrivateIp);
+        Assert.Equal("203.0.113.9", status.PublicIp);
+        Assert.True(status.IsLeader);
+        Assert.False(string.IsNullOrWhiteSpace(status.GatewayVer));
+        // The per-service inventory is the documented jsonb shape.
+        Assert.Contains("\"name\":\"svc-a\"", status.Services);
+        Assert.Contains("\"digest\":\"sha256:v1\"", status.Services);
+        Assert.Contains("\"restarts\":0", status.Services);
+    }
+
+    [Fact]
+    public async Task Heartbeat_RunsEveryLoop_EvenWhenConverged()
+    {
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+
+        await harness.Service.RunOnceAsync();
+        await harness.Service.RunOnceAsync();
+
+        // A no-op convergence still heartbeats each loop.
+        Assert.Equal(2, harness.StatusStore.Upserts.Count);
+    }
+
+    [Fact]
+    public async Task LeaderOnly_StaleCleanup_Honored()
+    {
+        var harness = new Harness(isLeader: true);
+        // A departed instance whose heartbeat aged out.
+        harness.StatusStore.Seed(new InstanceStatus
+        {
+            InstanceId = "i-gone",
+            HeartbeatAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(5),
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        // Leader ran cleanup and pruned the stale row; this instance's own row remains.
+        Assert.Single(harness.StatusStore.StaleCleanups);
+        Assert.False(harness.StatusStore.Rows.ContainsKey("i-gone"));
+        Assert.True(harness.StatusStore.Rows.ContainsKey("i-test"));
+    }
+
+    [Fact]
+    public async Task NonLeader_SkipsStaleCleanup()
+    {
+        var harness = new Harness(isLeader: false);
+        harness.StatusStore.Seed(new InstanceStatus
+        {
+            InstanceId = "i-gone",
+            HeartbeatAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(5),
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        // Non-leader still heartbeats (as a follower) but never prunes.
+        Assert.Empty(harness.StatusStore.StaleCleanups);
+        Assert.True(harness.StatusStore.Rows.ContainsKey("i-gone"));
+        var status = Assert.Single(harness.StatusStore.Upserts);
+        Assert.False(status.IsLeader);
     }
 }

@@ -1,5 +1,6 @@
 using Gateway.Api.Data;
 using Gateway.Api.Health;
+using Gateway.Api.Instances;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.Reconcile;
@@ -20,6 +21,16 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     builder.Services.AddDbContext<GatewayDbContext>(options =>
         options.UseNpgsql(dbConnection));
     builder.Services.AddScoped<IManifestStore, EfManifestStore>();
+
+    // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
+    // instance's status row via the EF store, and leadership — which gates the
+    // stale-row cleanup — is a Postgres advisory lock on a dedicated connection.
+    builder.Services.AddScoped<IInstanceStatusStore, EfInstanceStatusStore>();
+    builder.Services.AddSingleton<ILeaderElection>(sp =>
+        new PostgresAdvisoryLockLeaderElection(
+            dbConnection,
+            logger: sp.GetRequiredService<ILoggerFactory>()
+                .CreateLogger<PostgresAdvisoryLockLeaderElection>()));
 }
 else
 {

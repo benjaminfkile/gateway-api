@@ -1,4 +1,5 @@
 using Gateway.Api.Containers;
+using Gateway.Api.Instances;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Gateway.Api.Reconcile;
@@ -50,6 +51,25 @@ public static class ReconcilerServiceCollectionExtensions
         services.TryAddSingleton<IReadinessProber, HttpReadinessProber>();
         services.TryAddSingleton<IServiceEnvProvider, NullServiceEnvProvider>();
         services.TryAddSingleton<IReconcileReporter, LoggingReconcileReporter>();
+
+        // Instance identity (tech-spec §4.4): IMDSv2 first, environment fallback
+        // auto-selected when IMDS is unreachable. The IMDS client sets the
+        // link-local base address; Ec2InstanceMetadata bounds each call to 2s.
+        services.AddHttpClient(Ec2InstanceMetadata.HttpClientName, client =>
+        {
+            client.BaseAddress = new Uri(Ec2InstanceMetadata.ImdsBaseAddress);
+        });
+        services.AddSingleton<IInstanceMetadata>(sp =>
+            new Ec2InstanceMetadata(
+                sp.GetRequiredService<IHttpClientFactory>().CreateClient(Ec2InstanceMetadata.HttpClientName)));
+        services.AddSingleton<IInstanceMetadata, EnvInstanceMetadata>();
+        services.TryAddSingleton<InstanceMetadataProvider>();
+
+        // Leader election + instance-status persistence. Defaults suit a box with
+        // no Postgres (single-node dev / tests); Program.cs registers the
+        // Postgres-advisory-lock leader and EF-backed store when a DB is configured.
+        services.TryAddSingleton<ILeaderElection>(new InMemoryLeaderElection());
+        services.TryAddSingleton<IInstanceStatusStore, NullInstanceStatusStore>();
 
         services.AddHostedService<ReconcilerService>();
         return services;

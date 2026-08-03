@@ -80,6 +80,7 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
 
             // Prefer the daemon's precise start time; fall back to created time.
             DateTimeOffset? startedAt = null;
+            var restarts = 0;
             try
             {
                 var inspect = await _client.Containers.InspectContainerAsync(c.ID, ct);
@@ -91,6 +92,8 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
                 {
                     startedAt = parsed;
                 }
+
+                restarts = (int)inspect.RestartCount;
             }
             catch (DockerApiException)
             {
@@ -105,7 +108,8 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
                 Digest: string.IsNullOrEmpty(digest) ? null : digest,
                 State: c.State ?? string.Empty,
                 StartedAt: startedAt,
-                EnvHash: string.IsNullOrEmpty(envHash) ? null : envHash));
+                EnvHash: string.IsNullOrEmpty(envHash) ? null : envHash,
+                Restarts: restarts));
         }
 
         return result;

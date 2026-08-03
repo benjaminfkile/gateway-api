@@ -19,10 +19,16 @@ namespace Gateway.Api.Containers;
 /// Hash of the environment the container was created with, captured as a label so
 /// env drift triggers a blue-green replace. Null when unknown.
 /// </param>
+/// <param name="Restarts">
+/// How many times the container has been restarted by Docker, surfaced in the
+/// fleet <c>instance_status</c> heartbeat (tech-spec §4.4). Defaults to 0 when the
+/// runtime does not report it.
+/// </param>
 public sealed record ContainerInfo(
     string Name,
     string Image,
     string? Digest,
     string State,
     DateTimeOffset? StartedAt,
-    string? EnvHash);
+    string? EnvHash,
+    int Restarts = 0);
