@@ -2,6 +2,7 @@ using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
+using Gateway.Api.Reconcile;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -35,6 +36,12 @@ builder.Services.AddManifestProxy();
 // running services in parallel behind IHealthProber and folds the results into
 // the /api/health response below.
 builder.Services.AddAggregatedHealth();
+
+// Node reconciler (tech-spec §4.3, §7): converges the local box's containers
+// toward the manifest with blue-green deploys. Off unless
+// GATEWAY_RECONCILER_ENABLED=true, and the Docker-backed runtime only activates
+// where the daemon is present — so the gateway boots cleanly without Docker.
+builder.Services.AddNodeReconciler(builder.Configuration);
 
 var app = builder.Build();
 

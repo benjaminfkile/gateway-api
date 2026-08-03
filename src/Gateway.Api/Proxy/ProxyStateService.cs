@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Gateway.Api.Data;
 using Gateway.Api.Manifest;
 using Yarp.ReverseProxy.Configuration;
@@ -19,6 +20,13 @@ public sealed class ProxyStateService
     private readonly ManifestProxyConfigProvider _provider;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IServiceAddressResolver _addressResolver;
+
+    // Temporary per-service destination overrides used during a blue-green swap:
+    // while set, a service's route points at the given address (the green
+    // candidate) instead of its resolved canonical address. Cleared once the swap
+    // completes and the candidate has been promoted to the canonical name.
+    private readonly ConcurrentDictionary<string, string> _destinationOverrides =
+        new(StringComparer.Ordinal);
 
     public ProxyStateService(
         ManifestProxyConfigProvider provider,
@@ -75,12 +83,38 @@ public sealed class ProxyStateService
                 {
                     ["primary"] = new DestinationConfig
                     {
-                        Address = _addressResolver.Resolve(manifest),
+                        // A blue-green swap in progress points this route at the
+                        // green candidate; otherwise use the canonical address.
+                        Address = _destinationOverrides.TryGetValue(manifest.Name, out var overrideAddress)
+                            ? overrideAddress
+                            : _addressResolver.Resolve(manifest),
                     },
                 },
             });
         }
 
         _provider.Update(routes, clusters);
+    }
+
+    /// <summary>
+    /// Point a service's route at <paramref name="address"/> (a blue-green
+    /// candidate) and apply it immediately. In-flight requests to the previous
+    /// destination drain via YARP's graceful destination removal (tech-spec §7).
+    /// </summary>
+    public Task SwapDestinationAsync(string serviceName, string address, CancellationToken ct = default)
+    {
+        _destinationOverrides[serviceName] = address;
+        return RefreshRoutesAsync(ct);
+    }
+
+    /// <summary>
+    /// Clear a blue-green destination override, returning the route to the
+    /// service's canonical address (used after the candidate is promoted to the
+    /// canonical container name). Idempotent.
+    /// </summary>
+    public Task ClearDestinationOverrideAsync(string serviceName, CancellationToken ct = default)
+    {
+        _destinationOverrides.TryRemove(serviceName, out _);
+        return RefreshRoutesAsync(ct);
     }
 }
