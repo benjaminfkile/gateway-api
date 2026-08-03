@@ -12,6 +12,14 @@ namespace Gateway.Api.Proxy;
 public interface IServiceAddressResolver
 {
     string Resolve(ServiceManifest manifest);
+
+    /// <summary>
+    /// Resolve the base address for an explicit container name and port — used by
+    /// the reconciler to reach a blue-green candidate (<c>{name}-green</c> on its
+    /// side port) before it is promoted to the canonical name. Defaults to the
+    /// same container-DNS form as <see cref="Resolve(ServiceManifest)"/>.
+    /// </summary>
+    string Resolve(string name, int port) => $"http://{name}:{port}";
 }
 
 /// <summary>
@@ -20,5 +28,7 @@ public interface IServiceAddressResolver
 /// </summary>
 public sealed class ContainerDnsAddressResolver : IServiceAddressResolver
 {
-    public string Resolve(ServiceManifest manifest) => $"http://{manifest.Name}:{manifest.Port}";
+    public string Resolve(ServiceManifest manifest) => Resolve(manifest.Name, manifest.Port);
+
+    public string Resolve(string name, int port) => $"http://{name}:{port}";
 }
