@@ -1,0 +1,354 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Gateway.Api.Data;
+using Gateway.Api.Management;
+using Microsoft.EntityFrameworkCore;
+
+namespace Gateway.Api.Tests;
+
+/// <summary>
+/// Integration coverage for deploy / rollback / manifest-edit / logs / history
+/// (tech-spec §4.5). Asserts the deploy resolves the digest once and records
+/// <c>deploy_history</c>, the PUT validation guardrails, rollback to a previous
+/// successful digest, and the authz matrix (OpsDeploy for deploy, OpsAdmin for PUT).
+/// </summary>
+public class ManagementDeployTests
+{
+    private static async Task SeedAsync(ManagementApiFactory factory, params ServiceManifest[] manifests)
+    {
+        await factory.WithDbAsync(async db =>
+        {
+            db.ServiceManifests.AddRange(manifests);
+            await db.SaveChangesAsync();
+        });
+    }
+
+    [Fact]
+    public async Task Deploy_ResolvesDigestOnce_UpdatesManifest_RecordsHistory()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", digest: "sha256:old", tag: "v1"));
+        factory.ImageRegistry.DigestsByTag["v2"] = "sha256:new";
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken("bob"));
+        var response = await client.PostAsJsonAsync("/mgmt/services/svc-a/deploy", new { tag = "v2" });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var deployId = body.GetProperty("deployId").GetInt32();
+        Assert.Equal("sha256:new", body.GetProperty("digest").GetString());
+
+        // Digest resolved exactly once (fleet converges to one image).
+        Assert.Single(factory.ImageRegistry.Resolved);
+        Assert.Equal(("registry/svc-a", "v2"), factory.ImageRegistry.Resolved[0]);
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("sha256:new", m.Digest);
+            Assert.Equal("v2", m.Tag);
+            Assert.Equal("bob", m.UpdatedBy);
+
+            var history = await db.DeployHistory.SingleAsync(h => h.Id == deployId);
+            Assert.Equal(DeployAction.Deploy, history.Action);
+            Assert.Equal("sha256:old", history.FromDigest);
+            Assert.Equal("sha256:new", history.ToDigest);
+            Assert.Equal(DeployStatus.InProgress, history.Status);
+            Assert.Equal("bob", history.Actor);
+            Assert.Null(history.FinishedAt);
+        });
+    }
+
+    [Fact]
+    public async Task Deploy_UnknownTag_Returns404()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a"));
+        factory.ImageRegistry.MissingTags.Add("nope");
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.PostAsJsonAsync("/mgmt/services/svc-a/deploy", new { tag = "nope" });
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Deploy_MissingTag_Returns400()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a"));
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.PostAsJsonAsync("/mgmt/services/svc-a/deploy", new { tag = "" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Deploy_CiToken_Allowed()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a"));
+
+        var client = factory.CreateClient(ManagementApiFactory.CiToken());
+        var response = await client.PostAsJsonAsync("/mgmt/services/svc-a/deploy", new { tag = "v9" });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Deploy_NoRoleToken_Forbidden()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a"));
+
+        var client = factory.CreateClient(ManagementApiFactory.NoRoleToken());
+        var response = await client.PostAsJsonAsync("/mgmt/services/svc-a/deploy", new { tag = "v2" });
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Deploy_GatewayName_Rejected400()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.PostAsJsonAsync("/mgmt/services/gateway/deploy", new { tag = "v2" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rollback_UsesPreviousSuccessfulDigest()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", digest: "sha256:v2"));
+        await factory.WithDbAsync(async db =>
+        {
+            // A completed deploy that put v1 live, then v2 (current) in progress.
+            db.DeployHistory.Add(new DeployHistory
+            {
+                Service = "svc-a", FromDigest = null, ToDigest = "sha256:v1",
+                Actor = "bob", Action = DeployAction.Deploy, Status = DeployStatus.Done,
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-10), FinishedAt = DateTimeOffset.UtcNow.AddMinutes(-9),
+            });
+            await db.SaveChangesAsync();
+        });
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.PostAsync("/mgmt/services/svc-a/rollback", null);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("sha256:v1", body.GetProperty("digest").GetString());
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("sha256:v1", m.Digest);
+            var rollback = await db.DeployHistory.SingleAsync(h => h.Action == DeployAction.Rollback);
+            Assert.Equal("sha256:v2", rollback.FromDigest);
+            Assert.Equal("sha256:v1", rollback.ToDigest);
+            Assert.Equal(DeployStatus.InProgress, rollback.Status);
+        });
+    }
+
+    [Fact]
+    public async Task Rollback_NoPreviousDigest_Returns409()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", digest: "sha256:v1"));
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.PostAsync("/mgmt/services/svc-a/rollback", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Put_CreatesNewManifest_201_AndAudits()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken("alice"));
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            desiredStatus = "running",
+            includeInHealth = true,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Equal(8090, m.Port);
+            Assert.Equal("alice", m.UpdatedBy);
+            var audit = await db.DeployHistory.SingleAsync();
+            Assert.Equal(DeployAction.Upsert, audit.Action);
+        });
+    }
+
+    [Fact]
+    public async Task Put_UpdatesExisting_200_PreservesDigest()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", port: 8080, digest: "sha256:keep"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 9090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal(9090, m.Port);
+            Assert.False(m.IncludeInHealth);
+            Assert.Equal("sha256:keep", m.Digest); // preserved across the edit
+        });
+    }
+
+    [Theory]
+    [InlineData("Svc-A")]      // uppercase not allowed
+    [InlineData("svc_a")]      // underscore not allowed
+    [InlineData("svc a")]      // space not allowed
+    public async Task Put_InvalidName_Returns400(string name)
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync($"/mgmt/services/{Uri.EscapeDataString(name)}", new
+        {
+            image = "registry/x",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(70000)]
+    public async Task Put_InvalidPort_Returns400(int port)
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Put_DeployToken_Forbidden()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Deploys_ListAndGet_WithInstanceChildren()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a"));
+        int deployId = 0;
+        await factory.WithDbAsync(async db =>
+        {
+            var d = new DeployHistory
+            {
+                Service = "svc-a", ToDigest = "sha256:v1", Actor = "bob",
+                Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+                StartedAt = DateTimeOffset.UtcNow,
+            };
+            db.DeployHistory.Add(d);
+            await db.SaveChangesAsync();
+            deployId = d.Id;
+
+            db.DeployInstanceStatus.Add(new DeployInstanceStatus
+            {
+                DeployId = deployId, InstanceId = "i-1",
+                Status = DeployInstanceState.Converged, UpdatedAt = DateTimeOffset.UtcNow,
+            });
+            await db.SaveChangesAsync();
+        });
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+
+        var list = await client.GetFromJsonAsync<JsonElement>("/mgmt/deploys");
+        Assert.Contains(list.EnumerateArray(), e => e.GetProperty("id").GetInt32() == deployId);
+
+        var detail = await client.GetFromJsonAsync<JsonElement>($"/mgmt/deploys/{deployId}");
+        Assert.Equal("svc-a", detail.GetProperty("deploy").GetProperty("service").GetString());
+        var child = detail.GetProperty("instances").EnumerateArray().Single();
+        Assert.Equal("i-1", child.GetProperty("instanceId").GetString());
+        Assert.Equal(DeployInstanceState.Converged, child.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Deploy_Get_UnknownId_Returns404()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.GetAsync("/mgmt/deploys/9999");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Logs_ReturnsLines_ForInstance_AdminOnly()
+    {
+        await using var factory = new ManagementApiFactory();
+        var ts = new DateTimeOffset(2026, 8, 3, 12, 0, 0, TimeSpan.Zero);
+        factory.LogStore.Seed("svc-a", "i-1",
+            new Gateway.Api.Management.LogLine(ts, "started"),
+            new Gateway.Api.Management.LogLine(ts.AddSeconds(1), "ready"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var body = await client.GetFromJsonAsync<JsonElement>("/mgmt/services/svc-a/logs?instance=i-1&tail=50");
+
+        var lines = body.GetProperty("lines").EnumerateArray().ToList();
+        Assert.Equal(2, lines.Count);
+        Assert.Equal("started", lines[0].GetProperty("message").GetString());
+        Assert.Equal(("svc-a", "i-1", 50), factory.LogStore.Queries.Single());
+    }
+
+    [Fact]
+    public async Task Logs_DeployToken_Forbidden()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var response = await client.GetAsync("/mgmt/services/svc-a/logs");
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+}

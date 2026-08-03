@@ -51,6 +51,15 @@ public sealed class FakeInstanceStatusStore : IInstanceStatusStore
         return Task.CompletedTask;
     }
 
+    public Task<IReadOnlyList<InstanceStatus>> GetAllAsync(CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            IReadOnlyList<InstanceStatus> all = _rows.Values.ToList();
+            return Task.FromResult(all);
+        }
+    }
+
     public Task<int> DeleteStaleAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
         lock (_gate)

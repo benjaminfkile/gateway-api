@@ -34,6 +34,11 @@ public sealed class EfInstanceStatusStore : IInstanceStatusStore
         await _db.SaveChangesAsync(ct);
     }
 
+    public async Task<IReadOnlyList<InstanceStatus>> GetAllAsync(CancellationToken ct = default)
+    {
+        return await _db.InstanceStatus.AsNoTracking().ToListAsync(ct);
+    }
+
     public async Task<int> DeleteStaleAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
         // instance_status holds one row per live instance (bounded by fleet size),

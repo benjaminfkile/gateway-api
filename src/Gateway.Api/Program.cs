@@ -2,6 +2,7 @@ using Gateway.Api.Auth;
 using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Instances;
+using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.RealTime;
@@ -28,6 +29,10 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     builder.Services.AddDbContext<GatewayDbContext>(options =>
         options.UseNpgsql(dbConnection));
     builder.Services.AddScoped<IManifestStore, EfManifestStore>();
+
+    // Deploy history + per-instance rollout progress (tech-spec §4.4, §4.5): the
+    // Management API's audit/rollout ledger, EF-backed only when a database exists.
+    builder.Services.AddScoped<IDeployStore, EfDeployStore>();
 
     // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
     // instance's status row via the EF store, and leadership — which gates the
@@ -72,6 +77,12 @@ builder.Services.AddGatewayRealtime(builder.Configuration);
 // the authority is unset the plane is unconfigured and /mgmt/* 503s (see guard
 // below); the gateway still boots and serves all transparent traffic.
 builder.Services.AddManagementAuthentication();
+
+// Management API external-system seams (tech-spec §4.5): image registry (ECR),
+// log store (CloudWatch), and the deploy-history store. AWS-backed impls are lazy
+// so a region-less box still boots; the deploy store defaults to a no-op unless the
+// DB branch above wired the EF-backed one.
+builder.Services.AddManagementServices();
 
 var app = builder.Build();
 
@@ -128,6 +139,11 @@ app.MapInternalPublish();
 // requires a valid Cognito access token; unauthenticated calls get 401 (or 503
 // when the plane is unconfigured, via the guard above).
 app.MapManagementPlane();
+
+// The fleet-aware §4.5 Management endpoints (services, instances, deploys, logs,
+// lifecycle, deploy/rollback). Each requires a Cognito access token and audit-logs
+// mutating calls; all state is read from the DB, never local Docker.
+app.MapManagementApi();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.

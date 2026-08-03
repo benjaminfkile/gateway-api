@@ -43,6 +43,18 @@ public static class ManagementAuth
     /// <summary>Resource-server scope granting the CI machine token deploy rights.</summary>
     public const string DeployScope = "mgmt/deploy";
 
+    /// <summary>
+    /// The identity stamped into audit records for a mutating call (tech-spec §4.5,
+    /// §8): the Cognito <c>username</c> claim for a human token, or the
+    /// <c>client_id</c> for the CI machine token. Falls back to the principal name
+    /// and finally <c>"unknown"</c> so an audit row always has an actor.
+    /// </summary>
+    public static string ResolveUsername(ClaimsPrincipal user) =>
+        user.FindFirst("username")?.Value
+        ?? user.Identity?.Name
+        ?? user.FindFirst("client_id")?.Value
+        ?? "unknown";
+
     /// <summary>True when <paramref name="user"/> is a member of the named Cognito group.</summary>
     public static bool IsInGroup(ClaimsPrincipal user, string group) =>
         user.Claims.Any(c =>
