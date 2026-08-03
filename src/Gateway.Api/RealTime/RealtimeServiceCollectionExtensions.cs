@@ -19,16 +19,10 @@ public static class RealtimeServiceCollectionExtensions
         var redis = RedisBackplaneOptions.FromConfiguration(configuration);
         services.TryAddSingleton(redis);
 
-        // Authorization hook for the dashboard's ops:* channels. Today the policy
-        // only requires an authenticated principal — with no auth handler wired
-        // yet, that rejects every anonymous connection, which is the required
-        // behaviour until the Cognito task makes this a real JWT gate (§4.2, §5).
-        services.AddAuthorization(options =>
-        {
-            options.AddPolicy(GatewayHub.OpsChannelPolicy, policy =>
-                policy.RequireAuthenticatedUser());
-        });
-
+        // The dashboard's ops:* channel authorization policy
+        // (GatewayHub.OpsChannelPolicy) is defined by AddManagementAuthentication
+        // (§4.2, §5), so the hub gate shares the exact Cognito-group requirement the
+        // /mgmt endpoints enforce.
         var signalR = services.AddSignalR();
 
         // Backplane only when GATEWAY_REDIS_ENDPOINT is set (§4.2). Otherwise the

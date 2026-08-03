@@ -1,3 +1,4 @@
+using Gateway.Api.Auth;
 using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Instances;
@@ -65,6 +66,13 @@ builder.Services.AddNodeReconciler(builder.Configuration);
 // GATEWAY_REDIS_ENDPOINT is set, so single-node/dev/test boots without Redis.
 builder.Services.AddGatewayRealtime(builder.Configuration);
 
+// Management-plane auth (tech-spec §5): Cognito JWT bearer + ops authorization
+// policies, configured from GATEWAY_COGNITO_AUTHORITY. Scoped strictly to /mgmt/*
+// and the ops:* hub channels — application traffic is never authenticated. When
+// the authority is unset the plane is unconfigured and /mgmt/* 503s (see guard
+// below); the gateway still boots and serves all transparent traffic.
+builder.Services.AddManagementAuthentication();
+
 var app = builder.Build();
 
 // Keep the public and internal listeners' surfaces disjoint before any endpoint
@@ -75,6 +83,18 @@ app.UseInternalListenerIsolation();
 // requests flow through to downstream services untouched (tech-spec §4.1). The
 // SignalR hub's WebSocket transport rides the same middleware.
 app.UseWebSockets();
+
+// Management-plane configuration guard (tech-spec §5): /mgmt/* returns 503 when
+// no Cognito authority is set. Runs before authentication so the closed-plane
+// response never depends on a token; leaves proxy/health/hub traffic untouched.
+app.UseManagementPlaneGuard();
+
+// Authentication + authorization run for every request so the /mgmt endpoints and
+// the ops:* hub channels can read a Cognito principal — but only endpoints that
+// opt in via RequireAuthorization are gated. Nothing in front of the proxy or
+// /api/health requires a token, preserving the transparency invariant (§1).
+app.UseAuthentication();
+app.UseAuthorization();
 
 // Aggregated health: reports the gateway plus a per-service probe rollup. The
 // gateway is always "up" here and the response is always 200 — a down service
@@ -103,6 +123,11 @@ app.MapGet("/api/health", async (HealthAggregator aggregator, CancellationToken 
 // internal listener.
 app.MapGatewayHub();
 app.MapInternalPublish();
+
+// Management plane (tech-spec §5): the authenticated /mgmt surface. Each endpoint
+// requires a valid Cognito access token; unauthenticated calls get 401 (or 503
+// when the plane is unconfigured, via the guard above).
+app.MapManagementPlane();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.
