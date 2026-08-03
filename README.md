@@ -24,6 +24,24 @@ dotnet run --project src/Gateway.Api   # serves /api/health
 dotnet test
 ```
 
+## Packaging & deploy
+
+The gateway runs on the host via systemd (it manages Docker) and provisions the
+box itself — no hand-rolled user-data bash (tech-spec §2, §4.3).
+
+- `scripts/package.sh [version]` — `dotnet publish` a self-contained single-file
+  `linux-arm64` binary and bundle it with the unit + install script into
+  `artifacts/gateway-api-<version>-linux-arm64.tar.gz`.
+- `deploy/gateway-api.service` — systemd unit (`Restart=always`, `WatchdogSec`
+  wired to an app self-check, config via `EnvironmentFile=/etc/gateway-api/env`).
+- `deploy/install.sh` — unpack-and-install (idempotent) on the box.
+- `docs/user-data.example.sh` — the complete ~10-line instance user-data (§6).
+
+Node bootstrap (idempotent, off unless `GATEWAY_BOOTSTRAP_ENABLED=true`) writes
+Docker log-rotation config, ensures the internal network, logs in to the registry
+(refreshed on a timer), and writes the CloudWatch agent config — all behind an
+`ILinuxHost` seam so it is unit-tested against a fake host.
+
 ## Status
 
 Phase 0 (scaffold) of the build plan in `docs/tech-spec.md` §10.
