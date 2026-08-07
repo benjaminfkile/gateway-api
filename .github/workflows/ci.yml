@@ -30,10 +30,10 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     env:
-      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
     steps:
       - uses: actions/checkout@v4
 
