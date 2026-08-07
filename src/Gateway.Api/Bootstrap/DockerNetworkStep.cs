@@ -37,6 +37,12 @@ public sealed class DockerNetworkStep : IBootstrapStep
         var create = await _host.RunAsync("docker", new[] { "network", "create", network }, null, ct);
         if (!create.Succeeded)
         {
+            // The reconciler also ensures this network; losing that race is fine.
+            if (create.StandardError.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+            {
+                return BootstrapStepResult.Skipped($"Docker network '{network}' already exists.");
+            }
+
             throw new InvalidOperationException(
                 $"Failed to create Docker network '{network}': {create.StandardError}");
         }

@@ -22,10 +22,12 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
     public const string DefaultSocketPath = "/var/run/docker.sock";
 
     private readonly IDockerClient _client;
+    private readonly IRegistryAuthProvider _registryAuth;
 
-    public DockerContainerRuntime(IDockerClient client)
+    public DockerContainerRuntime(IDockerClient client, IRegistryAuthProvider? registryAuth = null)
     {
         _client = client;
+        _registryAuth = registryAuth ?? new NullRegistryAuthProvider();
     }
 
     /// <summary>
@@ -36,11 +38,11 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
         OperatingSystem.IsLinux() && File.Exists(DefaultSocketPath);
 
     /// <summary>Create a runtime bound to the local Docker unix socket.</summary>
-    public static DockerContainerRuntime Create()
+    public static DockerContainerRuntime Create(IRegistryAuthProvider? registryAuth = null)
     {
         var client = new DockerClientConfiguration(new Uri($"unix://{DefaultSocketPath}"))
             .CreateClient();
-        return new DockerContainerRuntime(client);
+        return new DockerContainerRuntime(client, registryAuth);
     }
 
     public async Task EnsureNetworkAsync(string name, CancellationToken ct = default)
@@ -117,9 +119,13 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
 
     public async Task<string> PullImageAsync(string image, string tag, CancellationToken ct = default)
     {
+        // API pulls authenticate per request (X-Registry-Auth); the CLI's
+        // `docker login` config file is never consulted by the daemon here.
+        var auth = await _registryAuth.GetAuthAsync(image, ct);
+
         await _client.Images.CreateImageAsync(
             new ImagesCreateParameters { FromImage = image, Tag = tag },
-            authConfig: null,
+            auth,
             progress: new Progress<JSONMessage>(),
             cancellationToken: ct);
 
