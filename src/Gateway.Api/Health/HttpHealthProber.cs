@@ -7,8 +7,8 @@ namespace Gateway.Api.Health;
 /// <summary>
 /// Production <see cref="IHealthProber"/>: issues <c>GET {base}/api/health</c>
 /// over a named <see cref="HttpClient"/>, where <c>{base}</c> comes from
-/// <see cref="IServiceAddressResolver"/> (<c>http://{name}:{port}</c> on the
-/// internal Docker network). Each probe is bounded by a 3-second timeout and any
+/// <see cref="IServiceAddressResolver"/> (<c>http://127.0.0.1:{port}</c>, the
+/// host-published container port). Each probe is bounded by a 3-second timeout and any
 /// failure is reported as an unreachable (<c>down</c>) result rather than thrown,
 /// so a single sick service never fails the gateway's own health response.
 /// </summary>

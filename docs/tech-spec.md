@@ -93,7 +93,7 @@ survive gateway restarts.
 
 ### 4.1 Edge proxy (YARP)
 - `Yarp.ReverseProxy`, routes built **dynamically** from the desired-state manifest via `IProxyConfigProvider` (in-memory swap, no restart).
-- Route rule: `/{service}/*` → `http://{container}:{port}` on the internal Docker network.
+- Route rule: `/{service}/*` → `http://127.0.0.1:{port}` — the container's host-published port. The gateway lives on the host (§3), outside the Docker network, so container DNS names are not resolvable for it; the reconciler publishes each service's port to the host instead.
 - WebSocket passthrough works natively for any service that terminates its own sockets.
 - Active health checks per cluster; unhealthy destinations are dropped from rotation automatically — this is the mechanism behind blue-green cutover.
 

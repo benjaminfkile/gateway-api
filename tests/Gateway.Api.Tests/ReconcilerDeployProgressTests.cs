@@ -60,7 +60,7 @@ public class ReconcilerDeployProgressTests
             services.AddSingleton<IServiceEnvProvider, NullEnvProvider>();
             services.AddSingleton<IInstanceStatusStore>(StatusStore);
             services.AddSingleton<IDeployStore>(DeployStore);
-            services.AddSingleton<IServiceAddressResolver, ContainerDnsAddressResolver>();
+            services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             var provider = services.BuildServiceProvider();

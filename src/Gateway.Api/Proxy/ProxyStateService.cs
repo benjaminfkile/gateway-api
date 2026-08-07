@@ -9,7 +9,7 @@ namespace Gateway.Api.Proxy;
 /// Translates the desired-state manifest into YARP routes and clusters and
 /// hands them to <see cref="ManifestProxyConfigProvider"/>. One route + cluster
 /// is built per <c>running</c> manifest entry:
-/// <c>/{name}/{**catch-all}</c> → <c>http://{name}:{port}</c>, with the
+/// <c>/{name}/{**catch-all}</c> → <c>http://127.0.0.1:{port}</c>, with the
 /// <c>/{name}</c> prefix stripped so the downstream app receives the remainder
 /// of the path and query unchanged and never has to know the gateway exists
 /// (design invariant, tech-spec §1). Call <see cref="RefreshRoutesAsync"/> after

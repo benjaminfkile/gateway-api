@@ -91,7 +91,7 @@ public class ReconcilerServiceTests
             services.AddSingleton<IManifestStore>(Store);
             services.AddSingleton<IServiceEnvProvider>(EnvProvider);
             services.AddSingleton<IInstanceStatusStore>(StatusStore);
-            services.AddSingleton<IServiceAddressResolver, ContainerDnsAddressResolver>();
+            services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             var provider = services.BuildServiceProvider();

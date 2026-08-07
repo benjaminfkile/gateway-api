@@ -47,7 +47,7 @@ develop the proxy without Postgres, Docker, or AWS:
 }
 ```
 
-Requests to `/svc-a/*` proxy to `http://svc-a:3001`; `/mgmt/*` returns 503
+Requests to `/svc-a/*` proxy to `http://127.0.0.1:3001`; `/mgmt/*` returns 503
 until a Cognito authority is configured.
 
 ## Configuration

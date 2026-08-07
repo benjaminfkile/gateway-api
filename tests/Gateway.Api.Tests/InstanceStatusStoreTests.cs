@@ -183,7 +183,7 @@ public class InstanceStatusStoreTests
             services.AddScoped<IInstanceStatusStore, EfInstanceStatusStore>();
             services.AddSingleton<IManifestStore>(Manifests);
             services.AddSingleton<IServiceEnvProvider, NullServiceEnvProvider>();
-            services.AddSingleton<IServiceAddressResolver, ContainerDnsAddressResolver>();
+            services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             _provider = services.BuildServiceProvider();
