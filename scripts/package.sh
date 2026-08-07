@@ -22,6 +22,9 @@ OUT_DIR="${REPO_ROOT}/artifacts"
 # Version: first arg, else GITHUB_REF_NAME/tag, else a dev stamp.
 VERSION="${1:-${GITHUB_REF_NAME:-0.0.0-dev}}"
 VERSION="${VERSION#v}" # strip a leading 'v' from a git tag
+# A bare git SHA (CI passes ${GITHUB_SHA::7}) is not a valid MSBuild version —
+# anchor non-numeric versions as a 0.0.0 prerelease.
+[[ "${VERSION}" =~ ^[0-9] ]] || VERSION="0.0.0-${VERSION}"
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
