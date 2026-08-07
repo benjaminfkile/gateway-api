@@ -36,6 +36,7 @@ public sealed class ReconcilerService : BackgroundService
     private readonly ILeaderElection _leaderElection;
     private readonly ReconcilerOptions _options;
     private readonly ILogger<ReconcilerService> _logger;
+    private readonly MigrationReadinessGate? _migrationGate;
 
     public ReconcilerService(
         IContainerRuntime runtime,
@@ -47,7 +48,8 @@ public sealed class ReconcilerService : BackgroundService
         InstanceMetadataProvider metadata,
         ILeaderElection leaderElection,
         ReconcilerOptions options,
-        ILogger<ReconcilerService> logger)
+        ILogger<ReconcilerService> logger,
+        MigrationReadinessGate? migrationGate = null)
     {
         _runtime = runtime;
         _proxyState = proxyState;
@@ -59,6 +61,7 @@ public sealed class ReconcilerService : BackgroundService
         _leaderElection = leaderElection;
         _options = options;
         _logger = logger;
+        _migrationGate = migrationGate;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -69,6 +72,23 @@ public sealed class ReconcilerService : BackgroundService
                 "Node reconciler disabled ({EnvVar} != true); not managing any containers.",
                 ReconcilerOptions.EnabledEnvVar);
             return;
+        }
+
+        // Gate on schema migration (tech-spec §6): with a database configured, do
+        // not converge or heartbeat until the migration hosted service has applied
+        // pending migrations — otherwise every manifest/status query races a schema
+        // that may not exist yet. The gate is already open when no DB is configured.
+        if (_migrationGate is not null)
+        {
+            _logger.LogInformation("Waiting for database migrations to complete before reconciling.");
+            try
+            {
+                await _migrationGate.WaitAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
         }
 
         _logger.LogInformation("Node reconciler enabled; converging every {Interval} (± {Jitter}).",

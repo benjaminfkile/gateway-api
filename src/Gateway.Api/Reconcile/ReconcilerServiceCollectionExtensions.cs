@@ -1,4 +1,5 @@
 using Gateway.Api.Containers;
+using Gateway.Api.Data;
 using Gateway.Api.Instances;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -70,6 +71,12 @@ public static class ReconcilerServiceCollectionExtensions
         // Postgres-advisory-lock leader and EF-backed store when a DB is configured.
         services.TryAddSingleton<ILeaderElection>(new InMemoryLeaderElection());
         services.TryAddSingleton<IInstanceStatusStore, NullInstanceStatusStore>();
+
+        // Migration gate (this task, tech-spec §6): the loop waits on this before
+        // reading the schema. Program.cs registers a pending gate + the migration
+        // hosted service when a DB is configured; without a DB there is nothing to
+        // migrate, so default to an already-open gate and boot with zero DB traffic.
+        services.TryAddSingleton(_ => MigrationReadinessGate.AlreadyReady());
 
         services.AddHostedService<ReconcilerService>();
         return services;

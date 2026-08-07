@@ -75,7 +75,7 @@ public class ReconcilerServiceTests
         public ReconcilerOptions Options { get; }
         public ReconcilerService Service { get; }
 
-        public Harness(bool enabled = true, bool isLeader = true)
+        public Harness(bool enabled = true, bool isLeader = true, MigrationReadinessGate? migrationGate = null)
         {
             Leader = new InMemoryLeaderElection(isLeader);
             Options = new ReconcilerOptions
@@ -112,7 +112,8 @@ public class ReconcilerServiceTests
                 metadata,
                 Leader,
                 Options,
-                NullLogger<ReconcilerService>.Instance);
+                NullLogger<ReconcilerService>.Instance,
+                migrationGate);
         }
     }
 
@@ -148,6 +149,37 @@ public class ReconcilerServiceTests
 
         Assert.Empty(harness.Runtime.Operations);
         Assert.False(harness.Runtime.Exists("svc-a"));
+    }
+
+    [Fact]
+    public async Task WaitsForMigrationGate_BeforeReconciling()
+    {
+        // With a DB configured, the reconciler must not converge or heartbeat until
+        // migrations have been applied (tech-spec §6): gate the loop on completion.
+        var gate = new MigrationReadinessGate();
+        var harness = new Harness(migrationGate: gate);
+        await harness.Store.UpsertAsync(Manifest("svc-a"));
+
+        // BackgroundService.StartAsync kicks off ExecuteAsync, which parks on the gate.
+        await harness.Service.StartAsync(CancellationToken.None);
+        await Task.Delay(100);
+
+        // Gate closed → nothing has touched the runtime or published a heartbeat.
+        Assert.Empty(harness.Runtime.Operations);
+        Assert.False(harness.Runtime.Exists("svc-a"));
+        Assert.Empty(harness.StatusStore.Upserts);
+
+        // Open the gate → the reconciler proceeds and converges the box.
+        gate.MarkReady();
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(5);
+        while (!harness.Runtime.Exists("svc-a") && DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.True(harness.Runtime.Exists("svc-a"));
+
+        await harness.Service.StopAsync(CancellationToken.None);
     }
 
     [Fact]
