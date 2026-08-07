@@ -45,6 +45,16 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
             dbConnection,
             logger: sp.GetRequiredService<ILoggerFactory>()
                 .CreateLogger<PostgresAdvisoryLockLeaderElection>()));
+
+    // Apply pending EF Core migrations on boot (tech-spec §6). A fresh database
+    // has no schema, so this must run before the reconciler/heartbeat or any
+    // endpoint touches a table. The hosted service serializes the fleet with a
+    // Postgres advisory lock (distinct key from leader election), retries with
+    // backoff while the box waits for the DB, and fails fast (exits non-zero) if
+    // still unreachable — systemd's Restart=always then retries the whole boot.
+    // Registered before AddNodeReconciler below so it starts first and opens the
+    // MigrationReadinessGate the reconciler waits on.
+    builder.Services.AddDatabaseMigration(dbConnection, builder.Configuration);
 }
 else
 {

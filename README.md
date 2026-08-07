@@ -58,7 +58,7 @@ feature degrades gracefully when its variable is unset, so a bare
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GATEWAY_DB_CONNECTION` | unset | Postgres connection string. Unset → in-memory manifest, DB features (fleet status, deploy history, leader election) inactive. |
+| `GATEWAY_DB_CONNECTION` | unset | Postgres connection string. Set → EF Core migrations are applied automatically on boot (see below), then DB-backed features (manifest, fleet status, deploy history, leader election) are active. Unset → in-memory manifest, all DB features inactive, zero DB traffic. |
 | `GATEWAY_RECONCILER_ENABLED` | `false` | Enable the node reconciler (requires the Docker socket). |
 | `GATEWAY_BOOTSTRAP_ENABLED` | `false` | Run the idempotent node-bootstrap pipeline at startup. |
 | `GATEWAY_COGNITO_AUTHORITY` | unset | Cognito issuer URL for the management plane. Unset → `/mgmt/*` returns 503. |
@@ -72,6 +72,27 @@ feature degrades gracefully when its variable is unset, so a bare
 `ASPNETCORE_URLS` controls the public listener as usual; under systemd,
 `NOTIFY_SOCKET`/`WATCHDOG_USEC` are provided by the unit for the watchdog
 self-check.
+
+### Database migrations (applied automatically)
+
+When `GATEWAY_DB_CONNECTION` is set the gateway **owns its schema and applies
+pending EF Core migrations on boot** — there is no manual `dotnet ef database
+update` step. This runs before the reconciler, heartbeat, or any endpoint that
+reads the schema, so pointing a fresh instance at an empty database just works.
+
+- **Fleet-safe:** when several instances boot at once (ASG scale-out) a Postgres
+  advisory lock (a distinct key from leader election) serializes migration —
+  exactly one instance migrates while the rest wait, then proceed.
+- **Resilient:** if the database is not yet reachable, migration is retried with
+  exponential backoff for a bounded window; if it is still failing the process
+  exits non-zero so systemd (`Restart=always`) restarts it, rather than serving
+  with a configured-but-unmigrated database.
+
+Tune the retry window via the `Migration` configuration section
+(`Migration:MaxWait`, `Migration:InitialBackoff`, `Migration:MaxBackoff`,
+`Migration:BackoffFactor`); the defaults give a ~2 minute window. Authoring new
+migrations still uses the EF Core tools (`dotnet ef migrations add …`) against
+`GatewayDbContextFactory`; applying them is automatic.
 
 ## CI
 
