@@ -34,17 +34,25 @@ public sealed class EcrRegistryAuthProvider : IRegistryAuthProvider
 {
     private static readonly TimeSpan TokenLifetime = TimeSpan.FromHours(6);
 
-    private readonly IImageRegistry _registry;
+    // Resolved lazily: constructing the AWS ECR client requires a region, and a
+    // region-less box (or the CI runner, which has Docker but no AWS) must still
+    // boot. The registry is only touched on the first ECR-image pull.
+    private readonly Func<IImageRegistry> _registry;
     private readonly TimeProvider _time;
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
 
     private AuthConfig? _cached;
     private DateTimeOffset _cachedAt = DateTimeOffset.MinValue;
 
-    public EcrRegistryAuthProvider(IImageRegistry registry, TimeProvider? time = null)
+    public EcrRegistryAuthProvider(Func<IImageRegistry> registry, TimeProvider? time = null)
     {
         _registry = registry;
         _time = time ?? TimeProvider.System;
+    }
+
+    public EcrRegistryAuthProvider(IImageRegistry registry, TimeProvider? time = null)
+        : this(() => registry, time)
+    {
     }
 
     public async Task<AuthConfig?> GetAuthAsync(string image, CancellationToken ct = default)
@@ -64,7 +72,7 @@ public sealed class EcrRegistryAuthProvider : IRegistryAuthProvider
         {
             if (_cached is null || _time.GetUtcNow() - _cachedAt >= TokenLifetime)
             {
-                var credentials = await _registry.GetCredentialsAsync(ct);
+                var credentials = await _registry().GetCredentialsAsync(ct);
                 _cached = new AuthConfig
                 {
                     Username = credentials.Username,

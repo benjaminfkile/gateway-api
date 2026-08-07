@@ -37,7 +37,8 @@ public static class ReconcilerServiceCollectionExtensions
         // Container runtime: real Docker only where the socket exists. Pulls
         // authenticate against ECR via the registry auth provider — the Docker
         // Engine API takes credentials per request, not from `docker login`.
-        services.TryAddSingleton<IRegistryAuthProvider, EcrRegistryAuthProvider>();
+        services.TryAddSingleton<IRegistryAuthProvider>(sp =>
+            new EcrRegistryAuthProvider(() => sp.GetRequiredService<Gateway.Api.Management.IImageRegistry>()));
         if (DockerContainerRuntime.IsSupported)
         {
             services.TryAddSingleton<IContainerRuntime>(sp =>
