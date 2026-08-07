@@ -96,6 +96,25 @@ builder.Services.AddManagementAuthentication();
 // DB branch above wired the EF-backed one.
 builder.Services.AddManagementServices();
 
+// Cross-origin access for the ops dashboard (tech-spec §4.6): the SPA is served
+// from its own origin, so browsers require CORS on /mgmt/* and the /hub
+// negotiate. Only the origins in GATEWAY_CORS_ORIGINS (comma-separated) are
+// allowed, with credentials for SignalR; unset → no CORS and the management
+// plane stays same-origin-only. Proxied application traffic is never touched —
+// downstream apps own their CORS end-to-end (design invariant, §1).
+var corsOrigins = (Environment.GetEnvironmentVariable("GATEWAY_CORS_ORIGINS")
+        ?? builder.Configuration["GATEWAY_CORS_ORIGINS"])
+    ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    ?? Array.Empty<string>();
+if (corsOrigins.Length > 0)
+{
+    builder.Services.AddCors(options => options.AddPolicy("ops", policy => policy
+        .WithOrigins(corsOrigins)
+        .AllowAnyHeader()
+        .AllowAnyMethod()
+        .AllowCredentials()));
+}
+
 // Node bootstrap (tech-spec §4.3, §2): the idempotent pipeline that provisions the
 // box (Docker daemon log rotation, internal network, registry login refreshed on a
 // timer, CloudWatch agent config) — replacing hand-rolled user-data bash. Every
@@ -117,6 +136,16 @@ app.UseInternalListenerIsolation();
 // requests flow through to downstream services untouched (tech-spec §4.1). The
 // SignalR hub's WebSocket transport rides the same middleware.
 app.UseWebSockets();
+
+// Ops CORS runs only on the management/hub surface and only when configured,
+// ahead of the plane guard so preflights succeed without a token.
+if (corsOrigins.Length > 0)
+{
+    app.UseWhen(
+        ctx => ctx.Request.Path.StartsWithSegments("/mgmt")
+            || ctx.Request.Path.StartsWithSegments("/hub"),
+        branch => branch.UseCors("ops"));
+}
 
 // Management-plane configuration guard (tech-spec §5): /mgmt/* returns 503 when
 // no Cognito authority is set. Runs before authentication so the closed-plane
