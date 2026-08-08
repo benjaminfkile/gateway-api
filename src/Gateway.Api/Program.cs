@@ -3,7 +3,6 @@ using Gateway.Api.Bootstrap;
 using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Instances;
-using Gateway.Api.Legacy;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
@@ -243,12 +242,6 @@ app.MapManagementPlane();
 // lifecycle, deploy/rollback). Each requires a Cognito access token and audit-logs
 // mutating calls; all state is read from the DB, never local Docker.
 app.MapManagementApi();
-
-// Legacy-compat local API for downstream services written against the old
-// gateway (/api/about-me, /api/ec2-launch/instances): wmsfo-api blocks at
-// startup until these answer. Shared-key guarded; 503 until GATEWAY_LEGACY_KEY
-// is configured.
-app.MapLegacyCompat(builder.Configuration);
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.
