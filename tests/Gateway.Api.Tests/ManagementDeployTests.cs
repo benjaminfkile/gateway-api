@@ -218,6 +218,62 @@ public class ManagementDeployTests
         });
     }
 
+    [Fact]
+    public async Task Put_ChangedTag_ClearsDigest_AndAudits()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", digest: "sha256:stale", tag: "v1"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken("alice"));
+        // Same image, different tag: the pinned digest was resolved from v1 and is now
+        // stale, so the edit must clear it (production bug 2026-08-08).
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "v2",
+            port = 8080,
+            includeInHealth = true,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("v2", m.Tag);
+            Assert.Null(m.Digest); // cleared so the next reconcile re-resolves from the tag
+            Assert.Equal("alice", m.UpdatedBy);
+
+            var audit = await db.DeployHistory.SingleAsync();
+            Assert.Equal(DeployAction.Upsert, audit.Action);
+            Assert.Equal("alice", audit.Actor);
+        });
+    }
+
+    [Fact]
+    public async Task Put_ChangedImage_ClearsDigest()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", digest: "sha256:stale", tag: "latest"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        // Different image (same tag): the pinned digest belongs to the old repo.
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a-fork",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = true,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("registry/svc-a-fork", m.Image);
+            Assert.Null(m.Digest);
+        });
+    }
+
     [Theory]
     [InlineData("Svc-A")]      // uppercase not allowed
     [InlineData("svc_a")]      // underscore not allowed

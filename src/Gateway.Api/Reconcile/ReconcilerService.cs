@@ -376,10 +376,9 @@ public sealed class ReconcilerService : BackgroundService
         var d = action.Desired!;
         try
         {
-            var digest = await ResolveDigestAsync(d, ct);
             // Docker assigns the host port; record what it actually bound so the
             // proxy forwards there (the manifest port is container-internal only).
-            var hostPort = await _runtime.StartServiceContainerAsync(SpecFor(d, d.Name, digest), ct);
+            var hostPort = await StartWithStaleDigestFallbackAsync(d, d.Name, ct);
             _hostPorts.Set(d.Name, hostPort);
             await _proxyState.RefreshRoutesAsync(ct);
             await _reporter.ReportAsync(new ReconcileOutcome(
@@ -429,10 +428,9 @@ public sealed class ReconcilerService : BackgroundService
             // Clear any stale green candidate from a previous crashed attempt.
             await _runtime.StopAndRemoveAsync(greenName, ct);
 
-            var digest = await ResolveDigestAsync(d, ct);
             // Docker assigns the green candidate a unique ephemeral host port; probe
             // and (later) route to that actual port.
-            var greenPort = await _runtime.StartServiceContainerAsync(SpecFor(d, greenName, digest), ct);
+            var greenPort = await StartWithStaleDigestFallbackAsync(d, greenName, ct);
 
             var greenAddress = _addressResolver.Resolve(greenName, greenPort);
             var ready = await _readinessProber.WaitForReadyAsync(
@@ -489,12 +487,44 @@ public sealed class ReconcilerService : BackgroundService
         }
     }
 
-    private async Task<string?> ResolveDigestAsync(DesiredService d, CancellationToken ct)
+    /// <summary>
+    /// Pull <c>image:tag</c> (so the image is present locally), then start the
+    /// container by the manifest's pinned digest when one is set, or by the freshly
+    /// pulled digest otherwise. Returns the assigned host port.
+    /// <para>
+    /// Defense in depth (tech-spec §7): if starting by the pinned digest fails with
+    /// image-not-found <b>after</b> a successful pull of <c>image:tag</c>, the pin is
+    /// stale (production 2026-08-08: an Upsert changed the tag but left the old
+    /// digest, so every start looped on <c>No such image ...@&lt;stale digest&gt;</c>).
+    /// Fall back to the pulled digest for this start and log a warning naming the
+    /// stale digest. The manifest's pinned digest is authoritative for drift
+    /// detection only after a successful deploy; a one-off fallback start does not
+    /// rewrite it — a deploy re-resolves it, and the Upsert fix now clears it up front.
+    /// </para>
+    /// </summary>
+    private async Task<int> StartWithStaleDigestFallbackAsync(DesiredService d, string containerName, CancellationToken ct)
     {
         // Pull to ensure the image is present locally; prefer the manifest's pinned
         // digest, falling back to whatever the pull resolved.
         var pulled = await _runtime.PullImageAsync(d.Image, d.Tag, ct);
-        return string.IsNullOrEmpty(d.Digest) ? pulled : d.Digest;
+        var pinned = d.Digest;
+        var digest = string.IsNullOrEmpty(pinned) ? pulled : pinned;
+
+        try
+        {
+            return await _runtime.StartServiceContainerAsync(SpecFor(d, containerName, digest), ct);
+        }
+        catch (ContainerImageNotFoundException ex)
+            when (!string.IsNullOrEmpty(pinned) && !string.Equals(pinned, pulled, StringComparison.Ordinal))
+        {
+            _logger.LogWarning(
+                ex,
+                "Start of {Container} by pinned digest {StaleDigest} failed with image-not-found after a "
+                + "successful pull of {Image}:{Tag}; the pinned digest is stale. Falling back to the pulled "
+                + "digest {PulledDigest} for this start.",
+                containerName, pinned, d.Image, d.Tag, pulled);
+            return await _runtime.StartServiceContainerAsync(SpecFor(d, containerName, pulled), ct);
+        }
     }
 
     private ServiceContainerSpec SpecFor(DesiredService d, string containerName, string? digest) =>

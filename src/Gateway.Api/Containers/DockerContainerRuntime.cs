@@ -210,7 +210,27 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
             },
         };
 
-        var created = await _client.Containers.CreateContainerAsync(create, ct);
+        CreateContainerResponse created;
+        try
+        {
+            created = await _client.Containers.CreateContainerAsync(create, ct);
+        }
+        catch (DockerImageNotFoundException ex)
+        {
+            // The referenced image (typically image@digest for a pinned deploy) is
+            // not present locally. Surface a runtime-agnostic exception so the
+            // reconciler can fall back to a freshly-pulled digest (tech-spec §7).
+            throw new ContainerImageNotFoundException(
+                $"No such image {imageRef} for container {spec.Name}.", imageRef, ex);
+        }
+        catch (DockerApiException ex) when (
+            ex.StatusCode == System.Net.HttpStatusCode.NotFound
+            || ex.Message.Contains("No such image", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ContainerImageNotFoundException(
+                $"No such image {imageRef} for container {spec.Name}.", imageRef, ex);
+        }
+
         await _client.Containers.StartContainerAsync(
             created.ID, new ContainerStartParameters(), ct);
 

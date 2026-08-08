@@ -253,6 +253,54 @@ public class ReconcilerServiceTests
     }
 
     [Fact]
+    public async Task Start_StalePinnedDigest_FallsBackToPulledDigest()
+    {
+        // Defense in depth (tech-spec §7): the manifest pins a digest that no longer
+        // exists locally (the production 2026-08-08 stale-digest loop). After the pull
+        // of image:tag succeeds, the start by the stale digest fails image-not-found,
+        // so the reconciler must retry with the freshly pulled digest and succeed.
+        var harness = new Harness();
+        harness.Runtime.PullDigest = (image, tag) => "sha256:fresh";
+        harness.Runtime.MissingDigests.Add("sha256:stale");
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:stale"));
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        // The container came up on the pulled digest, not the stale pinned one.
+        Assert.Equal("sha256:fresh", harness.Runtime.Get("svc-a")!.Digest);
+        // The first start attempt (stale digest) was observed to fail, then a retry ran.
+        Assert.Contains(harness.Runtime.Operations, op => op == "StartFailedImageNotFound:svc-a");
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.Start, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+    }
+
+    [Fact]
+    public async Task BlueGreen_StalePinnedDigest_FallsBackToPulledDigest()
+    {
+        // Same stale-pin defense, on the blue-green path: the green candidate's start
+        // by the pinned digest fails image-not-found after a successful pull, so it
+        // retries on the pulled digest, becomes healthy, and is promoted.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash));
+        harness.Runtime.PullDigest = (image, tag) => "sha256:fresh";
+        harness.Runtime.MissingDigests.Add("sha256:stale");
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:stale"));
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        Assert.False(harness.Runtime.Exists("svc-a-green"));
+        Assert.Equal("sha256:fresh", harness.Runtime.Get("svc-a")!.Digest);
+        Assert.Contains(harness.Runtime.Operations, op => op == "StartFailedImageNotFound:svc-a-green");
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+    }
+
+    [Fact]
     public async Task StopRemove_WhenDesiredStopped()
     {
         var harness = new Harness();
