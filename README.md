@@ -183,6 +183,25 @@ edits require `ops-admin`.
 | `PUT  /mgmt/services/{name}` | Create/update a manifest entry |
 | `DELETE /mgmt/services/{name}` | Remove a service from the manifest — the reconciler stops/removes the now-orphaned container on its next loop. `?force=true` is required when the service participates in the aggregated health check (mirrors `stop`) |
 
+### Convergence errors are visible
+
+Each reconcile loop records the outcome of the most recent action per service: a
+failure stamps `lastError`/`lastErrorAt` on that service's entry in the instance's
+`instance_status` services JSON, and a subsequent success clears them. A service
+that is desired running but whose start keeps failing has no container, yet still
+gets an entry (`state: "absent"`) carrying the error — so a stale-digest start that
+loops on `No such image` is visible through the API instead of hiding in journald.
+
+- `GET /mgmt/services` — each service's `fleet` rollup adds:
+  - `errorOn` — number of instances whose entry for the service carries a `lastError`.
+  - `latestError` — the most recent error fleet-wide as `{ instanceId, message, at }`,
+    or `null` when no instance reports one.
+- `GET /mgmt/instances` — each per-instance service entry adds `lastError` (trimmed
+  to ~300 chars) and `lastErrorAt`, both `null` when the last action succeeded.
+
+Older rows written before these fields existed parse unchanged (the fields default
+to `null`).
+
 ## CI
 
 `.github/workflows/ci.yml`:

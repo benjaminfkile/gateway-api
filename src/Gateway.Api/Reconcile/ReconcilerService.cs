@@ -43,6 +43,12 @@ public sealed class ReconcilerService : BackgroundService
     // process, so PutRetentionPolicy is issued at most once per group (tech-spec §9).
     private readonly HashSet<string> _retentionEnsured = new(StringComparer.Ordinal);
 
+    // Most recent failed reconcile outcome per service, cleared on a subsequent
+    // success. Merged into the heartbeat's services JSON so convergence failures are
+    // visible through the management API instead of only journald (tech-spec §4.4,
+    // production 2026-08-08). Guarded because the heartbeat reads it while actions write it.
+    private readonly Dictionary<string, ServiceError> _serviceErrors = new(StringComparer.Ordinal);
+
     public ReconcilerService(
         IContainerRuntime runtime,
         ProxyStateService proxyState,
@@ -154,6 +160,11 @@ public sealed class ReconcilerService : BackgroundService
 
         var plan = ReconcilePlanner.Plan(desired, actual);
 
+        // Forget errors for services that are no longer desired and have no container
+        // (e.g. a deleted manifest row whose start had been failing) so a removed
+        // service does not linger as a phantom absent-error entry in the heartbeat.
+        PruneErrors(desired, actual);
+
         foreach (var action in plan)
         {
             ct.ThrowIfCancellationRequested();
@@ -210,7 +221,7 @@ public sealed class ReconcilerService : BackgroundService
                 PublicIp = identity.PublicIp,
                 GatewayVer = GatewayVersion.Current,
                 IsLeader = isLeader,
-                Services = InstanceServicesJson.Build(containers),
+                Services = InstanceServicesJson.Build(containers, SnapshotErrors()),
                 HeartbeatAt = DateTimeOffset.UtcNow,
             };
 
@@ -375,6 +386,65 @@ public sealed class ReconcilerService : BackgroundService
         _ => Task.CompletedTask,
     };
 
+    /// <summary>
+    /// Report a reconcile outcome and record it as this service's last-error state
+    /// (tech-spec §4.4): a failure sets <see cref="ServiceError"/> for the service; a
+    /// success clears it. The state is merged into the next heartbeat's services JSON,
+    /// so a service failing every loop — even one with no container (absent) — is
+    /// visible through the management API. Trimmed to keep the jsonb small.
+    /// </summary>
+    private Task ReportOutcomeAsync(ReconcileOutcome outcome, CancellationToken ct)
+    {
+        lock (_serviceErrors)
+        {
+            if (outcome.Status == ReconcileOutcomeStatus.Succeeded)
+            {
+                _serviceErrors.Remove(outcome.ServiceName);
+            }
+            else
+            {
+                _serviceErrors[outcome.ServiceName] =
+                    new ServiceError(InstanceServicesJson.TrimError(outcome.Detail), DateTimeOffset.UtcNow);
+            }
+        }
+
+        return _reporter.ReportAsync(outcome, ct);
+    }
+
+    /// <summary>Snapshot the per-service error state for a heartbeat build (see <see cref="ReportOutcomeAsync"/>).</summary>
+    private IReadOnlyDictionary<string, ServiceError> SnapshotErrors()
+    {
+        lock (_serviceErrors)
+        {
+            return new Dictionary<string, ServiceError>(_serviceErrors, StringComparer.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// Drop tracked errors for services that are neither desired nor present as a
+    /// container, so a service removed from the manifest stops surfacing an absent
+    /// error entry. Errors for a desired service (still failing) or one that still has
+    /// a container are kept until its next successful action clears them.
+    /// </summary>
+    private void PruneErrors(IReadOnlyList<DesiredService> desired, IReadOnlyList<ContainerInfo> actual)
+    {
+        lock (_serviceErrors)
+        {
+            if (_serviceErrors.Count == 0)
+            {
+                return;
+            }
+
+            var keep = new HashSet<string>(desired.Select(d => d.Name), StringComparer.Ordinal);
+            keep.UnionWith(actual.Select(c => c.Name));
+
+            foreach (var name in _serviceErrors.Keys.Where(n => !keep.Contains(n)).ToList())
+            {
+                _serviceErrors.Remove(name);
+            }
+        }
+    }
+
     private async Task StartAsync(ReconcileAction action, CancellationToken ct)
     {
         var d = action.Desired!;
@@ -387,13 +457,13 @@ public sealed class ReconcilerService : BackgroundService
             await _proxyState.RefreshRoutesAsync(ct);
             // The start may have created the CloudWatch group; set retention once (§9).
             await EnsureRetentionAsync(d.Name, ct);
-            await _reporter.ReportAsync(new ReconcileOutcome(
+            await ReportOutcomeAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Failed to start {Service}", d.Name);
-            await _reporter.ReportAsync(new ReconcileOutcome(
+            await ReportOutcomeAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Failed, ex.Message), ct);
         }
     }
@@ -405,13 +475,13 @@ public sealed class ReconcilerService : BackgroundService
             await _runtime.StopAndRemoveAsync(action.ServiceName, ct);
             _hostPorts.Remove(action.ServiceName);
             await _proxyState.RefreshRoutesAsync(ct);
-            await _reporter.ReportAsync(new ReconcileOutcome(
+            await ReportOutcomeAsync(new ReconcileOutcome(
                 action.ServiceName, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Failed to stop/remove {Service}", action.ServiceName);
-            await _reporter.ReportAsync(new ReconcileOutcome(
+            await ReportOutcomeAsync(new ReconcileOutcome(
                 action.ServiceName, action.Kind, ReconcileOutcomeStatus.Failed, ex.Message), ct);
         }
     }
@@ -447,7 +517,7 @@ public sealed class ReconcilerService : BackgroundService
                 // Abort cleanly: drop the unhealthy candidate; the old container
                 // never stopped serving and no route changed.
                 await _runtime.StopAndRemoveAsync(greenName, ct);
-                await _reporter.ReportAsync(new ReconcileOutcome(
+                await ReportOutcomeAsync(new ReconcileOutcome(
                     d.Name, action.Kind, ReconcileOutcomeStatus.Failed,
                     $"green candidate not ready within {_options.ReadinessTimeout}; old container left serving"), ct);
                 return;
@@ -469,7 +539,7 @@ public sealed class ReconcilerService : BackgroundService
 
             // The green start may have created the CloudWatch group; set retention (§9).
             await EnsureRetentionAsync(d.Name, ct);
-            await _reporter.ReportAsync(new ReconcileOutcome(
+            await ReportOutcomeAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
         }
         catch (OperationCanceledException)
@@ -490,7 +560,7 @@ public sealed class ReconcilerService : BackgroundService
                 _logger.LogError(cleanupEx, "Failed to clean up green candidate {Green}", greenName);
             }
 
-            await _reporter.ReportAsync(new ReconcileOutcome(
+            await ReportOutcomeAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Failed, ex.Message), CancellationToken.None);
         }
     }

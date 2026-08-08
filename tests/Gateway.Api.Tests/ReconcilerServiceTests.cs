@@ -812,4 +812,117 @@ public class ReconcilerServiceTests
 
         Assert.Contains(("/gateway/services/svc-a", 30), harness.LogGroupAdmin.Calls);
     }
+
+    /// <summary>The svc entry in the most recent heartbeat's services JSON, or null when absent.</summary>
+    private static InstanceServiceEntry? HeartbeatEntry(Harness harness, string service) =>
+        InstanceServicesJson.Parse(harness.StatusStore.Upserts[^1].Services)
+            .FirstOrDefault(e => e.Name == service);
+
+    [Fact]
+    public async Task Heartbeat_RecordsLastError_OnFailure_ThenClearsOnSuccess()
+    {
+        // Requirement #1/#4: a failed reconcile action records lastError/lastErrorAt on
+        // the service's heartbeat entry; a subsequent success for the same service
+        // clears them. Uses the blue-green abort path (old container keeps serving).
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = false; // green never becomes healthy -> failure
+
+        await harness.Service.RunOnceAsync();
+
+        var failed = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(failed);
+        Assert.Equal("running", failed!.State); // old container still serving
+        Assert.False(string.IsNullOrEmpty(failed.LastError));
+        Assert.NotNull(failed.LastErrorAt);
+
+        // Now the green candidate becomes healthy: the replace succeeds and clears the error.
+        harness.Prober.Ready = true;
+        await harness.Service.RunOnceAsync();
+
+        var recovered = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(recovered);
+        Assert.Equal("sha256:v2", recovered!.Digest);
+        Assert.Null(recovered.LastError);
+        Assert.Null(recovered.LastErrorAt);
+    }
+
+    [Fact]
+    public async Task Heartbeat_AbsentButDesired_FailedStart_CarriesErrorEntry()
+    {
+        // Requirement #3: a service desired running whose start keeps failing has NO
+        // container, but must still get an entry carrying the error — otherwise the
+        // failure is invisible (production 2026-08-08: 'No such image' every loop).
+        var harness = new Harness();
+        harness.Runtime.PullDigest = (_, _) => "sha256:missing";
+        harness.Runtime.MissingDigests.Add("sha256:missing"); // every start throws image-not-found
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: null));
+
+        await harness.Service.RunOnceAsync();
+
+        // The start failed, so there is no container...
+        Assert.False(harness.Runtime.Exists("svc-a"));
+        var failedOutcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileOutcomeStatus.Failed, failedOutcome.Status);
+
+        // ...yet the heartbeat still lists svc-a as an 'absent' entry carrying the error.
+        var entry = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(entry);
+        Assert.Equal(InstanceServicesJson.AbsentState, entry!.State);
+        Assert.Null(entry.Digest);
+        Assert.False(string.IsNullOrEmpty(entry.LastError));
+        Assert.NotNull(entry.LastErrorAt);
+    }
+
+    [Fact]
+    public async Task Heartbeat_AbsentError_Pruned_WhenServiceRemovedFromManifest()
+    {
+        // An absent-but-desired service failing to start records an error; once the
+        // manifest row is deleted (no container to stop-remove and clear it), the error
+        // must not linger forever as a phantom entry.
+        var harness = new Harness();
+        harness.Runtime.PullDigest = (_, _) => "sha256:missing";
+        harness.Runtime.MissingDigests.Add("sha256:missing");
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: null));
+
+        await harness.Service.RunOnceAsync();
+        Assert.NotNull(HeartbeatEntry(harness, "svc-a")); // error recorded while desired
+
+        // Remove the service from the manifest and reconcile again.
+        await harness.Store.DeleteAsync("svc-a");
+        await harness.Service.RunOnceAsync();
+
+        Assert.Null(HeartbeatEntry(harness, "svc-a")); // no phantom absent-error entry
+    }
+
+    [Fact]
+    public async Task Heartbeat_LastError_TrimmedToBound()
+    {
+        // Requirement #1: lastError is trimmed to ~300 chars so the jsonb stays small.
+        var harness = new Harness();
+        harness.Runtime.PullDigest = (_, _) => "sha256:missing";
+        harness.Runtime.MissingDigests.Add("sha256:missing");
+        // Force a very long failure detail via a long image ref (surfaced in ex.Message).
+        var longName = new string('a', 500);
+        await harness.Store.UpsertAsync(new ServiceManifest
+        {
+            Name = "svc-a",
+            Image = $"registry/{longName}",
+            Tag = "latest",
+            Digest = null,
+            Port = 8080,
+            DesiredStatus = "running",
+            IncludeInHealth = true,
+            UpdatedBy = "test",
+            UpdatedAt = DateTimeOffset.UnixEpoch,
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var entry = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(entry);
+        Assert.NotNull(entry!.LastError);
+        Assert.True(entry.LastError!.Length <= InstanceServicesJson.MaxErrorLength);
+    }
 }
