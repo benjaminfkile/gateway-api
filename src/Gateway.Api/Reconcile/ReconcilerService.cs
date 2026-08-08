@@ -157,10 +157,19 @@ public sealed class ReconcilerService : BackgroundService
         var (desired, envFailed) = await BuildDesiredAsync(ct);
         var actual = await _runtime.ListManagedContainersAsync(ct);
 
-        // Refresh container-truth ports before acting: this self-heals the map after
-        // a gateway restart (a promoted-green container keeps its assigned host port) and
-        // keeps the proxy/health prober pointed at real ports (tech-spec §7).
-        _hostPorts.ReplaceFrom(actual);
+        // Reconcile the container-truth host-port map + routes before acting, from the
+        // ACTUAL running containers' published ports (tech-spec §7, production 2026-08-08).
+        // A port that changed outside a reconciler action — Docker restart-policy
+        // recovery, manual intervention, or a crash-looper that finally stabilized on a
+        // (possibly new-to-us) port — updates the map and refreshes YARP within one loop,
+        // with no gateway restart. Services mid blue-green keep their destination override
+        // (skipped so it is not clobbered), and routes rebuild only on a real change so a
+        // steady fleet churns nothing.
+        var midSwap = _proxyState.ServicesWithDestinationOverride();
+        if (_hostPorts.ReconcileFrom(actual, midSwap))
+        {
+            await _proxyState.RefreshRoutesAsync(ct);
+        }
 
         var plan = ReconcilePlanner.Plan(desired, actual);
 

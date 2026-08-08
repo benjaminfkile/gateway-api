@@ -37,18 +37,35 @@ public sealed class ServiceHostPortMap
     /// <summary>Try to read a service's actual host port.</summary>
     public bool TryGet(string service, out int hostPort) => _ports.TryGetValue(service, out hostPort);
 
+    private static readonly IReadOnlySet<string> None =
+        new HashSet<string>(StringComparer.Ordinal);
+
     /// <summary>
     /// Rebuild the whole map from a fresh container inventory snapshot. Only
     /// canonical containers with a known host port are recorded; transient
     /// <c>-green</c> candidates are ignored (the reconciler owns their lifecycle),
     /// and services no longer present are dropped.
     /// </summary>
-    public void ReplaceFrom(IEnumerable<ContainerInfo> containers)
+    public void ReplaceFrom(IEnumerable<ContainerInfo> containers) => ReconcileFrom(containers, None);
+
+    /// <summary>
+    /// Reconcile the map against a fresh container inventory (container-truth),
+    /// leaving services in <paramref name="skip"/> untouched — those are mid
+    /// blue-green swap, so their canonical port is deliberately overridden and must
+    /// not be clobbered (tech-spec §7, requirement #2). Returns <c>true</c> when any
+    /// recorded port was added, changed, or removed, so the caller can rebuild YARP
+    /// routes <b>only</b> on a real change — a steady fleet churns nothing
+    /// (requirement #3). This is what heals the map when a container's published
+    /// port changes outside a reconciler action — Docker restart-policy recovery,
+    /// manual intervention, or a crash-looper that finally stabilized (production
+    /// 2026-08-08) — within one loop and with no gateway restart (requirements #1, #4).
+    /// </summary>
+    public bool ReconcileFrom(IEnumerable<ContainerInfo> containers, IReadOnlySet<string> skip)
     {
         var snapshot = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var c in containers)
         {
-            if (ReconcileNaming.IsGreen(c.Name))
+            if (ReconcileNaming.IsGreen(c.Name) || skip.Contains(c.Name))
             {
                 continue;
             }
@@ -59,17 +76,35 @@ public sealed class ServiceHostPortMap
             }
         }
 
+        var changed = false;
+
+        // Drop services whose canonical container has vanished (a swap-in-progress
+        // service is never dropped: it is in skip and its old container is still up).
         foreach (var key in _ports.Keys.ToList())
         {
-            if (!snapshot.ContainsKey(key))
+            if (skip.Contains(key) || snapshot.ContainsKey(key))
             {
-                _ports.TryRemove(key, out _);
+                continue;
+            }
+
+            if (_ports.TryRemove(key, out _))
+            {
+                changed = true;
             }
         }
 
+        // Add or update from container truth; only a genuine move counts as a change.
         foreach (var kvp in snapshot)
         {
+            if (_ports.TryGetValue(kvp.Key, out var existing) && existing == kvp.Value)
+            {
+                continue;
+            }
+
             _ports[kvp.Key] = kvp.Value;
+            changed = true;
         }
+
+        return changed;
     }
 }
