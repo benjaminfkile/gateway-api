@@ -79,6 +79,23 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
             var labels = c.Labels ?? new Dictionary<string, string>();
             labels.TryGetValue(ContainerLabels.Digest, out var digest);
             labels.TryGetValue(ContainerLabels.EnvHash, out var envHash);
+            labels.TryGetValue(ContainerLabels.HostPort, out var hostPortLabel);
+            int? hostPort =
+                int.TryParse(hostPortLabel, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPort)
+                    ? parsedPort
+                    : null;
+
+            // Fallback for containers created before the host-port label existed
+            // (e.g. one already promoted onto a side port by an older gateway): read
+            // the actual published binding so the gateway still forwards correctly.
+            if (hostPort is null && c.Ports is { Count: > 0 })
+            {
+                var published = c.Ports.FirstOrDefault(p => p.PublicPort != 0);
+                if (published is not null)
+                {
+                    hostPort = published.PublicPort;
+                }
+            }
 
             // Prefer the daemon's precise start time; fall back to created time.
             DateTimeOffset? startedAt = null;
@@ -111,6 +128,7 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
                 State: c.State ?? string.Empty,
                 StartedAt: startedAt,
                 EnvHash: string.IsNullOrEmpty(envHash) ? null : envHash,
+                HostPort: hostPort,
                 Restarts: restarts));
         }
 
@@ -159,6 +177,10 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
                 [ContainerLabels.Service] = spec.Name,
                 [ContainerLabels.Digest] = spec.Digest ?? string.Empty,
                 [ContainerLabels.EnvHash] = spec.EnvHash ?? string.Empty,
+                // Record the actual host-published port: bindings are fixed at
+                // create time, so this is the port the gateway must forward to even
+                // after a green candidate is promoted to the canonical name.
+                [ContainerLabels.HostPort] = hostPort,
             },
             ExposedPorts = new Dictionary<string, EmptyStruct>
             {

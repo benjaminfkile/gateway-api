@@ -61,6 +61,7 @@ public class ReconcilerDeployProgressTests
             services.AddSingleton<IInstanceStatusStore>(StatusStore);
             services.AddSingleton<IDeployStore>(DeployStore);
             services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+            services.AddSingleton<ServiceHostPortMap>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             var provider = services.BuildServiceProvider();
@@ -74,6 +75,7 @@ public class ReconcilerDeployProgressTests
                 Runtime,
                 provider.GetRequiredService<ProxyStateService>(),
                 provider.GetRequiredService<IServiceAddressResolver>(),
+                provider.GetRequiredService<ServiceHostPortMap>(),
                 provider.GetRequiredService<IServiceScopeFactory>(),
                 new FakeReadinessProber(),
                 new NullReporter(),

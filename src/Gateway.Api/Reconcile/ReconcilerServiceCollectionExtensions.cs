@@ -58,6 +58,11 @@ public static class ReconcilerServiceCollectionExtensions
         services.TryAddSingleton<IServiceEnvProvider, NullServiceEnvProvider>();
         services.TryAddSingleton<IReconcileReporter, LoggingReconcileReporter>();
 
+        // Container-truth port map (tech-spec §7): the reconciler keeps it current
+        // so the proxy/health prober forward to the port each container is actually
+        // bound to. TryAdd — AddManifestProxy usually registers it first.
+        services.TryAddSingleton<Gateway.Api.Proxy.ServiceHostPortMap>();
+
         // Instance identity (tech-spec §4.4): IMDSv2 first, environment fallback
         // auto-selected when IMDS is unreachable. The IMDS client sets the
         // link-local base address; Ec2InstanceMetadata bounds each call to 2s.

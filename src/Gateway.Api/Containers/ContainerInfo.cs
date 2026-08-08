@@ -19,6 +19,14 @@ namespace Gateway.Api.Containers;
 /// Hash of the environment the container was created with, captured as a label so
 /// env drift triggers a blue-green replace. Null when unknown.
 /// </param>
+/// <param name="HostPort">
+/// The host-published port the container is <b>actually</b> bound to, captured as a
+/// label at start time. Docker port bindings are fixed at create time, so a
+/// blue-green candidate promoted to the canonical name keeps its side port — the
+/// gateway must forward to this port, not the manifest port (which is only the
+/// container-side contract). Null when unknown (e.g. a container not started by
+/// this gateway).
+/// </param>
 /// <param name="Restarts">
 /// How many times the container has been restarted by Docker, surfaced in the
 /// fleet <c>instance_status</c> heartbeat (tech-spec §4.4). Defaults to 0 when the
@@ -31,4 +39,5 @@ public sealed record ContainerInfo(
     string State,
     DateTimeOffset? StartedAt,
     string? EnvHash,
+    int? HostPort = null,
     int Restarts = 0);

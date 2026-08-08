@@ -74,6 +74,9 @@ public class ReconcilerServiceTests
         public InMemoryLeaderElection Leader { get; }
         public ReconcilerOptions Options { get; }
         public ReconcilerService Service { get; }
+        public ServiceHostPortMap HostPorts { get; }
+        public ProxyStateService ProxyState { get; }
+        public ManifestProxyConfigProvider ProxyConfig { get; }
 
         public Harness(bool enabled = true, bool isLeader = true, MigrationReadinessGate? migrationGate = null)
         {
@@ -92,9 +95,14 @@ public class ReconcilerServiceTests
             services.AddSingleton<IServiceEnvProvider>(EnvProvider);
             services.AddSingleton<IInstanceStatusStore>(StatusStore);
             services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+            services.AddSingleton<ServiceHostPortMap>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             var provider = services.BuildServiceProvider();
+
+            HostPorts = provider.GetRequiredService<ServiceHostPortMap>();
+            ProxyState = provider.GetRequiredService<ProxyStateService>();
+            ProxyConfig = provider.GetRequiredService<ManifestProxyConfigProvider>();
 
             var metadata = new InstanceMetadataProvider(
                 new IInstanceMetadata[]
@@ -104,8 +112,9 @@ public class ReconcilerServiceTests
 
             Service = new ReconcilerService(
                 Runtime,
-                provider.GetRequiredService<ProxyStateService>(),
+                ProxyState,
                 provider.GetRequiredService<IServiceAddressResolver>(),
+                HostPorts,
                 provider.GetRequiredService<IServiceScopeFactory>(),
                 Prober,
                 Reporter,
@@ -114,6 +123,18 @@ public class ReconcilerServiceTests
                 Options,
                 NullLogger<ReconcilerService>.Instance,
                 migrationGate);
+        }
+
+        /// <summary>
+        /// The YARP destination address currently configured for a service's route,
+        /// or null if the service has no cluster. Reads back what
+        /// <see cref="ProxyStateService"/> published to the config provider.
+        /// </summary>
+        public string? DestinationFor(string service)
+        {
+            var cluster = ProxyConfig.GetConfig().Clusters
+                .FirstOrDefault(c => c.ClusterId == $"cluster-{service}");
+            return cluster?.Destinations?.Values.FirstOrDefault()?.Address;
         }
     }
 
@@ -134,8 +155,28 @@ public class ReconcilerServiceTests
         UpdatedAt = DateTimeOffset.UnixEpoch,
     };
 
-    private static ContainerInfo Running(string name, string digest, string? envHash) =>
-        new(name, $"registry/{name}", digest, "running", DateTimeOffset.UnixEpoch, envHash);
+    private static ContainerInfo Running(string name, string digest, string? envHash, int hostPort = 8080) =>
+        new(name, $"registry/{name}", digest, "running", DateTimeOffset.UnixEpoch, envHash, HostPort: hostPort);
+
+    /// <summary>
+    /// Build a standalone proxy stack (host-port map + config provider +
+    /// <see cref="ProxyStateService"/>) over the given manifest store — used to
+    /// simulate a fresh gateway process whose in-memory swap state is gone.
+    /// </summary>
+    private static (ProxyStateService State, ManifestProxyConfigProvider Config, ServiceHostPortMap HostPorts)
+        BuildProxyStack(IManifestStore store)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(store);
+        services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+        services.AddSingleton<ServiceHostPortMap>();
+        services.AddSingleton<ManifestProxyConfigProvider>();
+        services.AddSingleton<ProxyStateService>();
+        var sp = services.BuildServiceProvider();
+        return (sp.GetRequiredService<ProxyStateService>(),
+                sp.GetRequiredService<ManifestProxyConfigProvider>(),
+                sp.GetRequiredService<ServiceHostPortMap>());
+    }
 
     [Fact]
     public async Task DisabledByDefault_DoesNothing()
@@ -297,6 +338,104 @@ public class ReconcilerServiceTests
         var outcome = Assert.Single(harness.Reporter.Outcomes);
         Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
         Assert.Equal(ReconcileOutcomeStatus.Failed, outcome.Status);
+    }
+
+    [Fact]
+    public async Task BlueGreen_Promote_Destination_TargetsActualSidePort()
+    {
+        // The core bug: Docker port bindings are fixed at create time, so a
+        // promoted green candidate keeps its side port. Traffic must follow it.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync();
+
+        var expectedPort = 8080 + harness.Options.SidePortOffset; // 8081
+
+        // The container really is bound to the side port after promotion.
+        Assert.Equal(expectedPort, harness.Runtime.Get("svc-a")!.HostPort);
+        // The container-truth map records it, and the YARP route targets it — no
+        // stale override, and NOT the manifest port where nothing listens.
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(expectedPort, mapped);
+        Assert.Equal($"http://127.0.0.1:{expectedPort}", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task AfterRestart_RoutesBuiltFromInventory_TargetPromotedSidePort()
+    {
+        // Simulate a gateway restart after a successful deploy: a promoted-green
+        // container is bound to the side port, running the current digest, but the
+        // in-memory swap state that recorded that port is gone. On startup the route
+        // table must be rebuilt from container truth (ProxyRouteInitializer), so the
+        // service keeps receiving traffic on its real port.
+        var runtime = new FakeContainerRuntime();
+        runtime.Seed(new ContainerInfo(
+            "svc-a", "registry/svc-a", "sha256:v2", "running",
+            DateTimeOffset.UnixEpoch, EmptyEnvHash, HostPort: 8081));
+
+        var store = new InMemoryManifestStore();
+        await store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+
+        var (state, config, hostPorts) = BuildProxyStack(store);
+        var initializer = new ProxyRouteInitializer(
+            state, hostPorts, NullLogger<ProxyRouteInitializer>.Instance, runtime);
+
+        await initializer.StartAsync(CancellationToken.None);
+
+        Assert.True(hostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(8081, mapped);
+        var cluster = Assert.Single(config.GetConfig().Clusters);
+        Assert.Equal("http://127.0.0.1:8081", cluster.Destinations!.Values.Single().Address);
+    }
+
+    [Fact]
+    public async Task Deploy_Promote_ThenNextLoop_IsNoOp()
+    {
+        // Regression for the observed replace churn (tech-spec §7): a container
+        // serving on the side port with the correct digest/env must NOT be flagged
+        // as drift. Deploy -> promote -> next reconcile loop is a pure no-op.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync(); // deploy + promote
+        Assert.Equal("sha256:v2", harness.Runtime.Get("svc-a")!.Digest);
+
+        harness.Reporter.Outcomes.Clear();
+        var opsBefore = harness.Runtime.Operations.Count;
+
+        await harness.Service.RunOnceAsync(); // steady state
+
+        var newOps = harness.Runtime.Operations.Skip(opsBefore).ToList();
+        Assert.Empty(newOps);
+        Assert.Empty(harness.Reporter.Outcomes);
+    }
+
+    [Fact]
+    public async Task BlueGreen_Failure_LeavesRouteOnOldContainerPort()
+    {
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = false; // green never becomes healthy
+
+        // Routes as they would be after startup — proven not to move on abort.
+        harness.HostPorts.ReplaceFrom(await harness.Runtime.ListManagedContainersAsync());
+        await harness.ProxyState.RefreshRoutesAsync();
+        Assert.Equal("http://127.0.0.1:8080", harness.DestinationFor("svc-a"));
+
+        await harness.Service.RunOnceAsync();
+
+        // Old container untouched on its real port; route and map unchanged.
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        Assert.Equal(8080, harness.Runtime.Get("svc-a")!.HostPort);
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(8080, mapped);
+        Assert.Equal("http://127.0.0.1:8080", harness.DestinationFor("svc-a"));
     }
 
     [Fact]

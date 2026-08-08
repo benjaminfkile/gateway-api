@@ -19,4 +19,12 @@ public static class ContainerLabels
 
     /// <summary>Hash of the environment the container was created with.</summary>
     public const string EnvHash = "gateway.env-hash";
+
+    /// <summary>
+    /// The host-published port the container is bound to. Recorded because Docker
+    /// port bindings are fixed at create time: a promoted blue-green candidate keeps
+    /// its side port, so the gateway resolves traffic to this port rather than the
+    /// manifest port (which is only the container-side contract).
+    /// </summary>
+    public const string HostPort = "gateway.host-port";
 }

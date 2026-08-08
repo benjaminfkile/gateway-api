@@ -20,6 +20,7 @@ public sealed class ProxyStateService
     private readonly ManifestProxyConfigProvider _provider;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IServiceAddressResolver _addressResolver;
+    private readonly ServiceHostPortMap _hostPorts;
 
     // Temporary per-service destination overrides used during a blue-green swap:
     // while set, a service's route points at the given address (the green
@@ -31,11 +32,13 @@ public sealed class ProxyStateService
     public ProxyStateService(
         ManifestProxyConfigProvider provider,
         IServiceScopeFactory scopeFactory,
-        IServiceAddressResolver addressResolver)
+        IServiceAddressResolver addressResolver,
+        ServiceHostPortMap hostPorts)
     {
         _provider = provider;
         _scopeFactory = scopeFactory;
         _addressResolver = addressResolver;
+        _hostPorts = hostPorts;
     }
 
     /// <summary>Rebuild the proxy routes from the current manifest state.</summary>
@@ -84,10 +87,12 @@ public sealed class ProxyStateService
                     ["primary"] = new DestinationConfig
                     {
                         // A blue-green swap in progress points this route at the
-                        // green candidate; otherwise use the canonical address.
+                        // green candidate; otherwise forward to the port the
+                        // container is actually bound to (which may be a side port
+                        // after a promote), falling back to the manifest port.
                         Address = _destinationOverrides.TryGetValue(manifest.Name, out var overrideAddress)
                             ? overrideAddress
-                            : _addressResolver.Resolve(manifest),
+                            : ResolveCanonical(manifest),
                     },
                 },
             });
@@ -95,6 +100,17 @@ public sealed class ProxyStateService
 
         _provider.Update(routes, clusters);
     }
+
+    /// <summary>
+    /// The canonical destination address for a service: the actual host port of its
+    /// running container (container-truth) when known, else the manifest port. The
+    /// container-truth port is what keeps a promoted-green container — bound to a
+    /// side port for the life of its process — reachable (this bug, tech-spec §7).
+    /// </summary>
+    private string ResolveCanonical(ServiceManifest manifest) =>
+        _hostPorts.TryGet(manifest.Name, out var hostPort)
+            ? _addressResolver.Resolve(manifest.Name, hostPort)
+            : _addressResolver.Resolve(manifest);
 
     /// <summary>
     /// Point a service's route at <paramref name="address"/> (a blue-green
