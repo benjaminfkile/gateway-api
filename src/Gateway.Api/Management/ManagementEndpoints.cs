@@ -248,9 +248,18 @@ public static partial class ManagementEndpoints
             return NotFoundService(name);
         }
 
-        // Restart = touch updated_at to force the reconciler's env-drift replace path
-        // (tech-spec §4.5); no field other than the audit stamp changes.
-        await MutateAsync(manifests, manifest, _ => { }, user, ct);
+        // Restart = stamp restart_requested_at = now (tech-spec §4.5). Each instance's
+        // reconciler then blue-green-recreates any container that started before this
+        // stamp (same digest/tag, zero-downtime) and leaves already-recreated containers
+        // alone, so a restart converges fleet-wide exactly once — no restart loop. It
+        // also (re)asserts desired=running, so a restart on a stopped service starts it,
+        // matching /start (documented in the README mgmt table).
+        var now = DateTimeOffset.UtcNow;
+        await MutateAsync(manifests, manifest, m =>
+        {
+            m.DesiredStatus = "running";
+            m.RestartRequestedAt = now;
+        }, user, ct);
         await AuditAsync(deploys, name, DeployAction.Restart, user, manifest.Digest, manifest.Digest, ct);
 
         return Results.Json(new { name, action = DeployAction.Restart });
@@ -567,6 +576,9 @@ public static partial class ManagementEndpoints
             includeInHealth = m.IncludeInHealth,
             updatedBy = m.UpdatedBy,
             updatedAt = m.UpdatedAt,
+            // When a fleet-wide restart was last requested (null if never); instances
+            // recreate any container older than this stamp (tech-spec §4.5).
+            restartRequestedAt = m.RestartRequestedAt,
             fleet = new
             {
                 runningOn = rollup.RunningOn,

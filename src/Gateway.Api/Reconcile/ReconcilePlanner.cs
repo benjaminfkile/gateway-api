@@ -12,6 +12,16 @@ namespace Gateway.Api.Reconcile;
 public static class ReconcilePlanner
 {
     /// <summary>
+    /// Clock tolerance applied to the restart-drift comparison (tech-spec §4.5,
+    /// requirement #3). A container is treated as satisfying a restart request when it
+    /// started no earlier than <c>restart_requested_at - RestartTolerance</c>. The DB
+    /// (which writes <c>restart_requested_at</c>) and the container runtime share a box
+    /// family, so skew is tiny; the small margin keeps a freshly-recreated container
+    /// from being flagged stale again — which would cause a restart loop.
+    /// </summary>
+    public static readonly TimeSpan RestartTolerance = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// Compute the reconcile plan.
     /// <para>Rules, per service:</para>
     /// <list type="bullet">
@@ -106,6 +116,19 @@ public static class ReconcilePlanner
         if (!string.Equals(d.EnvHash, container.EnvHash, StringComparison.Ordinal))
         {
             return $"env drift: desired {d.EnvHash ?? "<none>"}, running {container.EnvHash ?? "<none>"}";
+        }
+
+        // Restart drift (tech-spec §4.5): a restart request stamps restart_requested_at,
+        // and any container that started before it is stale and must be recreated (same
+        // digest/tag, zero-downtime). A container started at or after the request — within
+        // a small clock tolerance — already satisfies it, so it must NOT drift, else the
+        // recreated container would be replaced every loop. A container with no known
+        // StartedAt is not provably stale, so it is left alone rather than looped on.
+        if (d.RestartRequestedAt is { } requestedAt
+            && container.StartedAt is { } startedAt
+            && startedAt < requestedAt - RestartTolerance)
+        {
+            return $"restart requested at {requestedAt:O}; container started {startedAt:O}";
         }
 
         return null;

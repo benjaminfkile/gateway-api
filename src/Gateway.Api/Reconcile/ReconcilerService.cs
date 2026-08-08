@@ -372,7 +372,8 @@ public sealed class ReconcilerService : BackgroundService
                 Port: m.Port,
                 DesiredStatus: m.DesiredStatus,
                 EnvHash: EnvHasher.Compute(env),
-                EnvVars: env));
+                EnvVars: env,
+                RestartRequestedAt: m.RestartRequestedAt));
         }
 
         return desired;

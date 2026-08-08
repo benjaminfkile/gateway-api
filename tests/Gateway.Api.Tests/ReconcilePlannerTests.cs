@@ -14,20 +14,27 @@ public class ReconcilePlannerTests
     private static readonly IReadOnlyDictionary<string, string> NoEnv =
         new Dictionary<string, string>();
 
+    // A fixed clock so the restart-drift tests reason about StartedAt vs
+    // restart_requested_at without touching the wall clock (the planner is pure).
+    private static readonly DateTimeOffset T0 =
+        new(2026, 8, 8, 12, 0, 0, TimeSpan.Zero);
+
     private static DesiredService Desired(
         string name,
         string status = "running",
         string? digest = "sha256:v1",
         string? envHash = "env-1",
-        int port = 8080) =>
-        new(name, $"registry/{name}", "latest", digest, port, status, envHash, NoEnv);
+        int port = 8080,
+        DateTimeOffset? restartRequestedAt = null) =>
+        new(name, $"registry/{name}", "latest", digest, port, status, envHash, NoEnv, restartRequestedAt);
 
     private static ContainerInfo Container(
         string name,
         string? digest = "sha256:v1",
         string? envHash = "env-1",
-        string state = "running") =>
-        new(name, $"registry/{name}", digest, state, DateTimeOffset.UnixEpoch, envHash);
+        string state = "running",
+        DateTimeOffset? startedAt = null) =>
+        new(name, $"registry/{name}", digest, state, startedAt ?? DateTimeOffset.UnixEpoch, envHash);
 
     private static ReconcileAction Single(
         IReadOnlyList<DesiredService> desired,
@@ -92,6 +99,92 @@ public class ReconcilePlannerTests
             new[] { Container("svc-a", digest: "sha256:v1", envHash: "env-1") });
 
         Assert.Equal(ReconcileActionKind.None, action.Kind);
+    }
+
+    [Fact]
+    public void RestartRequested_ContainerOlder_BlueGreenReplace()
+    {
+        // A running container that started before restart_requested_at is stale: same
+        // digest/env, but the restart request forces a zero-downtime recreate (§4.5).
+        var action = Single(
+            new[] { Desired("svc-a", restartRequestedAt: T0) },
+            new[] { Container("svc-a", startedAt: T0 - TimeSpan.FromMinutes(1)) });
+
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, action.Kind);
+        Assert.Contains("restart requested", action.Reason);
+    }
+
+    [Fact]
+    public void RestartRequested_ContainerStartedAfter_None()
+    {
+        // A container started after the request already satisfies it — it must NOT drift,
+        // else the freshly-recreated container would be replaced every loop (§4.5, #3).
+        var action = Single(
+            new[] { Desired("svc-a", restartRequestedAt: T0) },
+            new[] { Container("svc-a", startedAt: T0 + TimeSpan.FromSeconds(1)) });
+
+        Assert.Equal(ReconcileActionKind.None, action.Kind);
+    }
+
+    [Fact]
+    public void RestartRequested_ContainerWithinTolerance_None()
+    {
+        // Small clock skew: a container that started just before the request (inside the
+        // tolerance window) counts as satisfying it — no restart loop.
+        var action = Single(
+            new[] { Desired("svc-a", restartRequestedAt: T0) },
+            new[] { Container("svc-a", startedAt: T0 - (ReconcilePlanner.RestartTolerance - TimeSpan.FromSeconds(1))) });
+
+        Assert.Equal(ReconcileActionKind.None, action.Kind);
+    }
+
+    [Fact]
+    public void RestartRequested_ContainerJustBeyondTolerance_BlueGreenReplace()
+    {
+        // Started clearly before the request (beyond the tolerance): stale → recreate.
+        var action = Single(
+            new[] { Desired("svc-a", restartRequestedAt: T0) },
+            new[] { Container("svc-a", startedAt: T0 - (ReconcilePlanner.RestartTolerance + TimeSpan.FromSeconds(1))) });
+
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, action.Kind);
+        Assert.Contains("restart requested", action.Reason);
+    }
+
+    [Fact]
+    public void RestartRequested_UnknownStartedAt_None()
+    {
+        // A container whose StartedAt is unknown is not provably stale, so a restart
+        // request does not force a replace (which could otherwise loop forever).
+        var plan = ReconcilePlanner.Plan(
+            new[] { Desired("svc-a", restartRequestedAt: T0) },
+            new[] { new ContainerInfo("svc-a", "registry/svc-a", "sha256:v1", "running", null, "env-1") });
+
+        var action = Assert.Single(plan);
+        Assert.Equal(ReconcileActionKind.None, action.Kind);
+    }
+
+    [Fact]
+    public void NoRestartRequested_OldContainer_None()
+    {
+        // With no restart_requested_at, an old StartedAt is irrelevant — only digest/env
+        // drive drift, so a matching container is converged.
+        var action = Single(
+            new[] { Desired("svc-a", restartRequestedAt: null) },
+            new[] { Container("svc-a", startedAt: DateTimeOffset.UnixEpoch) });
+
+        Assert.Equal(ReconcileActionKind.None, action.Kind);
+    }
+
+    [Fact]
+    public void RestartRequested_StoppedService_StillStopRemove()
+    {
+        // restart_requested_at only matters for a service desired running; a stopped
+        // service with a container is still torn down regardless of the stamp.
+        var action = Single(
+            new[] { Desired("svc-a", status: "stopped", restartRequestedAt: T0) },
+            new[] { Container("svc-a", startedAt: T0 - TimeSpan.FromMinutes(1)) });
+
+        Assert.Equal(ReconcileActionKind.StopRemove, action.Kind);
     }
 
     [Fact]

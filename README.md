@@ -178,7 +178,8 @@ edits require `ops-admin`.
 | `GET  /mgmt/instances` | Fleet list from `instance_status` |
 | `GET  /mgmt/deploys` · `GET /mgmt/deploys/{id}` | Deploy history + live per-instance rollout progress |
 | `GET  /mgmt/services/{name}/logs` | Centralized logs for a service/instance |
-| `POST /mgmt/services/{name}/stop` · `/start` · `/restart` | Set desired status (fleet converges) |
+| `POST /mgmt/services/{name}/stop` · `/start` | Set desired status (fleet converges) |
+| `POST /mgmt/services/{name}/restart` | Stamp `restart_requested_at` → every instance rolling-recreates its container via blue-green (same digest/tag, old serves until green is ready), fleet-wide. A restart on a stopped service starts it (like `/start`) |
 | `POST /mgmt/services/{name}/deploy` · `/rollback` | Resolve digest and roll the fleet |
 | `PUT  /mgmt/services/{name}` | Create/update a manifest entry |
 | `DELETE /mgmt/services/{name}` | Remove a service from the manifest — the reconciler stops/removes the now-orphaned container on its next loop. `?force=true` is required when the service participates in the aggregated health check (mirrors `stop`) |

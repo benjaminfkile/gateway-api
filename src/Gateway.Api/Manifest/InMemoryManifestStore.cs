@@ -95,5 +95,6 @@ public sealed class InMemoryManifestStore : IManifestStore
         IncludeInHealth = m.IncludeInHealth,
         UpdatedBy = m.UpdatedBy,
         UpdatedAt = m.UpdatedAt,
+        RestartRequestedAt = m.RestartRequestedAt,
     };
 }
