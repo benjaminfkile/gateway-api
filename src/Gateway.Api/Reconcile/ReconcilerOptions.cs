@@ -44,6 +44,14 @@ public sealed class ReconcilerOptions
     public LogDriverConfig LogDriver { get; set; } = new();
 
     /// <summary>
+    /// TTL for the per-ref Secrets Manager environment cache (tech-spec §8). Resolved
+    /// env is cached this long so a 30s fleet loop does not hit Secrets Manager per
+    /// service per loop, while a rotated secret still lands within ~TTL + one loop. A
+    /// failed fetch is never cached. Default 60s.
+    /// </summary>
+    public TimeSpan SecretCacheTtl { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
     /// Age past which an <c>instance_status</c> row is considered a departed
     /// instance and pruned by the leader (tech-spec §4.4: rows stale &gt; 90s).
     /// </summary>

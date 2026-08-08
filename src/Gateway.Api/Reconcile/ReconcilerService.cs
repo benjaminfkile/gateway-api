@@ -49,6 +49,10 @@ public sealed class ReconcilerService : BackgroundService
     // production 2026-08-08). Guarded because the heartbeat reads it while actions write it.
     private readonly Dictionary<string, ServiceError> _serviceErrors = new(StringComparer.Ordinal);
 
+    // Services whose most recent error came from environment resolution (tech-spec §8),
+    // so a subsequent successful resolution clears it. Guarded by the _serviceErrors lock.
+    private readonly HashSet<string> _envErrored = new(StringComparer.Ordinal);
+
     public ReconcilerService(
         IContainerRuntime runtime,
         ProxyStateService proxyState,
@@ -150,7 +154,7 @@ public sealed class ReconcilerService : BackgroundService
     /// </summary>
     public async Task RunOnceAsync(CancellationToken ct = default)
     {
-        var desired = await BuildDesiredAsync(ct);
+        var (desired, envFailed) = await BuildDesiredAsync(ct);
         var actual = await _runtime.ListManagedContainersAsync(ct);
 
         // Refresh container-truth ports before acting: this self-heals the map after
@@ -163,7 +167,9 @@ public sealed class ReconcilerService : BackgroundService
         // Forget errors for services that are no longer desired and have no container
         // (e.g. a deleted manifest row whose start had been failing) so a removed
         // service does not linger as a phantom absent-error entry in the heartbeat.
-        PruneErrors(desired, actual);
+        // Services whose env failed to resolve this loop are kept so their error still
+        // surfaces even though they were dropped from the desired set (tech-spec §8).
+        PruneErrors(desired, actual, envFailed);
 
         foreach (var action in plan)
         {
@@ -353,7 +359,17 @@ public sealed class ReconcilerService : BackgroundService
         return store.UpdateAsync(deploy, ct);
     }
 
-    private async Task<IReadOnlyList<DesiredService>> BuildDesiredAsync(CancellationToken ct)
+    /// <summary>
+    /// Project the manifest into desired services, resolving each one's environment
+    /// (tech-spec §8). Env resolution is isolated per service: a missing secret /
+    /// AccessDenied / parse failure fails only <b>that</b> service — it is dropped from
+    /// this pass (its existing container, if any, is left untouched and keeps serving)
+    /// and its ref-only error is recorded through the same last-error plumbing as any
+    /// other reconcile failure, never taking down the loop or other services. Returns
+    /// the resolved services plus the names whose env failed (so their error is not
+    /// pruned as a phantom while they are absent from the desired set).
+    /// </summary>
+    private async Task<(IReadOnlyList<DesiredService> Desired, IReadOnlyList<string> EnvFailed)> BuildDesiredAsync(CancellationToken ct)
     {
         using var scope = _scopeFactory.CreateScope();
         var store = scope.ServiceProvider.GetRequiredService<IManifestStore>();
@@ -361,9 +377,28 @@ public sealed class ReconcilerService : BackgroundService
 
         var manifests = await store.GetAllAsync(ct);
         var desired = new List<DesiredService>(manifests.Count);
+        var envFailed = new List<string>();
         foreach (var m in manifests)
         {
-            var env = await envProvider.GetEnvAsync(m, ct);
+            IReadOnlyDictionary<string, string> env;
+            try
+            {
+                env = await envProvider.GetEnvAsync(m, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Failure isolation (requirement #4): surface a ref-only error for this
+                // service and skip it so its container is left as-is. Values never reach
+                // here — the provider only throws messages naming the ref/name.
+                _logger.LogError(ex, "Failed to resolve environment for {Service}", m.Name);
+                envFailed.Add(m.Name);
+                await RecordEnvErrorAsync(m.Name, ex.Message, ct);
+                continue;
+            }
+
+            // Env resolved: drop any prior env-resolution error for this service.
+            ClearEnvErrorIfPresent(m.Name);
+
             desired.Add(new DesiredService(
                 Name: m.Name,
                 Image: m.Image,
@@ -376,7 +411,38 @@ public sealed class ReconcilerService : BackgroundService
                 RestartRequestedAt: m.RestartRequestedAt));
         }
 
-        return desired;
+        return (desired, envFailed);
+    }
+
+    /// <summary>
+    /// Record an environment-resolution failure for a service (tech-spec §8): tracks it
+    /// as an env error so a later successful resolution clears it, and routes it through
+    /// the shared reconcile-outcome plumbing so it lands in the service's heartbeat
+    /// <c>lastError</c>. The detail is a ref-only message; secret values never appear.
+    /// </summary>
+    private Task RecordEnvErrorAsync(string service, string detail, CancellationToken ct)
+    {
+        lock (_serviceErrors)
+        {
+            _envErrored.Add(service);
+        }
+
+        // Route through the same reporter path as any failed action; there is no action
+        // kind for env resolution, so report it as None (no container change).
+        return ReportOutcomeAsync(new ReconcileOutcome(
+            service, ReconcileActionKind.None, ReconcileOutcomeStatus.Failed, detail), ct);
+    }
+
+    /// <summary>Clear a service's recorded env-resolution error once its env resolves again.</summary>
+    private void ClearEnvErrorIfPresent(string service)
+    {
+        lock (_serviceErrors)
+        {
+            if (_envErrored.Remove(service))
+            {
+                _serviceErrors.Remove(service);
+            }
+        }
     }
 
     private Task ExecuteAsync(ReconcileAction action, CancellationToken ct) => action.Kind switch
@@ -427,7 +493,10 @@ public sealed class ReconcilerService : BackgroundService
     /// error entry. Errors for a desired service (still failing) or one that still has
     /// a container are kept until its next successful action clears them.
     /// </summary>
-    private void PruneErrors(IReadOnlyList<DesiredService> desired, IReadOnlyList<ContainerInfo> actual)
+    private void PruneErrors(
+        IReadOnlyList<DesiredService> desired,
+        IReadOnlyList<ContainerInfo> actual,
+        IReadOnlyList<string> envFailed)
     {
         lock (_serviceErrors)
         {
@@ -438,10 +507,14 @@ public sealed class ReconcilerService : BackgroundService
 
             var keep = new HashSet<string>(desired.Select(d => d.Name), StringComparer.Ordinal);
             keep.UnionWith(actual.Select(c => c.Name));
+            // A service dropped from the desired set this loop because its env failed to
+            // resolve still needs its error surfaced (tech-spec §8), so keep it.
+            keep.UnionWith(envFailed);
 
             foreach (var name in _serviceErrors.Keys.Where(n => !keep.Contains(n)).ToList())
             {
                 _serviceErrors.Remove(name);
+                _envErrored.Remove(name);
             }
         }
     }

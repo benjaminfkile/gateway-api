@@ -1,3 +1,4 @@
+using Amazon.SecretsManager;
 using Gateway.Api.Containers;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
@@ -66,7 +67,19 @@ public static class ReconcilerServiceCollectionExtensions
         });
 
         services.TryAddSingleton<IReadinessProber, HttpReadinessProber>();
-        services.TryAddSingleton<IServiceEnvProvider, NullServiceEnvProvider>();
+
+        // Container env from Secrets Manager (tech-spec §8): resolve each service's
+        // env from its manifest env_secret_ref at (re)create time. The AWS client is
+        // lazy — resolved through a Func<> and only constructed on the first non-empty
+        // ref (like the ECR auth provider) — so a region-less box / AWS-less CI runner
+        // still boots. TryAdd-first: tests substitute a fake IServiceEnvProvider.
+        services.TryAddSingleton<IAmazonSecretsManager>(_ => new AmazonSecretsManagerClient());
+        services.TryAddSingleton<ISecretStore, SecretsManagerSecretStore>();
+        services.TryAddSingleton<IServiceEnvProvider>(sp =>
+            new SecretsManagerEnvProvider(
+                () => sp.GetRequiredService<ISecretStore>(),
+                options.SecretCacheTtl));
+
         services.TryAddSingleton<IReconcileReporter, LoggingReconcileReporter>();
 
         // Container-truth port map (tech-spec §7): the reconciler keeps it current

@@ -351,7 +351,20 @@ both versions).
 - `/internal/*` listener bound to the Docker bridge interface only; never routed by the load balancer.
 - Management plane: Cognito JWT + MFA + group authz + full audit trail (actor, action, before/after digest).
 - Docker socket = root-equivalent: the gateway is the *only* privileged process; downstream containers run unprivileged, no socket mounts.
-- Secrets: containers get env from the secrets store at (re)create time via the reconciler — secret values never stored in the manifest or logs.
+- Secrets: containers get env from the secrets store at (re)create time via the
+  reconciler — secret values never stored in the manifest or logs. **Implemented**
+  (`SecretsManagerEnvProvider`): a manifest row's optional `env_secret_ref` (a secret
+  name or full ARN) names a Secrets Manager secret whose `SecretString` is a flat JSON
+  object of string values, resolved into the container env when the container is
+  (re)created. An empty/unset ref → empty env. The resolved env is folded into the env
+  hash, so a **rotated secret value changes the hash and rolls the container on the
+  next reconcile loop — rotation propagates via env drift**, no explicit restart. The
+  provider caches per ref with a configurable TTL (`Reconciler:SecretCacheTtl`, default
+  60s; a failed fetch is never cached), constructs the AWS client lazily (region-less
+  boxes still boot), and isolates failures: a missing secret, `AccessDenied`, or a
+  non-JSON/non-flat secret fails only that one service's reconcile action (surfaced via
+  the per-service `lastError`), never the loop or other services. Error messages name
+  the ref only; secret values never appear in logs or errors.
 - Keep the database non-public; restrict by security group / network policy.
 
 ---
