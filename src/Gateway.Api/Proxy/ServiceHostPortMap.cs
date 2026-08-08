@@ -8,12 +8,12 @@ namespace Gateway.Api.Proxy;
 /// Container-truth map of canonical service name → the host port its running
 /// managed container is <b>actually</b> published on.
 /// <para>
-/// Docker port bindings are immutable after container creation: when a blue-green
-/// candidate started on a side port is promoted (renamed) to the canonical name it
-/// keeps that side port. The manifest port is therefore only the <i>container-side</i>
-/// contract — the gateway must forward traffic (and health-probe) to the port the
-/// container is truly bound to, or every request 502s after a successful deploy
-/// (this bug, tech-spec §7).
+/// Host ports are Docker-assigned (dynamic) and immutable after container creation:
+/// when a blue-green candidate started on its ephemeral host port is promoted
+/// (renamed) to the canonical name it keeps that port. The manifest port is only the
+/// <i>container-side</i> contract — the gateway must forward traffic (and
+/// health-probe) to the port the container is truly bound to, or every request 502s
+/// after a successful deploy (tech-spec §7).
 /// </para>
 /// <para>
 /// The reconciler keeps this map current from the container inventory (each loop and

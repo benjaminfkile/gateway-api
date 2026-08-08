@@ -88,8 +88,8 @@ public sealed class ProxyStateService
                     {
                         // A blue-green swap in progress points this route at the
                         // green candidate; otherwise forward to the port the
-                        // container is actually bound to (which may be a side port
-                        // after a promote), falling back to the manifest port.
+                        // container is actually bound to (a Docker-assigned host
+                        // port), falling back to the manifest port.
                         Address = _destinationOverrides.TryGetValue(manifest.Name, out var overrideAddress)
                             ? overrideAddress
                             : ResolveCanonical(manifest),
@@ -104,8 +104,8 @@ public sealed class ProxyStateService
     /// <summary>
     /// The canonical destination address for a service: the actual host port of its
     /// running container (container-truth) when known, else the manifest port. The
-    /// container-truth port is what keeps a promoted-green container — bound to a
-    /// side port for the life of its process — reachable (this bug, tech-spec §7).
+    /// container-truth port is what keeps a promoted-green container — bound to its
+    /// Docker-assigned host port for the life of its process — reachable (tech-spec §7).
     /// </summary>
     private string ResolveCanonical(ServiceManifest manifest) =>
         _hostPorts.TryGet(manifest.Name, out var hostPort)

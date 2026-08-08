@@ -32,8 +32,13 @@ public interface IContainerRuntime
     /// Create and start a service container from <paramref name="spec"/>. The
     /// container is started with <c>--restart unless-stopped</c> and the
     /// configured log driver, joins the given network, and is labelled as managed.
+    /// The container-internal port (<see cref="ServiceContainerSpec.Port"/>) is
+    /// published with an <b>unassigned</b> host binding so Docker picks a unique
+    /// ephemeral host port; the method inspects the started container and returns
+    /// the actual assigned host port. The caller records this so the proxy and
+    /// health prober can reach the container (tech-spec §4.1, §7).
     /// </summary>
-    Task StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default);
+    Task<int> StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default);
 
     /// <summary>Stop (if running) and remove the named container. Idempotent.</summary>
     Task StopAndRemoveAsync(string name, CancellationToken ct = default);

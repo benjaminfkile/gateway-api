@@ -36,9 +36,9 @@ public sealed class HttpHealthProber : IHealthProber
 
     public async Task<ServiceProbeResult> ProbeAsync(ServiceManifest manifest, CancellationToken ct = default)
     {
-        // Probe the port the container is actually bound to (a promoted-green
-        // container keeps its side port), falling back to the manifest port when
-        // container-truth is unavailable.
+        // Probe the port the container is actually bound to (a Docker-assigned host
+        // port; a promoted-green container keeps the port it started on), falling
+        // back to the manifest port when container-truth is unavailable.
         var baseAddress = (_hostPorts is not null && _hostPorts.TryGet(manifest.Name, out var hostPort)
             ? _addressResolver.Resolve(manifest.Name, hostPort)
             : _addressResolver.Resolve(manifest)).TrimEnd('/');

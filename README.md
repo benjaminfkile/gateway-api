@@ -50,6 +50,15 @@ develop the proxy without Postgres, Docker, or AWS:
 Requests to `/svc-a/*` proxy to `http://127.0.0.1:3001`; `/mgmt/*` returns 503
 until a Cognito authority is configured.
 
+`Port` is the **container-internal port only** — the port the app binds inside its
+container (Kubernetes `containerPort` semantics), never a fixed host port. In
+production the reconciler publishes it with an unassigned host binding and Docker
+picks a unique ephemeral host port; the gateway forwards to that real, dynamic
+port (surfaced as `hostPort` on `GET /mgmt/services`). Because host ports are
+Docker-assigned, two services may share the same `Port`. In proxy-only dev mode
+there is no reconciler, so the gateway falls back to `Port` as the host port —
+run your app locally on it.
+
 ## Configuration
 
 All settings are environment variables (or equivalent configuration keys); every

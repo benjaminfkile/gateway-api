@@ -13,9 +13,9 @@ namespace Gateway.Api.Proxy;
 /// Before building routes it primes the <see cref="ServiceHostPortMap"/> from the
 /// running container inventory, so routes are built against the ports containers
 /// are <b>actually</b> bound to. This is what keeps a blue-green candidate that was
-/// promoted onto a side port receiving traffic after a gateway restart (tech-spec
-/// §7) — the in-memory swap that recorded that port is gone, so the truth must come
-/// from the containers themselves.
+/// promoted onto its Docker-assigned host port receiving traffic after a gateway
+/// restart (tech-spec §7) — the in-memory swap that recorded that port is gone, so
+/// the truth must come from the containers themselves.
 /// </para>
 /// </summary>
 public sealed class ProxyRouteInitializer : IHostedService

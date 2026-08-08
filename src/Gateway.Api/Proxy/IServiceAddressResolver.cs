@@ -17,9 +17,9 @@ public interface IServiceAddressResolver
     /// <summary>
     /// Resolve the base address for an explicit container name and port — used by
     /// the reconciler to reach a blue-green candidate (<c>{name}-green</c> on its
-    /// side port) before it is promoted to the canonical name. The port is the
-    /// host-published port, so the name does not participate in the default
-    /// loopback form.
+    /// Docker-assigned host port) before it is promoted to the canonical name. The
+    /// port is the host-published port, so the name does not participate in the
+    /// default loopback form.
     /// </summary>
     string Resolve(string name, int port) => $"http://127.0.0.1:{port}";
 }

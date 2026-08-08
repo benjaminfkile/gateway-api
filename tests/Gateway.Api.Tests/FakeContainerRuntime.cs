@@ -27,6 +27,14 @@ public sealed class FakeContainerRuntime : IContainerRuntime
     /// <summary>Digest returned by <see cref="PullImageAsync"/>; keyed by "image:tag", else the default.</summary>
     public Func<string, string, string> PullDigest { get; set; } = (image, tag) => $"sha256:{image}-{tag}";
 
+    // Models Docker's dynamic host-port assignment: each started container gets a
+    // fresh, unique ephemeral host port (Docker's default range starts at 49152),
+    // so no two live containers ever contend for a port.
+    private int _nextHostPort = 49152;
+
+    /// <summary>The next ephemeral host port the fake will assign on the next start.</summary>
+    public int NextHostPort => _nextHostPort;
+
     /// <summary>Seed a pre-existing container (e.g. an already-running old service).</summary>
     public void Seed(ContainerInfo container)
     {
@@ -80,10 +88,14 @@ public sealed class FakeContainerRuntime : IContainerRuntime
         return Task.FromResult(PullDigest(image, tag));
     }
 
-    public Task StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default)
+    public Task<int> StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default)
     {
+        int hostPort;
         lock (_gate)
         {
+            // Docker assigns a unique ephemeral host port at start time; the manifest
+            // port is only the container-internal port and never a host binding.
+            hostPort = _nextHostPort++;
             _containers[spec.Name] = new ContainerInfo(
                 Name: spec.Name,
                 Image: spec.Image,
@@ -91,14 +103,12 @@ public sealed class FakeContainerRuntime : IContainerRuntime
                 State: "running",
                 StartedAt: DateTimeOffset.UnixEpoch,
                 EnvHash: spec.EnvHash,
-                // Model Docker's fixed binding: the host port is the side port when
-                // one is given (a green candidate), otherwise the manifest port.
-                HostPort: spec.SidePort ?? spec.Port);
+                HostPort: hostPort);
         }
 
         StartedSpecs.Enqueue(spec);
         Operations.Enqueue($"Start:{spec.Name}");
-        return Task.CompletedTask;
+        return Task.FromResult(hostPort);
     }
 
     public Task StopAndRemoveAsync(string name, CancellationToken ct = default)

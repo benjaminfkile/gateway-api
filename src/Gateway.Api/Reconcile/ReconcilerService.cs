@@ -148,7 +148,7 @@ public sealed class ReconcilerService : BackgroundService
         var actual = await _runtime.ListManagedContainersAsync(ct);
 
         // Refresh container-truth ports before acting: this self-heals the map after
-        // a gateway restart (a promoted-green container keeps its side port) and
+        // a gateway restart (a promoted-green container keeps its assigned host port) and
         // keeps the proxy/health prober pointed at real ports (tech-spec §7).
         _hostPorts.ReplaceFrom(actual);
 
@@ -375,9 +375,10 @@ public sealed class ReconcilerService : BackgroundService
         try
         {
             var digest = await ResolveDigestAsync(d, ct);
-            await _runtime.StartServiceContainerAsync(SpecFor(d, d.Name, sidePort: null, digest), ct);
-            // A fresh canonical container publishes the manifest port.
-            _hostPorts.Set(d.Name, d.Port);
+            // Docker assigns the host port; record what it actually bound so the
+            // proxy forwards there (the manifest port is container-internal only).
+            var hostPort = await _runtime.StartServiceContainerAsync(SpecFor(d, d.Name, digest), ct);
+            _hostPorts.Set(d.Name, hostPort);
             await _proxyState.RefreshRoutesAsync(ct);
             await _reporter.ReportAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
@@ -410,21 +411,16 @@ public sealed class ReconcilerService : BackgroundService
 
     /// <summary>
     /// Zero-downtime replace (tech-spec §7): pull, start <c>{name}-green</c> on a
-    /// side port, poll readiness; on success swap the YARP destination to green,
-    /// drain, then remove the old container and promote green to the canonical
-    /// name; on failure remove green and leave the old container serving.
+    /// Docker-assigned host port, poll readiness; on success swap the YARP
+    /// destination to green, drain, then remove the old container and promote green
+    /// to the canonical name; on failure remove green and leave the old container
+    /// serving. Docker guarantees the green candidate's ephemeral host port never
+    /// collides with the still-serving old container's, so the two always coexist.
     /// </summary>
     private async Task BlueGreenReplaceAsync(ReconcileAction action, CancellationToken ct)
     {
         var d = action.Desired!;
         var greenName = ReconcileNaming.GreenNameFor(d.Name);
-
-        // The candidate must bind a host port the canonical container is NOT
-        // occupying. After a promote the canonical container sits on the side
-        // port (bindings are immutable), so consecutive deploys alternate
-        // between the manifest port and the side port.
-        var canonicalPort = _hostPorts.TryGet(d.Name, out var current) ? current : d.Port;
-        var sidePort = canonicalPort == d.Port ? d.Port + _options.SidePortOffset : d.Port;
 
         try
         {
@@ -432,9 +428,11 @@ public sealed class ReconcilerService : BackgroundService
             await _runtime.StopAndRemoveAsync(greenName, ct);
 
             var digest = await ResolveDigestAsync(d, ct);
-            await _runtime.StartServiceContainerAsync(SpecFor(d, greenName, sidePort, digest), ct);
+            // Docker assigns the green candidate a unique ephemeral host port; probe
+            // and (later) route to that actual port.
+            var greenPort = await _runtime.StartServiceContainerAsync(SpecFor(d, greenName, digest), ct);
 
-            var greenAddress = _addressResolver.Resolve(greenName, sidePort);
+            var greenAddress = _addressResolver.Resolve(greenName, greenPort);
             var ready = await _readinessProber.WaitForReadyAsync(
                 greenAddress, _options.HealthPath, _options.ReadinessTimeout, ct);
 
@@ -456,11 +454,11 @@ public sealed class ReconcilerService : BackgroundService
             await _runtime.StopAndRemoveAsync(d.Name, ct);
             await _runtime.RenameContainerAsync(greenName, d.Name, ct);
             // Docker port bindings are fixed at create time: the promoted container
-            // keeps the SIDE port for the life of its process. Record that as the
-            // canonical service's real port so clearing the swap override routes
-            // back to where the container actually listens — not the manifest port,
-            // where nothing is bound (this bug, tech-spec §7).
-            _hostPorts.Set(d.Name, sidePort);
+            // keeps the host port Docker assigned it for the life of its process.
+            // Record that as the canonical service's real port so clearing the swap
+            // override routes back to where the container actually listens — not the
+            // manifest port, which is container-internal only (tech-spec §7).
+            _hostPorts.Set(d.Name, greenPort);
             await _proxyState.ClearDestinationOverrideAsync(d.Name, ct);
 
             await _reporter.ReportAsync(new ReconcileOutcome(
@@ -497,13 +495,12 @@ public sealed class ReconcilerService : BackgroundService
         return string.IsNullOrEmpty(d.Digest) ? pulled : d.Digest;
     }
 
-    private ServiceContainerSpec SpecFor(DesiredService d, string containerName, int? sidePort, string? digest) =>
+    private ServiceContainerSpec SpecFor(DesiredService d, string containerName, string? digest) =>
         new(
             Name: containerName,
             Image: d.Image,
             Digest: digest,
             Port: d.Port,
-            SidePort: sidePort,
             EnvVars: d.EnvVars,
             Network: _options.Network,
             LogConfig: _options.LogDriver,

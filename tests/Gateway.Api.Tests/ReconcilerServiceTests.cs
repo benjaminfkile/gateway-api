@@ -296,23 +296,29 @@ public class ReconcilerServiceTests
     }
 
     [Fact]
-    public async Task BlueGreen_ConsecutiveDeploys_AlternateBetweenManifestAndSidePort()
+    public async Task BlueGreen_ConsecutiveDeploys_EachGetFreshEphemeralPort()
     {
-        // After a promote the canonical container occupies the side port (Docker
-        // bindings are immutable); the next candidate must bind the manifest port
-        // or green creation collides with the canonical container.
+        // Host ports are Docker-assigned now: there is NO alternation between a
+        // manifest port and a side port. Each deploy's green candidate gets a fresh
+        // ephemeral host port and the promoted container adopts it.
         var harness = new Harness();
         harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash));
         harness.Prober.Ready = true;
 
         await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2"));
         await harness.Service.RunOnceAsync();
-        Assert.Equal(8081, harness.Runtime.Get("svc-a")!.HostPort);
+        var portAfterFirst = harness.Runtime.Get("svc-a")!.HostPort;
+        Assert.NotNull(portAfterFirst);
+        Assert.NotEqual(8080, portAfterFirst); // never the container-internal port
 
         await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v3"));
         await harness.Service.RunOnceAsync();
-        Assert.Equal(8080, harness.Runtime.Get("svc-a")!.HostPort);
+        var portAfterSecond = harness.Runtime.Get("svc-a")!.HostPort;
         Assert.Equal("sha256:v3", harness.Runtime.Get("svc-a")!.Digest);
+        // A fresh Docker-assigned port each time — not the previous port re-used and
+        // not an alternation back to the manifest port.
+        Assert.NotEqual(portAfterFirst, portAfterSecond);
+        Assert.NotEqual(8080, portAfterSecond);
     }
 
     [Fact]
@@ -361,10 +367,11 @@ public class ReconcilerServiceTests
     }
 
     [Fact]
-    public async Task BlueGreen_Promote_Destination_TargetsActualSidePort()
+    public async Task BlueGreen_Promote_Destination_TargetsAssignedHostPort()
     {
-        // The core bug: Docker port bindings are fixed at create time, so a
-        // promoted green candidate keeps its side port. Traffic must follow it.
+        // Docker port bindings are fixed at create time, so a promoted green keeps
+        // the ephemeral host port Docker assigned it. Traffic must follow it, not
+        // the manifest (container-internal) port where nothing is host-published.
         var harness = new Harness();
         harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
         await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
@@ -372,25 +379,106 @@ public class ReconcilerServiceTests
 
         await harness.Service.RunOnceAsync();
 
-        var expectedPort = 8080 + harness.Options.SidePortOffset; // 8081
-
-        // The container really is bound to the side port after promotion.
-        Assert.Equal(expectedPort, harness.Runtime.Get("svc-a")!.HostPort);
+        // The container is bound to the Docker-assigned ephemeral port after promotion.
+        var assigned = harness.Runtime.Get("svc-a")!.HostPort;
+        Assert.NotNull(assigned);
+        Assert.NotEqual(8080, assigned);
         // The container-truth map records it, and the YARP route targets it — no
         // stale override, and NOT the manifest port where nothing listens.
         Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
-        Assert.Equal(expectedPort, mapped);
-        Assert.Equal($"http://127.0.0.1:{expectedPort}", harness.DestinationFor("svc-a"));
+        Assert.Equal(assigned, mapped);
+        Assert.Equal($"http://127.0.0.1:{assigned}", harness.DestinationFor("svc-a"));
     }
 
     [Fact]
-    public async Task AfterRestart_RoutesBuiltFromInventory_TargetPromotedSidePort()
+    public async Task Start_RecordsAssignedHostPort_AndRoutesToIt()
     {
-        // Simulate a gateway restart after a successful deploy: a promoted-green
-        // container is bound to the side port, running the current digest, but the
-        // in-memory swap state that recorded that port is gone. On startup the route
-        // table must be rebuilt from container truth (ProxyRouteInitializer), so the
-        // service keeps receiving traffic on its real port.
+        // A fresh start publishes the container-internal port with an unassigned host
+        // binding; Docker's assigned host port is fed into the map and routed to.
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync();
+
+        var assigned = harness.Runtime.Get("svc-a")!.HostPort;
+        Assert.NotNull(assigned);
+        Assert.NotEqual(8080, assigned); // dynamic host port, not the container-internal port
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(assigned, mapped);
+        Assert.Equal($"http://127.0.0.1:{assigned}", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task BlueGreen_ProbesGreen_AtAssignedHostPort()
+    {
+        // Readiness must probe the green candidate at the host port Docker assigned
+        // it, never the manifest (container-internal) port.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync();
+
+        // The promoted container keeps the green candidate's assigned port.
+        var greenPort = harness.Runtime.Get("svc-a")!.HostPort;
+        Assert.NotNull(greenPort);
+        Assert.Contains($"http://127.0.0.1:{greenPort}", harness.Prober.ProbedAddresses);
+        Assert.DoesNotContain("http://127.0.0.1:8080", harness.Prober.ProbedAddresses);
+    }
+
+    [Fact]
+    public async Task BlueGreen_ReplacesPreExistingFixedPortContainer_WithEphemeralPort()
+    {
+        // Migration/coexistence (tech-spec §7): a container from an older gateway is
+        // bound to a FIXED host port (== the manifest port). No migration step is
+        // required — its next replace starts a green on a Docker-assigned ephemeral
+        // port (the two coexist; Docker guarantees uniqueness) and the promoted green
+        // adopts the ephemeral port, with traffic following it.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = true;
+
+        // Route as primed at startup from the pre-existing fixed-port container.
+        harness.HostPorts.ReplaceFrom(await harness.Runtime.ListManagedContainersAsync());
+        await harness.ProxyState.RefreshRoutesAsync();
+        Assert.Equal("http://127.0.0.1:8080", harness.DestinationFor("svc-a"));
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.Equal("sha256:v2", harness.Runtime.Get("svc-a")!.Digest);
+        var promoted = harness.Runtime.Get("svc-a")!.HostPort;
+        Assert.NotNull(promoted);
+        Assert.NotEqual(8080, promoted); // adopted an ephemeral port on replace
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(promoted, mapped);
+        Assert.Equal($"http://127.0.0.1:{promoted}", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task StopRemove_ClearsHostPortMap()
+    {
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        harness.HostPorts.Set("svc-a", 8080);
+        await harness.Store.UpsertAsync(Manifest("svc-a", status: "stopped"));
+
+        await harness.Service.RunOnceAsync();
+
+        // Container gone and its host-port mapping forgotten.
+        Assert.False(harness.Runtime.Exists("svc-a"));
+        Assert.False(harness.HostPorts.TryGet("svc-a", out _));
+    }
+
+    [Fact]
+    public async Task AfterRestart_RoutesBuiltFromInventory_TargetAssignedHostPort()
+    {
+        // Simulate a gateway restart after a successful deploy: the container is
+        // bound to its Docker-assigned host port, running the current digest, but the
+        // in-memory state that recorded that port is gone. On startup the route table
+        // must be rebuilt from container truth (ProxyRouteInitializer), so the service
+        // keeps receiving traffic on its real (assigned) port.
         var runtime = new FakeContainerRuntime();
         runtime.Seed(new ContainerInfo(
             "svc-a", "registry/svc-a", "sha256:v2", "running",
@@ -415,7 +503,7 @@ public class ReconcilerServiceTests
     public async Task Deploy_Promote_ThenNextLoop_IsNoOp()
     {
         // Regression for the observed replace churn (tech-spec §7): a container
-        // serving on the side port with the correct digest/env must NOT be flagged
+        // serving on its assigned host port with the correct digest/env must NOT be flagged
         // as drift. Deploy -> promote -> next reconcile loop is a pure no-op.
         var harness = new Harness();
         harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
