@@ -136,39 +136,36 @@ survive gateway restarts.
 - Housekeeping: prune untagged images older than 48h; disk/mem watermarks
   emitted as metrics.
 - Only mutates its **own** box. With >1 instance, every instance converges
-  independently; the **leader** (Postgres advisory lock) is the only one that
+  independently; the **leader** (heartbeat-derived, below) is the only one that
   executes *fleet-wide* actions (e.g. marking a deploy record complete,
   pruning history).
 
-**Leader election — lease-fenced (zombie-proof).** Leadership is a session-scoped
-`pg_try_advisory_lock` on a fixed key: the primary mutex, held while a dedicated
-connection stays open. That alone is not enough — a **hard-killed** leader (EC2
-terminate, kernel panic) never closes its TCP connection, so Postgres keeps the
-session (`state=idle`) and the lock alive until TCP keepalives expire (potentially
-hours), during which every follower's `pg_try_advisory_lock` returns false and
-leader-only duties silently stop. The fix adds a DB **lease** as the liveness
-truth: a singleton `leader_lease (holder_instance_id, acquired_at, renewed_at)`
-row the leader renews every reconcile loop (same cadence as heartbeats).
+**Leader election — heartbeat-derived.** Leadership is *not* a lock. The leader is
+simply the live instance with the **lowest `instance_id`** (ordinal string compare)
+among the `instance_status` rows whose `heartbeat_at` is within
+`ReconcilerOptions.InstanceStaleThreshold` (default **90s**). No new tables, no
+advisory locks, no session state.
 
-- A follower that cannot get the lock reads the lease. When `renewed_at` is older
-  than `LeaderElection:LeaseStaleThreshold` (default **90s**, same as the
-  `instance_status` `InstanceStaleThreshold`), the holder is dead: the follower
-  **fences** it — looks up the advisory-lock holder's backend via
-  `pg_locks`/`pg_stat_activity` and `pg_terminate_backend`s it (the owning login
-  role suffices; **no superuser** required) — then retries the lock once and, on
-  success, upserts the lease under its own instance id.
-- **Guard rails:** fence only when the lease is provably stale (never a
-  merely-slow but live leader), re-check the lease right before fencing so a peer
-  that just won the race is not terminated, and log fencing loudly (who fenced
-  whom, and the lease age). On acquiring leadership (fresh or after fencing) the
-  new leader upserts the lease immediately; on graceful release/dispose it clears
-  the lease so a successor need not wait out the threshold.
-- All Postgres-specific SQL sits behind a small internal seam
-  (`ILeaderLockGateway`) so the election algorithm is unit-tested against a fake —
-  the build box has no Postgres. **Leadership survives leader-instance death within
-  ~1 reconcile loop after the lease threshold** (observed live 2026-08-08: a killed
-  leader's session pinned the lock for 5+ minutes with three healthy followers
-  waiting; fencing closes that gap automatically).
+- Every reconcile loop, the instance **upserts its own heartbeat first, then
+  evaluates leadership from a fresh read** — a booting instance must be able to see
+  itself and take leadership when it is the lowest live id. The `is_leader` flag on
+  the instance's own `instance_status` row reflects that evaluation each loop, so the
+  dashboard's leader badge follows automatically.
+- A **hard-killed** leader (EC2 terminate, kernel panic) simply stops heartbeating.
+  Its row goes stale and drops out of the candidate set on its own, so the
+  next-lowest live id becomes leader **within ~1 reconcile loop after the stale
+  threshold** — none of the zombie-connection pathology of a session-scoped advisory
+  lock (observed live 2026-08-08: a killed leader's still-open Postgres session
+  pinned an advisory lock for 5+ minutes with three healthy followers waiting; a
+  heartbeat-derived leader has no session to pin).
+- The leader-only duties here (stale `instance_status` pruning, `deploy_history`
+  completion marking) are **idempotent**, so strict mutual exclusion is unnecessary:
+  a brief **dual-leader overlap** during a transition is harmless and tolerated by
+  design. Liveness (a healthy fleet always has a leader) matters more than
+  exclusivity.
+- The algorithm reads/writes only through the `IInstanceStatusStore` seam, so it is
+  unit-tested against a fake — the build box has no Postgres. `InMemoryLeaderElection`
+  still stands in for single-node no-DB mode.
 
 ### 4.4 Desired-state manifest (PostgreSQL)
 Single source of truth, mutated only by the Management API, consumed by reconcilers.
@@ -202,11 +199,10 @@ instance_status (
 -- per-instance rollout progress for a deploy ("17/20 converged")
 deploy_instance_status (deploy_id, instance_id, status, detail, updated_at,
                         primary key (deploy_id, instance_id))
-
--- singleton leader-liveness lease (§4.3): the leader renews renewed_at every
--- reconcile loop; a stale row lets a follower fence the dead holder
-leader_lease (id, holder_instance_id, acquired_at, renewed_at)  -- one row (id=1)
 ```
+
+Leadership needs no table of its own: it is derived from `instance_status`
+heartbeats (the lowest live `instance_id` leads — see §4.3).
 
 - CI integration: the build pipeline pushes the image, then calls one
   Management API endpoint (machine credential, see §5) —

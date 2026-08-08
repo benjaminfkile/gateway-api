@@ -140,10 +140,6 @@ public sealed class ReconcilerService : BackgroundService
     /// </summary>
     public async Task RunOnceAsync(CancellationToken ct = default)
     {
-        // Determine leadership up front: it is re-verified every loop and gates the
-        // fleet-wide duties in the heartbeat step below.
-        var isLeader = await TryAcquireLeadershipAsync(ct);
-
         var desired = await BuildDesiredAsync(ct);
         var actual = await _runtime.ListManagedContainersAsync(ct);
 
@@ -160,8 +156,14 @@ public sealed class ReconcilerService : BackgroundService
             await ExecuteAsync(action, ct);
         }
 
-        // After converging, publish this instance's heartbeat + inventory so any
-        // instance can answer fleet-wide queries (tech-spec §4.3, §4.4).
+        // Derive leadership from heartbeats (tech-spec §4.3): the election upserts our
+        // own heartbeat first — so a booting instance sees itself — then picks the
+        // lowest live instance_id. We do this right before publishing our heartbeat so
+        // the fresh full row below carries the authoritative is_leader for the loop.
+        var isLeader = await TryAcquireLeadershipAsync(ct);
+
+        // Publish this instance's heartbeat + inventory so any instance can answer
+        // fleet-wide queries (tech-spec §4.3, §4.4).
         await HeartbeatAsync(isLeader, ct);
 
         // Close the deploy loop (tech-spec §4.5, §7): report this instance's

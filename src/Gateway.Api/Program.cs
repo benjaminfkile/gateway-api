@@ -38,28 +38,27 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
 
     // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
     // instance's status row via the EF store, and leadership — which gates the
-    // stale-row cleanup — is a Postgres advisory lock on a dedicated connection.
+    // stale-row cleanup — is derived from those same heartbeats (no lock, no lease).
     builder.Services.AddScoped<IInstanceStatusStore, EfInstanceStatusStore>();
-    // Lease-fenced leader election (tech-spec §4.3): the advisory lock is the primary
-    // mutex; a DB lease is the liveness truth so a hard-killed leader is fenced within
-    // ~1 reconcile loop after the lease threshold instead of pinning the lock for hours.
-    var leaseStaleThreshold = builder.Configuration.GetValue<TimeSpan?>(
-        PostgresAdvisoryLockLeaderElection.StaleThresholdConfigKey)
-        ?? PostgresAdvisoryLockLeaderElection.DefaultStaleThreshold;
+    // Heartbeat-derived leader election (tech-spec §4.3): the leader is simply the
+    // lowest instance_id among instances whose heartbeat is within the stale
+    // threshold. A hard-killed leader stops heartbeating, so its row ages out and a
+    // successor takes over within ~1 reconcile loop — no zombie session can pin
+    // leadership. The leader-only duties are idempotent, so a brief dual-leader
+    // overlap during a transition is tolerated by design.
     builder.Services.AddSingleton<ILeaderElection>(sp =>
-        new PostgresAdvisoryLockLeaderElection(
-            dbConnection,
-            instanceIdProvider: async ct =>
-                (await sp.GetRequiredService<InstanceMetadataProvider>().GetAsync(ct)).InstanceId,
-            staleThreshold: leaseStaleThreshold,
-            logger: sp.GetRequiredService<ILoggerFactory>()
-                .CreateLogger<PostgresAdvisoryLockLeaderElection>()));
+        new HeartbeatLeaderElection(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<InstanceMetadataProvider>(),
+            sp.GetRequiredService<ReconcilerOptions>().InstanceStaleThreshold,
+            sp.GetRequiredService<ILoggerFactory>()
+                .CreateLogger<HeartbeatLeaderElection>()));
 
     // Apply pending EF Core migrations on boot (tech-spec §6). A fresh database
     // has no schema, so this must run before the reconciler/heartbeat or any
     // endpoint touches a table. The hosted service serializes the fleet with a
-    // Postgres advisory lock (distinct key from leader election), retries with
-    // backoff while the box waits for the DB, and fails fast (exits non-zero) if
+    // Postgres advisory lock (used only for migration; leader election uses none),
+    // retries with backoff while the box waits for the DB, and fails fast (exits non-zero) if
     // still unreachable — systemd's Restart=always then retries the whole boot.
     // Registered before AddNodeReconciler below so it starts first and opens the
     // MigrationReadinessGate the reconciler waits on.
