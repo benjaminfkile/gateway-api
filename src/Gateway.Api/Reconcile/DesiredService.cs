@@ -16,6 +16,11 @@ namespace Gateway.Api.Reconcile;
 /// <param name="DesiredStatus">Desired lifecycle state: <c>running</c> or <c>stopped</c>.</param>
 /// <param name="EnvHash">Hash of the service's resolved environment; drift from the running container triggers a replace.</param>
 /// <param name="EnvVars">The resolved environment to start the container with.</param>
+/// <param name="RestartRequestedAt">
+/// When a fleet-wide restart was last requested for this service, or null if never. A
+/// running container that started before this stamp is stale and gets a blue-green
+/// recreate; one started after it satisfies the request (tech-spec §4.5).
+/// </param>
 public sealed record DesiredService(
     string Name,
     string Image,
@@ -24,7 +29,8 @@ public sealed record DesiredService(
     int Port,
     string DesiredStatus,
     string? EnvHash,
-    IReadOnlyDictionary<string, string> EnvVars)
+    IReadOnlyDictionary<string, string> EnvVars,
+    DateTimeOffset? RestartRequestedAt = null)
 {
     /// <summary>Whether the service should be running (case-insensitive on the status text).</summary>
     public bool WantsRunning =>

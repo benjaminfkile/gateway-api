@@ -183,7 +183,8 @@ service_manifest (
   -- dev variants are their own explicit rows (e.g. 'svc-a-dev'), not a
   -- derived flag: the dashboard can stop/deploy dev independently of prod
   updated_by      text not null,         -- Cognito username
-  updated_at      timestamptz not null
+  updated_at      timestamptz not null,
+  restart_requested_at timestamptz       -- last fleet-wide restart request; a container older than this is recreated (blue-green)
 )
 deploy_history (id, service, from_digest, to_digest, actor, action, status, started_at, finished_at, detail jsonb)
 
@@ -223,7 +224,8 @@ balancer routes the dashboard's request to.
 |---|---|
 | `GET  /mgmt/services` | Manifest + fleet rollup per service ("running on 20/20, digest abc123 on 20/20") |
 | `GET  /mgmt/instances` | Fleet list from `instance_status` (heartbeats, versions, leader, per-instance services) |
-| `POST /mgmt/services/{name}/stop` · `/start` · `/restart` | Set desired status — **all** instances converge |
+| `POST /mgmt/services/{name}/stop` · `/start` | Set desired status — **all** instances converge |
+| `POST /mgmt/services/{name}/restart` | Stamp `restart_requested_at`=now → every instance rolling-recreates its container via blue-green (same digest/tag; old serves until green is ready), fleet-wide. A container started after the stamp already satisfies the request (no restart loop). A restart on a stopped service starts it |
 | `POST /mgmt/services/{name}/deploy` | `{tag}` → resolve digest once, update manifest → every instance blue-greens locally |
 | `POST /mgmt/services/{name}/rollback` | Redeploy previous digest from history (fleet-wide, same mechanism) |
 | `PUT  /mgmt/services/{name}` | Create/update manifest entry (add a new app from the dashboard) |

@@ -36,6 +36,15 @@ public sealed class FakeContainerRuntime : IContainerRuntime
     public int NextHostPort => _nextHostPort;
 
     /// <summary>
+    /// The <see cref="ContainerInfo.StartedAt"/> stamped on containers created by
+    /// <see cref="StartServiceContainerAsync"/> — models Docker recording each
+    /// container's start time. Defaults to the Unix epoch (so a plain start matches a
+    /// container seeded at the epoch); restart-drift tests set a later instant so a
+    /// recreated container is newer than the manifest's <c>restart_requested_at</c>.
+    /// </summary>
+    public DateTimeOffset NewContainerStartedAt { get; set; } = DateTimeOffset.UnixEpoch;
+
+    /// <summary>
     /// Digests that are "missing" locally: a start referencing one throws
     /// <see cref="ContainerImageNotFoundException"/>, modelling Docker's
     /// "No such image ...@&lt;digest&gt;" for a stale pinned digest.
@@ -115,7 +124,7 @@ public sealed class FakeContainerRuntime : IContainerRuntime
                 Image: spec.Image,
                 Digest: spec.Digest,
                 State: "running",
-                StartedAt: DateTimeOffset.UnixEpoch,
+                StartedAt: NewContainerStartedAt,
                 EnvHash: spec.EnvHash,
                 HostPort: hostPort);
         }

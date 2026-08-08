@@ -40,6 +40,7 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.IncludeInHealth).HasColumnName("include_in_health");
             e.Property(x => x.UpdatedBy).HasColumnName("updated_by").IsRequired();
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+            e.Property(x => x.RestartRequestedAt).HasColumnName("restart_requested_at");
         });
 
         modelBuilder.Entity<DeployHistory>(e =>

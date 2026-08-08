@@ -97,10 +97,11 @@ public class ManagementLifecycleTests
     }
 
     [Fact]
-    public async Task Restart_TouchesUpdatedAt_AndAudits()
+    public async Task Restart_StampsRestartRequestedAt_AndAudits()
     {
         await using var factory = new ManagementApiFactory();
         await SeedAsync(factory, ManagementTestData.Manifest("svc-a", includeInHealth: false));
+        var before = DateTimeOffset.UtcNow;
 
         var client = factory.CreateClient(ManagementApiFactory.AdminToken());
         var response = await client.PostAsync("/mgmt/services/svc-a/restart", null);
@@ -111,8 +112,34 @@ public class ManagementLifecycleTests
             var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
             // updated_at was bumped off the seeded UnixEpoch.
             Assert.True(m.UpdatedAt > DateTimeOffset.UnixEpoch);
+            // The restart request is stamped to ~now so the reconciler recreates any
+            // container older than it (tech-spec §4.5).
+            Assert.NotNull(m.RestartRequestedAt);
+            Assert.True(m.RestartRequestedAt >= before);
+            // A running service stays running; the digest/tag are untouched.
+            Assert.Equal("running", m.DesiredStatus);
             var audit = await db.DeployHistory.SingleAsync();
             Assert.Equal(DeployAction.Restart, audit.Action);
+        });
+    }
+
+    [Fact]
+    public async Task Restart_StoppedService_StartsIt_AndStampsRequest()
+    {
+        // Requirement #4: restart on a stopped service behaves like start — it sets
+        // desired=running — and also stamps restart_requested_at.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", desiredStatus: "stopped", includeInHealth: false));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PostAsync("/mgmt/services/svc-a/restart", null);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("running", m.DesiredStatus);
+            Assert.NotNull(m.RestartRequestedAt);
         });
     }
 

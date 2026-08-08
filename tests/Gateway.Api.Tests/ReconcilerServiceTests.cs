@@ -145,7 +145,8 @@ public class ReconcilerServiceTests
         string name,
         string status = "running",
         string? digest = "sha256:v1",
-        int port = 8080) => new()
+        int port = 8080,
+        DateTimeOffset? restartRequestedAt = null) => new()
     {
         Name = name,
         Image = $"registry/{name}",
@@ -156,6 +157,7 @@ public class ReconcilerServiceTests
         IncludeInHealth = true,
         UpdatedBy = "test",
         UpdatedAt = DateTimeOffset.UnixEpoch,
+        RestartRequestedAt = restartRequestedAt,
     };
 
     private static ContainerInfo Running(string name, string digest, string? envHash, int hostPort = 8080) =>
@@ -616,6 +618,87 @@ public class ReconcilerServiceTests
         Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
         Assert.Equal(8080, mapped);
         Assert.Equal("http://127.0.0.1:8080", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task Restart_RecreatesStaleContainerOnce_ThenImmune()
+    {
+        // A restart stamps restart_requested_at (tech-spec §4.5). The already-running
+        // container started before the stamp, so it is stale and gets a blue-green
+        // recreate on the SAME digest/env. The recreated container is stamped after the
+        // request, so the next loop is a pure no-op — no restart loop (requirement #3).
+        var harness = new Harness();
+        var restartAt = new DateTimeOffset(2026, 8, 8, 12, 0, 0, TimeSpan.Zero);
+        // The old container started at the epoch, well before the restart request.
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        // Containers the fake (re)creates are stamped after the request → satisfy it.
+        harness.Runtime.NewContainerStartedAt = restartAt + TimeSpan.FromSeconds(30);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", restartRequestedAt: restartAt));
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync();
+
+        // Same digest/env, but a full blue-green recreate ran (old removed, green promoted).
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        Assert.Equal("sha256:v1", harness.Runtime.Get("svc-a")!.Digest);
+        Assert.Contains(harness.Runtime.Operations, op => op == "Rename:svc-a-green->svc-a");
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+        Assert.Contains("restart requested", outcome.Detail);
+
+        // Second loop: the recreated container satisfies the request → nothing happens.
+        harness.Reporter.Outcomes.Clear();
+        var opsBefore = harness.Runtime.Operations.Count;
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.Empty(harness.Runtime.Operations.Skip(opsBefore));
+        Assert.Empty(harness.Reporter.Outcomes);
+    }
+
+    [Fact]
+    public async Task Restart_OldKeepsServing_UntilGreenHealthy()
+    {
+        // Blue-green invariant on the restart path (requirement #5): the old container
+        // keeps serving until the green candidate is healthy.
+        var harness = new Harness();
+        var restartAt = new DateTimeOffset(2026, 8, 8, 12, 0, 0, TimeSpan.Zero);
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        harness.Runtime.NewContainerStartedAt = restartAt + TimeSpan.FromSeconds(30);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", restartRequestedAt: restartAt));
+
+        bool oldPresentAtProbe = false, greenPresentAtProbe = false;
+        harness.Prober.OnProbe = () =>
+        {
+            oldPresentAtProbe = harness.Runtime.Exists("svc-a");
+            greenPresentAtProbe = harness.Runtime.Exists("svc-a-green");
+        };
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.True(oldPresentAtProbe, "old container must still be serving while green is probed");
+        Assert.True(greenPresentAtProbe, "green candidate must be running when probed");
+    }
+
+    [Fact]
+    public async Task Restart_StoppedService_BehavesLikeStart()
+    {
+        // Requirement #4: a restart request on a service whose desired container is
+        // absent just starts it (the endpoint also asserts desired=running). Here the
+        // stale stamp is present but there is no container, so the plan is a plain Start.
+        var harness = new Harness();
+        var restartAt = new DateTimeOffset(2026, 8, 8, 12, 0, 0, TimeSpan.Zero);
+        harness.Runtime.NewContainerStartedAt = restartAt + TimeSpan.FromSeconds(30);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", restartRequestedAt: restartAt));
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.Start, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
     }
 
     [Fact]

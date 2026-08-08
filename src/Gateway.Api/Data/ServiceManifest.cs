@@ -36,4 +36,13 @@ public class ServiceManifest
 
     /// <summary>Timestamp of the last mutation.</summary>
     public DateTimeOffset UpdatedAt { get; set; }
+
+    /// <summary>
+    /// When a fleet-wide restart was last requested for this service, or null if never
+    /// (tech-spec §4.5). A running container whose <c>StartedAt</c> predates this stamp
+    /// is stale and gets a blue-green recreate; a container started after it satisfies
+    /// the request and never triggers a restart loop. Set by <c>POST
+    /// /mgmt/services/{name}/restart</c>; the digest/tag are unchanged.
+    /// </summary>
+    public DateTimeOffset? RestartRequestedAt { get; set; }
 }
