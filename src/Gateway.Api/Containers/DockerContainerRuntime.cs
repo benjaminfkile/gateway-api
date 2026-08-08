@@ -79,22 +79,27 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
             var labels = c.Labels ?? new Dictionary<string, string>();
             labels.TryGetValue(ContainerLabels.Digest, out var digest);
             labels.TryGetValue(ContainerLabels.EnvHash, out var envHash);
-            labels.TryGetValue(ContainerLabels.HostPort, out var hostPortLabel);
-            int? hostPort =
-                int.TryParse(hostPortLabel, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPort)
-                    ? parsedPort
-                    : null;
 
-            // Fallback for containers created before the host-port label existed
-            // (e.g. one already promoted onto a side port by an older gateway): read
-            // the actual published binding so the gateway still forwards correctly.
-            if (hostPort is null && c.Ports is { Count: > 0 })
+            // Host ports are dynamic (Docker-assigned): the actual published binding
+            // is the source of truth. Read it straight off the container listing so
+            // the gateway forwards to wherever Docker put each service.
+            int? hostPort = null;
+            if (c.Ports is { Count: > 0 })
             {
                 var published = c.Ports.FirstOrDefault(p => p.PublicPort != 0);
                 if (published is not null)
                 {
                     hostPort = published.PublicPort;
                 }
+            }
+
+            // Legacy fallback: a container from an older gateway recorded its fixed
+            // host port as a label rather than a Docker-assigned binding.
+            if (hostPort is null
+                && labels.TryGetValue(ContainerLabels.HostPort, out var hostPortLabel)
+                && int.TryParse(hostPortLabel, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPort))
+            {
+                hostPort = parsedPort;
             }
 
             // Prefer the daemon's precise start time; fall back to created time.
@@ -157,14 +162,13 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
         return repoDigest ?? inspect.ID;
     }
 
-    public async Task StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default)
+    public async Task<int> StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default)
     {
         var imageRef = string.IsNullOrEmpty(spec.Digest)
             ? spec.Image
             : $"{spec.Image}@{spec.Digest}";
 
         var containerPort = $"{spec.Port}/tcp";
-        var hostPort = (spec.SidePort ?? spec.Port).ToString(CultureInfo.InvariantCulture);
 
         var create = new CreateContainerParameters
         {
@@ -177,10 +181,6 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
                 [ContainerLabels.Service] = spec.Name,
                 [ContainerLabels.Digest] = spec.Digest ?? string.Empty,
                 [ContainerLabels.EnvHash] = spec.EnvHash ?? string.Empty,
-                // Record the actual host-published port: bindings are fixed at
-                // create time, so this is the port the gateway must forward to even
-                // after a green candidate is promoted to the canonical name.
-                [ContainerLabels.HostPort] = hostPort,
             },
             ExposedPorts = new Dictionary<string, EmptyStruct>
             {
@@ -193,9 +193,13 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
                 NetworkMode = spec.Network,
                 PortBindings = new Dictionary<string, IList<PortBinding>>
                 {
+                    // Publish the container port with an UNASSIGNED host binding
+                    // (empty HostPort): Docker picks a unique ephemeral host port,
+                    // guaranteeing two containers of the same service — or two
+                    // services sharing an internal port — never contend (tech-spec §7).
                     [containerPort] = new List<PortBinding>
                     {
-                        new() { HostPort = hostPort },
+                        new() { HostPort = string.Empty },
                     },
                 },
                 LogConfig = new Docker.DotNet.Models.LogConfig
@@ -209,6 +213,35 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
         var created = await _client.Containers.CreateContainerAsync(create, ct);
         await _client.Containers.StartContainerAsync(
             created.ID, new ContainerStartParameters(), ct);
+
+        // Host ports are dynamic: inspect the started container to learn the port
+        // Docker assigned, and return it so the caller can route/health-probe there.
+        var inspect = await _client.Containers.InspectContainerAsync(created.ID, ct);
+        return ResolveAssignedHostPort(inspect, containerPort);
+    }
+
+    /// <summary>
+    /// Read the host port Docker bound the container's published port to from an
+    /// inspect result. Throws when no binding is present — a started container that
+    /// published no host port is a misconfiguration the caller must surface.
+    /// </summary>
+    private static int ResolveAssignedHostPort(ContainerInspectResponse inspect, string containerPort)
+    {
+        var bindings = inspect.NetworkSettings?.Ports;
+        if (bindings is not null
+            && bindings.TryGetValue(containerPort, out var hostBindings)
+            && hostBindings is { Count: > 0 })
+        {
+            var published = hostBindings.FirstOrDefault(b => !string.IsNullOrEmpty(b.HostPort));
+            if (published is not null
+                && int.TryParse(published.HostPort, NumberStyles.Integer, CultureInfo.InvariantCulture, out var port))
+            {
+                return port;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Docker did not report a host port binding for {containerPort} on container {inspect.Name}.");
     }
 
     public async Task StopAndRemoveAsync(string name, CancellationToken ct = default)

@@ -13,17 +13,23 @@ namespace Gateway.Api.Instances;
 /// <param name="State">Docker container state, e.g. <c>running</c> / <c>exited</c>.</param>
 /// <param name="StartedAt">When the container last started, or null when unknown.</param>
 /// <param name="Restarts">Docker restart count for the container.</param>
+/// <param name="HostPort">
+/// The Docker-assigned host port the container is published on, or null when no
+/// container (or an older instance that did not record it). Surfaced so the ops
+/// dashboard can show where each service is actually bound.
+/// </param>
 public sealed record InstanceServiceEntry(
     string Name,
     string? Digest,
     string State,
     DateTimeOffset? StartedAt,
-    int Restarts);
+    int Restarts,
+    int? HostPort = null);
 
 /// <summary>
 /// Serialises (and parses) this instance's container inventory to/from the
 /// <c>services</c> jsonb payload of <c>instance_status</c> (tech-spec §4.4):
-/// <c>[{name, digest, state, startedAt, restarts}]</c>. Every reconcile loop
+/// <c>[{name, digest, state, startedAt, restarts, hostPort}]</c>. Every reconcile loop
 /// rebuilds this from the live managed-container list so any instance can answer
 /// fleet-wide queries; the Management API parses it back to compute fleet rollups.
 /// </summary>
@@ -40,7 +46,7 @@ public static class InstanceServicesJson
     public static string Build(IReadOnlyList<ContainerInfo> containers)
     {
         var entries = containers
-            .Select(c => new InstanceServiceEntry(c.Name, c.Digest, c.State, c.StartedAt, c.Restarts))
+            .Select(c => new InstanceServiceEntry(c.Name, c.Digest, c.State, c.StartedAt, c.Restarts, c.HostPort))
             .ToList();
 
         return JsonSerializer.Serialize(entries, Options);

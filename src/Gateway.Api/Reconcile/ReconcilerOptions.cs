@@ -40,12 +40,6 @@ public sealed class ReconcilerOptions
     /// <summary>Drain delay after cutting traffic to green before removing the old container (tech-spec: 30s).</summary>
     public TimeSpan DrainDelay { get; set; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>
-    /// Offset added to a service's port to derive its green candidate's host-side
-    /// port, so old and green can publish without colliding during a swap.
-    /// </summary>
-    public int SidePortOffset { get; set; } = 1;
-
     /// <summary>Log driver applied to every container the reconciler starts (awslogs in production).</summary>
     public LogDriverConfig LogDriver { get; set; } = new();
 

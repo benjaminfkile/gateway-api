@@ -93,7 +93,7 @@ survive gateway restarts.
 
 ### 4.1 Edge proxy (YARP)
 - `Yarp.ReverseProxy`, routes built **dynamically** from the desired-state manifest via `IProxyConfigProvider` (in-memory swap, no restart).
-- Route rule: `/{service}/*` → `http://127.0.0.1:{port}` — the container's host-published port. The gateway lives on the host (§3), outside the Docker network, so container DNS names are not resolvable for it; the reconciler publishes each service's port to the host instead.
+- Route rule: `/{service}/*` → `http://127.0.0.1:{hostPort}` — the container's host-published port. The gateway lives on the host (§3), outside the Docker network, so container DNS names are not resolvable for it; the reconciler publishes each service's port to the host instead. **Host ports are Docker-assigned, not manifest-derived:** the reconciler publishes the manifest `port` (container-internal only) with an *unassigned* host binding, Docker picks a unique ephemeral host port, and the reconciler records that actual port and points the route at it. This guarantees uniqueness (two containers of a service, or two services sharing an internal port, never contend) and removes any fixed host-port reservation. Manifest `port` is therefore purely the container-side contract.
 - WebSocket passthrough works natively for any service that terminates its own sockets.
 - Active health checks per cluster; unhealthy destinations are dropped from rotation automatically — this is the mechanism behind blue-green cutover.
 
@@ -149,7 +149,7 @@ service_manifest (
   image           text not null,         -- registry repo
   tag             text not null,         -- 'latest' | pinned
   digest          text,                  -- resolved sha256 (set on deploy)
-  port            int  not null,
+  port            int  not null,          -- container-internal port ONLY (containerPort); Docker assigns the host port dynamically
   desired_status  text not null,         -- 'running' | 'stopped'
   env_secret_ref  text,                  -- optional secrets-store reference
   include_in_health boolean not null,
@@ -281,20 +281,24 @@ cp /opt/gateway/gateway-api.service /etc/systemd/system/ && systemctl enable --n
 
 **Downstream service (the common case — seconds, zero drop, any fleet size):**
 1. Manifest digest changes (CI or dashboard) — a single Postgres write, whether the fleet is 1 instance or 20.
-2. Each instance's reconciler notices on its next (jittered) loop and runs the same local sequence independently: pull image, start `svc-a-green` on a side port, container health + HTTP readiness poll.
+2. Each instance's reconciler notices on its next (jittered) loop and runs the same local sequence independently: pull image, start `svc-a-green` (Docker assigns it a unique ephemeral host port), container health + HTTP readiness poll at that assigned port.
 3. YARP config swap on that instance: destination flips to green (in-flight requests drain via YARP's graceful destination removal).
 4. Old container stopped/removed after drain timeout (30s), then green is renamed to the canonical name; instance reports `converged` to `deploy_instance_status`.
    - **Ports are container-truth, not manifest-derived.** Docker port bindings are
-     fixed at container creation, so a promoted green keeps the **side port** it was
-     started on — a rename does **not** move it to the manifest port. The manifest
-     `port` is therefore only the *container-side* contract. The reconciler records
-     each managed container's actual host-published port (a `gateway.host-port`
-     label, surfaced on `ContainerInfo`), and the proxy + health prober resolve each
-     destination to that real port, falling back to the manifest port only when no
-     container port is known. On startup the route table is rebuilt from the running
-     container inventory for the same reason, so a promoted-green container keeps
-     receiving traffic across a gateway restart. A container serving on its side port
-     with the correct digest/env is fully converged and never triggers a replace.
+     fixed at container creation, so a promoted green keeps the **Docker-assigned
+     host port** it was started on — a rename does **not** move it to the manifest
+     port. The manifest `port` is therefore only the *container-side* contract. The
+     reconciler learns each managed container's actual host-published port by
+     inspecting it after start (surfaced on `ContainerInfo.HostPort`), and the proxy
+     + health prober resolve each destination to that real port, falling back to the
+     manifest port only when no container port is known. On startup the route table
+     is rebuilt from the running container inventory for the same reason, so a
+     promoted-green container keeps receiving traffic across a gateway restart. A
+     container serving on its assigned host port with the correct digest/env is fully
+     converged and never triggers a replace. Pre-existing containers from an older
+     gateway that used fixed host ports keep working unchanged (container-truth
+     routing handles arbitrary ports) and adopt an ephemeral port on their next
+     replace — no migration step is required.
 5. Because every instance keeps its old container serving until its own green is healthy, **fleet capacity never dips** — no wave orchestration needed; convergence completes fleet-wide within ~1–2 min of the click. The **leader** marks the `deploy_history` row complete when all live instances report converged (or flags `partial` listing stragglers).
 6. Failure on an instance = automatic local abort, old container stays live there, dashboard shows exactly which instances are on which digest; `rollback` is one click and uses the identical mechanism.
 

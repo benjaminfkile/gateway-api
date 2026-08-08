@@ -111,6 +111,7 @@ public static partial class ManagementEndpoints
                 state = s.State,
                 startedAt = s.StartedAt,
                 restarts = s.Restarts,
+                hostPort = s.HostPort,
             }),
         }).ToList();
 
@@ -481,7 +482,12 @@ public static partial class ManagementEndpoints
         image = m.Image,
         tag = m.Tag,
         digest = m.Digest,
+        // Container-internal port only (what the app binds inside the container);
+        // host ports are Docker-assigned and surfaced separately as hostPort.
         port = m.Port,
+        // The actual Docker-assigned host port the service is published on across the
+        // fleet (representative; null when no instance runs a container for it).
+        hostPort = rollup.HostPort,
         desiredStatus = m.DesiredStatus,
         envSecretRef = m.EnvSecretRef,
         includeInHealth = m.IncludeInHealth,

@@ -12,10 +12,16 @@ namespace Gateway.Api.Management;
 /// <param name="RunningOn">Number of instances currently running the service.</param>
 /// <param name="TotalInstances">Fleet size recorded in <c>instance_status</c>.</param>
 /// <param name="Digests">Per-digest instance counts among the instances running the service.</param>
+/// <param name="HostPort">
+/// The Docker-assigned host port the service is published on, taken from a running
+/// instance (host ports are per-instance and now dynamic — this is a representative
+/// value). Null when no instance is running a container for the service.
+/// </param>
 public sealed record FleetRollup(
     int RunningOn,
     int TotalInstances,
-    IReadOnlyDictionary<string, int> Digests)
+    IReadOnlyDictionary<string, int> Digests,
+    int? HostPort)
 {
     /// <summary>Placeholder key for an instance running the service on an unknown digest.</summary>
     public const string UnknownDigest = "unknown";
@@ -29,6 +35,7 @@ public sealed record FleetRollup(
     {
         var digests = new Dictionary<string, int>(StringComparer.Ordinal);
         var runningOn = 0;
+        int? hostPort = null;
 
         foreach (var instance in instances)
         {
@@ -42,10 +49,11 @@ public sealed record FleetRollup(
             }
 
             runningOn++;
+            hostPort ??= entry.HostPort;
             var key = string.IsNullOrEmpty(entry.Digest) ? UnknownDigest : entry.Digest;
             digests[key] = digests.TryGetValue(key, out var count) ? count + 1 : 1;
         }
 
-        return new FleetRollup(runningOn, instances.Count, digests);
+        return new FleetRollup(runningOn, instances.Count, digests, hostPort);
     }
 }

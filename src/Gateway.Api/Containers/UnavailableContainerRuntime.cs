@@ -22,7 +22,7 @@ public sealed class UnavailableContainerRuntime : IContainerRuntime
     public Task<string> PullImageAsync(string image, string tag, CancellationToken ct = default) =>
         throw Unavailable();
 
-    public Task StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default) =>
+    public Task<int> StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default) =>
         throw Unavailable();
 
     public Task StopAndRemoveAsync(string name, CancellationToken ct = default) => throw Unavailable();
