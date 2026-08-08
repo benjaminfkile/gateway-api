@@ -80,7 +80,11 @@ public class ReconcilerServiceTests
         public ProxyStateService ProxyState { get; }
         public ManifestProxyConfigProvider ProxyConfig { get; }
 
-        public Harness(bool enabled = true, bool isLeader = true, MigrationReadinessGate? migrationGate = null)
+        public Harness(
+            bool enabled = true,
+            bool isLeader = true,
+            MigrationReadinessGate? migrationGate = null,
+            IServiceEnvProvider? envProvider = null)
         {
             Leader = new InMemoryLeaderElection(isLeader);
             Options = new ReconcilerOptions
@@ -94,7 +98,10 @@ public class ReconcilerServiceTests
 
             var services = new ServiceCollection();
             services.AddSingleton<IManifestStore>(Store);
-            services.AddSingleton<IServiceEnvProvider>(EnvProvider);
+            // Default to the in-test FakeEnvProvider; a caller may inject the real
+            // SecretsManagerEnvProvider (over a fake secret store) to exercise the
+            // secrets → env-drift path end to end.
+            services.AddSingleton<IServiceEnvProvider>(envProvider ?? EnvProvider);
             services.AddSingleton<IInstanceStatusStore>(StatusStore);
             services.AddSingleton<ILogGroupAdmin>(LogGroupAdmin);
             services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
@@ -146,7 +153,8 @@ public class ReconcilerServiceTests
         string status = "running",
         string? digest = "sha256:v1",
         int port = 8080,
-        DateTimeOffset? restartRequestedAt = null) => new()
+        DateTimeOffset? restartRequestedAt = null,
+        string? envSecretRef = null) => new()
     {
         Name = name,
         Image = $"registry/{name}",
@@ -158,6 +166,7 @@ public class ReconcilerServiceTests
         UpdatedBy = "test",
         UpdatedAt = DateTimeOffset.UnixEpoch,
         RestartRequestedAt = restartRequestedAt,
+        EnvSecretRef = envSecretRef,
     };
 
     private static ContainerInfo Running(string name, string digest, string? envHash, int hostPort = 8080) =>
@@ -719,6 +728,113 @@ public class ReconcilerServiceTests
         var outcome = Assert.Single(harness.Reporter.Outcomes);
         Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
         Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+    }
+
+    [Fact]
+    public async Task SecretsEnv_ChangedResolvedValue_TriggersBlueGreenReplace()
+    {
+        // Requirement #5 (reconciler-level): the real SecretsManagerEnvProvider (over a
+        // fake secret store) resolves a service's env at reconcile time; when the secret
+        // value later changes, the resolved env hash drifts from the running container's
+        // and the reconciler blue-green-replaces it — rotation propagates via env drift.
+        var store = new FakeSecretStore();
+        store.Secrets["svc-a-secret"] = "{\"TOKEN\":\"v1\"}";
+        var time = new ManualTimeProvider();
+        var provider = new SecretsManagerEnvProvider(store, TimeSpan.FromSeconds(60), time);
+
+        var harness = new Harness(envProvider: provider);
+        var v1Hash = EnvHasher.Compute(new Dictionary<string, string> { ["TOKEN"] = "v1" });
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", v1Hash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080, envSecretRef: "svc-a-secret"));
+        harness.Prober.Ready = true;
+
+        // First loop: resolved env matches the running container → nothing to do.
+        await harness.Service.RunOnceAsync();
+        Assert.Empty(harness.Reporter.Outcomes);
+        Assert.Equal(1, store.Calls);
+
+        // Rotate the secret value and let the cache TTL lapse.
+        store.Secrets["svc-a-secret"] = "{\"TOKEN\":\"v2\"}";
+        time.Now += TimeSpan.FromSeconds(61);
+
+        // Second loop: the resolved env hash drifts → blue-green replace onto the new env.
+        await harness.Service.RunOnceAsync();
+
+        var v2Hash = EnvHasher.Compute(new Dictionary<string, string> { ["TOKEN"] = "v2" });
+        Assert.Equal(v2Hash, harness.Runtime.Get("svc-a")!.EnvHash);
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+        Assert.Equal(2, store.Calls); // refetched after TTL, not per loop
+    }
+
+    [Fact]
+    public async Task SecretsEnv_ResolutionFailure_IsolatedToOneService()
+    {
+        // Requirement #4: a service whose secret cannot be resolved (missing secret)
+        // fails only itself — the other service still converges, the loop never throws,
+        // and the failing service surfaces a ref-only error (no secret value) through the
+        // heartbeat lastError plumbing.
+        var store = new FakeSecretStore();
+        store.Secrets["svc-a-secret"] = "{\"TOKEN\":\"ok\"}";
+        // svc-b-secret is intentionally absent → the store throws for it.
+        var provider = new SecretsManagerEnvProvider(store, TimeSpan.FromSeconds(60));
+
+        var harness = new Harness(envProvider: provider);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", envSecretRef: "svc-a-secret"));
+        await harness.Store.UpsertAsync(Manifest("svc-b", digest: "sha256:v1", envSecretRef: "svc-b-secret"));
+
+        await harness.Service.RunOnceAsync();
+
+        // svc-a converged normally.
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        Assert.Equal(
+            EnvHasher.Compute(new Dictionary<string, string> { ["TOKEN"] = "ok" }),
+            harness.Runtime.Get("svc-a")!.EnvHash);
+
+        // svc-b never started (its env could not be resolved), but the loop survived.
+        Assert.False(harness.Runtime.Exists("svc-b"));
+
+        // The failure is surfaced as a service-scoped outcome and heartbeat entry...
+        var failed = Assert.Single(harness.Reporter.Outcomes, o => o.ServiceName == "svc-b");
+        Assert.Equal(ReconcileOutcomeStatus.Failed, failed.Status);
+        Assert.Contains("svc-b-secret", failed.Detail); // names the ref
+        Assert.DoesNotContain("ok", failed.Detail);       // never any secret value
+
+        var entry = HeartbeatEntry(harness, "svc-b");
+        Assert.NotNull(entry);
+        Assert.Equal(InstanceServicesJson.AbsentState, entry!.State);
+        Assert.False(string.IsNullOrEmpty(entry.LastError));
+        Assert.NotNull(entry.LastErrorAt);
+
+        // svc-a is clean (no error entry).
+        var okEntry = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(okEntry);
+        Assert.Null(okEntry!.LastError);
+    }
+
+    [Fact]
+    public async Task SecretsEnv_TransientFailure_ClearsAfterRecovery()
+    {
+        // A service whose secret is temporarily unresolvable records an error; once the
+        // secret resolves on a later loop, the error clears and the service converges.
+        var store = new FakeSecretStore();
+        var provider = new SecretsManagerEnvProvider(store, TimeSpan.FromSeconds(60));
+
+        var harness = new Harness(envProvider: provider);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", envSecretRef: "svc-a-secret"));
+
+        // First loop: secret missing → error recorded, no container.
+        await harness.Service.RunOnceAsync();
+        Assert.False(harness.Runtime.Exists("svc-a"));
+        Assert.False(string.IsNullOrEmpty(HeartbeatEntry(harness, "svc-a")!.LastError));
+
+        // Fix the secret and reconcile again: the service starts and the error clears.
+        store.Secrets["svc-a-secret"] = "{\"TOKEN\":\"ok\"}";
+        await harness.Service.RunOnceAsync();
+
+        Assert.True(harness.Runtime.Exists("svc-a"));
+        Assert.Null(HeartbeatEntry(harness, "svc-a")!.LastError);
     }
 
     [Fact]

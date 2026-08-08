@@ -15,6 +15,7 @@
   <ItemGroup>
     <PackageReference Include="AWSSDK.CloudWatchLogs" Version="3.7.509.3" />
     <PackageReference Include="AWSSDK.ECR" Version="3.7.509.8" />
+    <PackageReference Include="AWSSDK.SecretsManager" Version="3.7.504.43" />
     <PackageReference Include="Docker.DotNet" Version="3.125.15" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.10" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.10">

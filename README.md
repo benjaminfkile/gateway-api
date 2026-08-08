@@ -164,6 +164,34 @@ reconciler additionally needs `logs:PutRetentionPolicy` for retention. The log
 *viewer* path (`GET /mgmt/services/{name}/logs`) needs `logs:GetLogEvents` and
 `logs:FilterLogEvents`. Scope these to `arn:aws:logs:*:*:log-group:/gateway/services/*`.
 
+### Container secrets (Secrets Manager)
+
+A service's container environment is resolved from **AWS Secrets Manager at
+container (re)create time** (tech-spec §8), never stored in the manifest or logs.
+A manifest row's optional `env_secret_ref` (a secret **name or full ARN**, set via
+`PUT /mgmt/services/{name}`) names a secret whose `SecretString` is a **flat JSON
+object of string values**; that object becomes the container's env. An empty/unset
+ref means an empty environment (the container runs with only its image defaults).
+
+- **Rotation propagates via env drift.** The resolved env is folded into the
+  service's env hash, so changing a secret's value changes the hash; the next
+  reconcile loop sees the drift and **blue-green-replaces** the container onto the
+  new env — no explicit restart. Rotation lands within ~`SecretCacheTtl` + one loop.
+- **Caching:** resolved env is cached per ref for
+  `Reconciler:SecretCacheTtl` (a `TimeSpan`, default `00:01:00` = **60s**) so a 30s
+  fleet loop does not call Secrets Manager per service per loop. The cache is
+  thread-safe and a **failed fetch is never cached**.
+- **Failure isolation:** a missing secret, `AccessDenied`, or a non-JSON / non-flat
+  `SecretString` fails **only that service's** reconcile action (surfaced through the
+  same per-service `lastError` as any other failure) — it never takes down the loop
+  or other services, and the existing container (if any) keeps serving. Error
+  messages name the **ref only**; secret values never appear in logs or errors.
+- **Laziness:** the AWS client is constructed only on the first non-empty ref, so a
+  region-less dev box or an AWS-less CI runner still boots and passes host tests.
+
+**IAM (instance role):** `secretsmanager:GetSecretValue` on the referenced secrets
+(e.g. `arn:aws:secretsmanager:*:*:secret:/gateway/services/*`).
+
 ## Management API
 
 All endpoints live under `/mgmt/*` on the public listener but require a Cognito

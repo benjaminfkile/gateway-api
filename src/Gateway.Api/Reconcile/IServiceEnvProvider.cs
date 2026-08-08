@@ -6,8 +6,9 @@ namespace Gateway.Api.Reconcile;
 /// Resolves the environment (including secrets) a service container should be
 /// started with (tech-spec §8: secrets fetched at (re)create time, never stored
 /// in the manifest or logs). Behind an interface so the reconciler can be tested
-/// without a real secrets store, and so a future task can plug in a Secrets
-/// Manager–backed implementation from <see cref="ServiceManifest.EnvSecretRef"/>.
+/// without a real secrets store. The production implementation is
+/// <see cref="SecretsManagerEnvProvider"/>, which resolves the env from a service's
+/// <see cref="ServiceManifest.EnvSecretRef"/>.
 /// </summary>
 public interface IServiceEnvProvider
 {
@@ -16,9 +17,10 @@ public interface IServiceEnvProvider
 }
 
 /// <summary>
-/// Default no-op provider: returns an empty environment. Secrets-store
-/// integration is a later task; until then containers run with only their image
-/// defaults, and env-drift detection still works off this (stable) empty set.
+/// No-op provider: returns an empty environment regardless of the manifest. Used
+/// where a secrets store is deliberately not wired (single-node no-secrets mode,
+/// tests); the reconciler's default is <see cref="SecretsManagerEnvProvider"/>.
+/// Env-drift detection still works off this (stable) empty set.
 /// </summary>
 public sealed class NullServiceEnvProvider : IServiceEnvProvider
 {
