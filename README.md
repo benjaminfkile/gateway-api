@@ -78,6 +78,8 @@ feature degrades gracefully when its variable is unset, so a bare
 | `GATEWAY_INSTANCE_ID` | unset | Instance identity fallback when EC2 IMDS is unreachable (local dev). |
 | `GATEWAY_PRIVATE_IP` | unset | Private IP fallback for local dev. |
 | `GATEWAY_PUBLIC_IP` | unset | Public IP fallback for local dev. |
+| `GATEWAY_LOG_DRIVER` | unset | Container log-driver escape hatch. Set to `json-file` to log downstream containers to local rotating files (dev box without AWS); unset → `awslogs` to CloudWatch (see [Container logs](#container-logs-cloudwatch) below). |
+| `AWS_REGION` | unset | Region for the `awslogs` driver; falls back to `AWS_DEFAULT_REGION`, then the instance's own region (IMDS). |
 
 `ASPNETCORE_URLS` controls the public listener as usual; under systemd,
 `NOTIFY_SOCKET`/`WATCHDOG_USEC` are provided by the unit for the watchdog
@@ -130,6 +132,37 @@ lock, no session state.
 - The leader-only duties are **idempotent**, so strict mutual exclusion is
   unnecessary: a brief **dual-leader overlap** during a transition is harmless and
   tolerated by design. Liveness matters more than exclusivity.
+
+### Container logs (CloudWatch)
+
+Every downstream service container the reconciler starts logs to CloudWatch via the
+Docker `awslogs` driver (tech-spec §4.3, §9), so the dashboard log viewer works
+fleet-wide and logs survive instance replacement:
+
+- **Group per service:** `/gateway/services/{service}` — e.g. `svc-a` →
+  `/gateway/services/svc-a`.
+- **Stream per instance:** the stream name is this instance's id (the same id used
+  in `instance_status` and the `?instance=` log query param), so the viewer scopes
+  a service's logs to one box exactly. A blue-green candidate (`{service}-green`)
+  logs to its **service's** group/stream, so its output lands in the canonical group
+  and survives promotion.
+- **Region:** `AWS_REGION` → `AWS_DEFAULT_REGION` → the instance's own region (IMDS).
+- **Group creation + retention:** the driver sets `awslogs-create-group=true` so the
+  group is created on first write; because that cannot set retention, the reconciler
+  sets **30-day retention once per group** (`PutRetentionPolicy`) after a start that
+  may have created it. This runs on every instance (not leader-only) and tolerates a
+  lagging IAM grant (`AccessDenied`) with a warning — logs still ship regardless.
+
+**Driver precedence** (highest wins): `GATEWAY_LOG_DRIVER` env >
+`Reconciler:LogDriver:Driver` config > `awslogs` default. Set either to `json-file`
+to force local rotating-file logging (`max-size=10m,max-file=3`) on a dev box
+without AWS — no CloudWatch group is created and no retention call is made.
+
+**IAM (instance role):** the awslogs *writer* (the Docker driver) needs
+`logs:CreateLogGroup`, `logs:CreateLogStream`, and `logs:PutLogEvents`; the
+reconciler additionally needs `logs:PutRetentionPolicy` for retention. The log
+*viewer* path (`GET /mgmt/services/{name}/logs`) needs `logs:GetLogEvents` and
+`logs:FilterLogEvents`. Scope these to `arn:aws:logs:*:*:log-group:/gateway/services/*`.
 
 ## Management API
 

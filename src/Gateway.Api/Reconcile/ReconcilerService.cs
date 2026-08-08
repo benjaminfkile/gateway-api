@@ -39,6 +39,10 @@ public sealed class ReconcilerService : BackgroundService
     private readonly ILogger<ReconcilerService> _logger;
     private readonly MigrationReadinessGate? _migrationGate;
 
+    // Service log groups whose 30-day retention has already been ensured this
+    // process, so PutRetentionPolicy is issued at most once per group (tech-spec §9).
+    private readonly HashSet<string> _retentionEnsured = new(StringComparer.Ordinal);
+
     public ReconcilerService(
         IContainerRuntime runtime,
         ProxyStateService proxyState,
@@ -381,6 +385,8 @@ public sealed class ReconcilerService : BackgroundService
             var hostPort = await StartWithStaleDigestFallbackAsync(d, d.Name, ct);
             _hostPorts.Set(d.Name, hostPort);
             await _proxyState.RefreshRoutesAsync(ct);
+            // The start may have created the CloudWatch group; set retention once (§9).
+            await EnsureRetentionAsync(d.Name, ct);
             await _reporter.ReportAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
         }
@@ -461,6 +467,8 @@ public sealed class ReconcilerService : BackgroundService
             _hostPorts.Set(d.Name, greenPort);
             await _proxyState.ClearDestinationOverrideAsync(d.Name, ct);
 
+            // The green start may have created the CloudWatch group; set retention (§9).
+            await EnsureRetentionAsync(d.Name, ct);
             await _reporter.ReportAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
         }
@@ -504,6 +512,12 @@ public sealed class ReconcilerService : BackgroundService
     /// </summary>
     private async Task<int> StartWithStaleDigestFallbackAsync(DesiredService d, string containerName, CancellationToken ct)
     {
+        // Build the per-service log config (tech-spec §4.3): awslogs → CloudWatch group
+        // /gateway/services/{d.Name}, stream = this instance's id. A green candidate
+        // uses its service's group/stream, not the {name}-green container name, so its
+        // logs land in the canonical group and survive promotion.
+        var logConfig = await BuildLogConfigAsync(d.Name, ct);
+
         // Pull to ensure the image is present locally; prefer the manifest's pinned
         // digest, falling back to whatever the pull resolved.
         var pulled = await _runtime.PullImageAsync(d.Image, d.Tag, ct);
@@ -512,7 +526,7 @@ public sealed class ReconcilerService : BackgroundService
 
         try
         {
-            return await _runtime.StartServiceContainerAsync(SpecFor(d, containerName, digest), ct);
+            return await _runtime.StartServiceContainerAsync(SpecFor(d, containerName, digest, logConfig), ct);
         }
         catch (ContainerImageNotFoundException ex)
             when (!string.IsNullOrEmpty(pinned) && !string.Equals(pinned, pulled, StringComparison.Ordinal))
@@ -523,11 +537,22 @@ public sealed class ReconcilerService : BackgroundService
                 + "successful pull of {Image}:{Tag}; the pinned digest is stale. Falling back to the pulled "
                 + "digest {PulledDigest} for this start.",
                 containerName, pinned, d.Image, d.Tag, pulled);
-            return await _runtime.StartServiceContainerAsync(SpecFor(d, containerName, pulled), ct);
+            return await _runtime.StartServiceContainerAsync(SpecFor(d, containerName, pulled, logConfig), ct);
         }
     }
 
-    private ServiceContainerSpec SpecFor(DesiredService d, string containerName, string? digest) =>
+    /// <summary>
+    /// Resolve the per-service <see cref="LogDriverConfig"/> for a container start
+    /// (tech-spec §4.3). Uses this instance's id as the awslogs stream and its region
+    /// (or <c>AWS_REGION</c>) for the driver region; honors the json-file escape hatch.
+    /// </summary>
+    private async Task<LogDriverConfig> BuildLogConfigAsync(string service, CancellationToken ct)
+    {
+        var identity = await _metadata.GetAsync(ct);
+        return LogConfigFactory.ForService(service, identity.InstanceId, identity.Region, _options.LogDriver);
+    }
+
+    private ServiceContainerSpec SpecFor(DesiredService d, string containerName, string? digest, LogDriverConfig logConfig) =>
         new(
             Name: containerName,
             Image: d.Image,
@@ -535,8 +560,53 @@ public sealed class ReconcilerService : BackgroundService
             Port: d.Port,
             EnvVars: d.EnvVars,
             Network: _options.Network,
-            LogConfig: _options.LogDriver,
+            LogConfig: logConfig,
             EnvHash: d.EnvHash);
+
+    /// <summary>
+    /// Set 30-day retention on a service's CloudWatch log group once per group
+    /// (tech-spec §9). Only meaningful for the awslogs driver (json-file has no
+    /// group). Called after a container start that may have created the group via
+    /// <c>awslogs-create-group</c>; runs on every instance (not leader-only) and
+    /// never crashes the loop. AccessDenied is tolerated inside the admin (IAM may
+    /// lag); any other failure forgets the mark so a later loop retries.
+    /// </summary>
+    private async Task EnsureRetentionAsync(string service, CancellationToken ct)
+    {
+        if (!LogConfigFactory.UsesAwsLogs(_options.LogDriver))
+        {
+            return;
+        }
+
+        var group = CloudWatchLogStore.LogGroupFor(service);
+        lock (_retentionEnsured)
+        {
+            if (!_retentionEnsured.Add(group))
+            {
+                return;
+            }
+        }
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var admin = scope.ServiceProvider.GetService<ILogGroupAdmin>();
+            if (admin is null)
+            {
+                return;
+            }
+
+            await admin.EnsureRetentionAsync(group, LogConfigFactory.RetentionDays, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Failed to set retention on log group {Group}; will retry next loop.", group);
+            lock (_retentionEnsured)
+            {
+                _retentionEnsured.Remove(group);
+            }
+        }
+    }
 
     private TimeSpan NextDelay()
     {

@@ -53,11 +53,15 @@ public sealed class Ec2InstanceMetadata : IInstanceMetadata
 
             var privateIp = await FetchMetadataAsync("latest/meta-data/local-ipv4", token, ct);
             var publicIp = await FetchMetadataAsync("latest/meta-data/public-ipv4", token, ct);
+            // Region feeds the container log driver's awslogs-region (tech-spec §4.3);
+            // absent off-EC2, where the env fallback / AWS_REGION covers it instead.
+            var region = await FetchMetadataAsync("latest/meta-data/placement/region", token, ct);
 
             return new InstanceIdentity(
                 instanceId,
                 string.IsNullOrEmpty(privateIp) ? null : privateIp,
-                string.IsNullOrEmpty(publicIp) ? null : publicIp);
+                string.IsNullOrEmpty(publicIp) ? null : publicIp,
+                string.IsNullOrEmpty(region) ? null : region);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
         {

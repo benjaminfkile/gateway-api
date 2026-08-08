@@ -1,6 +1,7 @@
 using Gateway.Api.Containers;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
+using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.Reconcile;
@@ -71,6 +72,7 @@ public class ReconcilerServiceTests
         public FakeReporter Reporter { get; } = new();
         public FakeEnvProvider EnvProvider { get; } = new();
         public FakeInstanceStatusStore StatusStore { get; } = new();
+        public FakeLogGroupAdmin LogGroupAdmin { get; } = new();
         public InMemoryLeaderElection Leader { get; }
         public ReconcilerOptions Options { get; }
         public ReconcilerService Service { get; }
@@ -94,6 +96,7 @@ public class ReconcilerServiceTests
             services.AddSingleton<IManifestStore>(Store);
             services.AddSingleton<IServiceEnvProvider>(EnvProvider);
             services.AddSingleton<IInstanceStatusStore>(StatusStore);
+            services.AddSingleton<ILogGroupAdmin>(LogGroupAdmin);
             services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
             services.AddSingleton<ServiceHostPortMap>();
             services.AddSingleton<ManifestProxyConfigProvider>();
@@ -720,5 +723,93 @@ public class ReconcilerServiceTests
         Assert.True(harness.StatusStore.Rows.ContainsKey("i-gone"));
         var status = Assert.Single(harness.StatusStore.Upserts);
         Assert.False(status.IsLeader);
+    }
+
+    [Fact]
+    public async Task Start_AppliesPerServiceAwsLogsConfig()
+    {
+        // tech-spec §4.3: every container ships to CloudWatch group
+        // /gateway/services/{service} with a stream per instance (this instance's id).
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+
+        await harness.Service.RunOnceAsync();
+
+        var spec = Assert.Single(harness.Runtime.StartedSpecs);
+        Assert.Equal("awslogs", spec.LogConfig.Driver);
+        Assert.Equal("/gateway/services/svc-a", spec.LogConfig.Options["awslogs-group"]);
+        Assert.Equal("i-test", spec.LogConfig.Options["awslogs-stream"]);
+        Assert.Equal("true", spec.LogConfig.Options["awslogs-create-group"]);
+        // The write-path group must equal the read-path template exactly (requirement #4).
+        Assert.Equal(CloudWatchLogStore.LogGroupFor("svc-a"), spec.LogConfig.Options["awslogs-group"]);
+    }
+
+    [Fact]
+    public async Task BlueGreen_GreenInheritsServiceGroupAndStream()
+    {
+        // The green candidate is the {name}-green container, but its logs must land in
+        // the canonical service group/stream so they survive promotion (tech-spec §4.3).
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+        harness.Prober.Ready = true;
+
+        await harness.Service.RunOnceAsync();
+
+        var greenSpec = harness.Runtime.StartedSpecs.Single(s => s.Name == "svc-a-green");
+        Assert.Equal("awslogs", greenSpec.LogConfig.Driver);
+        // Group/stream are the service's, NOT the -green container name.
+        Assert.Equal("/gateway/services/svc-a", greenSpec.LogConfig.Options["awslogs-group"]);
+        Assert.Equal("i-test", greenSpec.LogConfig.Options["awslogs-stream"]);
+    }
+
+    [Fact]
+    public async Task EscapeHatch_JsonFileDriver_UsesLocalRotation()
+    {
+        // Escape hatch (tech-spec §4.3): a dev box without AWS forces json-file with
+        // sane rotation. No awslogs group/stream is set.
+        var harness = new Harness();
+        harness.Options.LogDriver.Driver = "json-file";
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+
+        await harness.Service.RunOnceAsync();
+
+        var spec = Assert.Single(harness.Runtime.StartedSpecs);
+        Assert.Equal("json-file", spec.LogConfig.Driver);
+        Assert.Equal("10m", spec.LogConfig.Options["max-size"]);
+        Assert.Equal("3", spec.LogConfig.Options["max-file"]);
+        Assert.False(spec.LogConfig.Options.ContainsKey("awslogs-group"));
+        // No CloudWatch group exists under the escape hatch, so no retention call.
+        Assert.Empty(harness.LogGroupAdmin.Calls);
+    }
+
+    [Fact]
+    public async Task Retention_SetOncePerServiceGroup_AcrossLoops()
+    {
+        // tech-spec §9: 30-day retention set once per service group (awslogs-create-group
+        // cannot set it). Two services → two groups; repeated loops do not re-issue.
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+        await harness.Store.UpsertAsync(Manifest("svc-b", digest: "sha256:v1"));
+
+        await harness.Service.RunOnceAsync();
+        await harness.Service.RunOnceAsync();
+
+        Assert.Equal(2, harness.LogGroupAdmin.Calls.Count);
+        Assert.Contains(("/gateway/services/svc-a", 30), harness.LogGroupAdmin.Calls);
+        Assert.Contains(("/gateway/services/svc-b", 30), harness.LogGroupAdmin.Calls);
+    }
+
+    [Fact]
+    public async Task Retention_NotLeaderGated_FollowerStillSetsIt()
+    {
+        // Retention is not a fleet-wide/leader-only duty (requirement #3): a follower
+        // that starts a container still ensures its group's retention.
+        var harness = new Harness(isLeader: false);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.Contains(("/gateway/services/svc-a", 30), harness.LogGroupAdmin.Calls);
     }
 }

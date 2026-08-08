@@ -32,6 +32,17 @@ public static class ReconcilerServiceCollectionExtensions
             ?? configuration[ReconcilerOptions.EnabledEnvVar];
         options.Enabled = string.Equals(flag, "true", StringComparison.OrdinalIgnoreCase);
 
+        // Log-driver escape hatch (tech-spec §4.3): GATEWAY_LOG_DRIVER forces the
+        // container log driver (e.g. json-file on a dev box without AWS), overriding
+        // the configured value. Precedence: GATEWAY_LOG_DRIVER env >
+        // Reconciler:LogDriver:Driver config > awslogs default. The reconciler builds
+        // the per-service group/stream from this driver (see LogConfigFactory).
+        var logDriver = Environment.GetEnvironmentVariable(LogConfigFactory.DriverEnvVar);
+        if (!string.IsNullOrWhiteSpace(logDriver))
+        {
+            options.LogDriver.Driver = logDriver.Trim();
+        }
+
         services.TryAddSingleton(options);
 
         // Container runtime: real Docker only where the socket exists. Pulls
