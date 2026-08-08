@@ -29,6 +29,9 @@ public sealed class ProxyStateService
     private readonly ConcurrentDictionary<string, string> _destinationOverrides =
         new(StringComparer.Ordinal);
 
+    private static readonly IReadOnlySet<string> NoOverrides =
+        new HashSet<string>(StringComparer.Ordinal);
+
     public ProxyStateService(
         ManifestProxyConfigProvider provider,
         IServiceScopeFactory scopeFactory,
@@ -40,6 +43,17 @@ public sealed class ProxyStateService
         _addressResolver = addressResolver;
         _hostPorts = hostPorts;
     }
+
+    /// <summary>
+    /// The services currently pointed at a blue-green destination override (mid-swap).
+    /// The reconciler uses this to skip those services when it reconciles the
+    /// container-truth host-port map each loop, so an in-flight swap's override is
+    /// never clobbered (tech-spec §7, requirement #2).
+    /// </summary>
+    public IReadOnlySet<string> ServicesWithDestinationOverride() =>
+        _destinationOverrides.IsEmpty
+            ? NoOverrides
+            : new HashSet<string>(_destinationOverrides.Keys, StringComparer.Ordinal);
 
     /// <summary>Rebuild the proxy routes from the current manifest state.</summary>
     public async Task RefreshRoutesAsync(CancellationToken ct = default)

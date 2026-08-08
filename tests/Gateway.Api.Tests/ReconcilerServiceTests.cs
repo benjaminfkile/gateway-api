@@ -519,6 +519,128 @@ public class ReconcilerServiceTests
     }
 
     [Fact]
+    public async Task Reconcile_ContainerStabilizesOnNewPort_NoStartAction_MapAndRouteUpdatedNextLoop()
+    {
+        // Production 2026-08-08: a container recovered (Docker restart policy / crash-loop
+        // stabilization) on a host port the map did not hold, with NO reconciler start or
+        // promote action. The in-memory map + YARP route must catch up within one loop,
+        // no gateway restart (requirements #1, #4). Here the container is converged
+        // (digest/env match the manifest) so the plan produces no action for it.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 32777));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync();
+
+        // No container mutation happened — the map/route caught up purely from truth.
+        Assert.DoesNotContain(harness.Runtime.Operations, op => op.StartsWith("Start:"));
+        Assert.DoesNotContain(harness.Runtime.Operations, op => op.StartsWith("Rename:"));
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(32777, mapped);
+        // The route resolves to the container's real port, not the manifest fallback.
+        Assert.Equal("http://127.0.0.1:32777", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task Reconcile_PortChangesBetweenLoops_RouteFollowsWithoutAction()
+    {
+        // A managed container's published port changes outside any reconciler action
+        // (e.g. manual docker intervention recreated it). The next loop must re-point
+        // the route at the new real port with no start/promote.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 40000));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync();
+        Assert.Equal("http://127.0.0.1:40000", harness.DestinationFor("svc-a"));
+
+        // Container reappears on a different host port with no reconciler action.
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 40001));
+        var opsBefore = harness.Runtime.Operations.Count;
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.Empty(harness.Runtime.Operations.Skip(opsBefore)); // no container mutation
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(40001, mapped);
+        Assert.Equal("http://127.0.0.1:40001", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task Reconcile_SteadyPort_DoesNotRebuildRoutes()
+    {
+        // Requirement #3: no unnecessary route churn. A converged fleet whose ports are
+        // unchanged must not rebuild the YARP config (the provider hands back the SAME
+        // config instance when nothing was published).
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 40000));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync(); // primes map + route to 40000
+        var configAfterFirst = harness.ProxyConfig.GetConfig();
+
+        await harness.Service.RunOnceAsync(); // steady state, port unchanged
+
+        // Same config object => no route rebuild this loop.
+        Assert.Same(configAfterFirst, harness.ProxyConfig.GetConfig());
+        Assert.Equal("http://127.0.0.1:40000", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task Reconcile_MultipleServices_OnlyChangedOneTriggersRefresh()
+    {
+        // Requirement #5: with several services, only the one whose real port moved
+        // triggers a refresh; the unchanged service's destination is preserved.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 40000));
+        harness.Runtime.Seed(Running("svc-b", "sha256:v1", EmptyEnvHash, hostPort: 40001));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-b", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync(); // prime both routes
+        var configAfterFirst = harness.ProxyConfig.GetConfig();
+
+        // Only svc-b moves.
+        harness.Runtime.Seed(Running("svc-b", "sha256:v1", EmptyEnvHash, hostPort: 40002));
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.NotSame(configAfterFirst, harness.ProxyConfig.GetConfig()); // a refresh ran
+        Assert.Equal("http://127.0.0.1:40000", harness.DestinationFor("svc-a")); // unchanged
+        Assert.Equal("http://127.0.0.1:40002", harness.DestinationFor("svc-b")); // followed truth
+    }
+
+    [Fact]
+    public async Task Reconcile_MidSwapOverride_NotClobbered()
+    {
+        // Requirement #2: while a service's blue-green destination override is active,
+        // the per-loop container-truth reconcile must not touch its canonical port nor
+        // move its route off the override. The service is converged (digest/env match)
+        // so the plan takes no action for it.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 40000));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync(); // map + route primed to 40000
+        Assert.Equal("http://127.0.0.1:40000", harness.DestinationFor("svc-a"));
+
+        // Simulate an in-flight swap: the route is overridden onto a green candidate.
+        await harness.ProxyState.SwapDestinationAsync("svc-a", "http://127.0.0.1:59999");
+        Assert.Equal("http://127.0.0.1:59999", harness.DestinationFor("svc-a"));
+
+        // Container truth for the canonical container appears to move; the loop must
+        // NOT clobber the canonical map entry or the active override.
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 41000));
+
+        await harness.Service.RunOnceAsync();
+
+        // Canonical map still holds the pre-swap port (skipped), override still routes.
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(40000, mapped);
+        Assert.Equal("http://127.0.0.1:59999", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
     public async Task StopRemove_ClearsHostPortMap()
     {
         var harness = new Harness();
