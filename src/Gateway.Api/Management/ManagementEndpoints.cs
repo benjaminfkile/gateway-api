@@ -114,6 +114,10 @@ public static partial class ManagementEndpoints
                 startedAt = s.StartedAt,
                 restarts = s.Restarts,
                 hostPort = s.HostPort,
+                // Convergence failure for this service on this instance, or null when
+                // the last action succeeded (tech-spec §4.4).
+                lastError = s.LastError,
+                lastErrorAt = s.LastErrorAt,
             }),
         }).ToList();
 
@@ -533,30 +537,48 @@ public static partial class ManagementEndpoints
             status = record.Status,
         }, ct);
 
-    private static object ServiceView(ServiceManifest m, FleetRollup rollup) => new
+    private static object ServiceView(ServiceManifest m, FleetRollup rollup)
     {
-        name = m.Name,
-        image = m.Image,
-        tag = m.Tag,
-        digest = m.Digest,
-        // Container-internal port only (what the app binds inside the container);
-        // host ports are Docker-assigned and surfaced separately as hostPort.
-        port = m.Port,
-        // The actual Docker-assigned host port the service is published on across the
-        // fleet (representative; null when no instance runs a container for it).
-        hostPort = rollup.HostPort,
-        desiredStatus = m.DesiredStatus,
-        envSecretRef = m.EnvSecretRef,
-        includeInHealth = m.IncludeInHealth,
-        updatedBy = m.UpdatedBy,
-        updatedAt = m.UpdatedAt,
-        fleet = new
+        // Most recent convergence error for this service across the fleet, or null
+        // when no instance reports one (tech-spec §4.4, §4.5).
+        object? latestError = rollup.LatestError is null
+            ? null
+            : new
+            {
+                instanceId = rollup.LatestError.InstanceId,
+                message = rollup.LatestError.Message,
+                at = rollup.LatestError.At,
+            };
+
+        return new
         {
-            runningOn = rollup.RunningOn,
-            totalInstances = rollup.TotalInstances,
-            digests = rollup.Digests,
-        },
-    };
+            name = m.Name,
+            image = m.Image,
+            tag = m.Tag,
+            digest = m.Digest,
+            // Container-internal port only (what the app binds inside the container);
+            // host ports are Docker-assigned and surfaced separately as hostPort.
+            port = m.Port,
+            // The actual Docker-assigned host port the service is published on across the
+            // fleet (representative; null when no instance runs a container for it).
+            hostPort = rollup.HostPort,
+            desiredStatus = m.DesiredStatus,
+            envSecretRef = m.EnvSecretRef,
+            includeInHealth = m.IncludeInHealth,
+            updatedBy = m.UpdatedBy,
+            updatedAt = m.UpdatedAt,
+            fleet = new
+            {
+                runningOn = rollup.RunningOn,
+                totalInstances = rollup.TotalInstances,
+                digests = rollup.Digests,
+                // Instances whose last reconcile action for this service failed, and the
+                // most recent such error fleet-wide (tech-spec §4.4).
+                errorOn = rollup.ErrorOn,
+                latestError,
+            },
+        };
+    }
 
     private static object DeployView(DeployHistory d) => new
     {
