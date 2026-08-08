@@ -21,7 +21,13 @@ public sealed class CloudWatchLogStore : ILogStore
         _logs = logs;
     }
 
-    /// <summary>The log group name for a service.</summary>
+    /// <summary>
+    /// The log group name for a service. This is the single source of truth for the
+    /// group template: the reconciler's awslogs write path builds the same value via
+    /// <c>LogConfigFactory.ForService</c>, so read and write can never diverge
+    /// (tech-spec §4.3). The <c>instance</c> query param below is the stream name,
+    /// matching the awslogs <c>awslogs-stream</c> = instance id.
+    /// </summary>
     public static string LogGroupFor(string service) => LogGroupPrefix + service;
 
     public async Task<IReadOnlyList<LogLine>> GetLogsAsync(

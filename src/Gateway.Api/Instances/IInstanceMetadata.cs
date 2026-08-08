@@ -7,7 +7,12 @@ namespace Gateway.Api.Instances;
 /// <param name="InstanceId">Stable instance identifier (e.g. an EC2 instance id). Primary key of <c>instance_status</c>.</param>
 /// <param name="PrivateIp">Private (in-VPC) IP, or null when unknown.</param>
 /// <param name="PublicIp">Public IP, or null when the instance has none.</param>
-public sealed record InstanceIdentity(string InstanceId, string? PrivateIp, string? PublicIp);
+/// <param name="Region">
+/// AWS region this instance runs in (from IMDS <c>placement/region</c>), or null
+/// off-EC2. Used as the fallback source for the container log driver's
+/// <c>awslogs-region</c> when <c>AWS_REGION</c> is not set (tech-spec §4.3).
+/// </param>
+public sealed record InstanceIdentity(string InstanceId, string? PrivateIp, string? PublicIp, string? Region = null);
 
 /// <summary>
 /// A source of this instance's <see cref="InstanceIdentity"/> (tech-spec §4.4).

@@ -35,6 +35,12 @@ public static class ManagementServiceCollectionExtensions
         services.TryAddSingleton<IAmazonCloudWatchLogs>(_ => new AmazonCloudWatchLogsClient());
         services.TryAddSingleton<ILogStore, CloudWatchLogStore>();
 
+        // Log-group retention admin (tech-spec §9): the reconciler sets 30-day
+        // retention once per service group after a start that may have created it
+        // (awslogs-create-group cannot set retention). Resolved on demand from the
+        // reconcile loop, so the CloudWatch client is only built when it actually runs.
+        services.TryAddSingleton<ILogGroupAdmin, CloudWatchLogGroupAdmin>();
+
         return services;
     }
 }
