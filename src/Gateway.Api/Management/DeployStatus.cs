@@ -26,6 +26,7 @@ public static class DeployAction
     public const string Start = "start";
     public const string Restart = "restart";
     public const string Upsert = "upsert";
+    public const string Delete = "delete";
 }
 
 /// <summary>Well-known <c>deploy_instance_status.status</c> values (tech-spec §4.4).</summary>
