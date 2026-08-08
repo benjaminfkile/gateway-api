@@ -29,6 +29,7 @@ public sealed class ReconcilerService : BackgroundService
     private readonly IContainerRuntime _runtime;
     private readonly ProxyStateService _proxyState;
     private readonly IServiceAddressResolver _addressResolver;
+    private readonly ServiceHostPortMap _hostPorts;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IReadinessProber _readinessProber;
     private readonly IReconcileReporter _reporter;
@@ -42,6 +43,7 @@ public sealed class ReconcilerService : BackgroundService
         IContainerRuntime runtime,
         ProxyStateService proxyState,
         IServiceAddressResolver addressResolver,
+        ServiceHostPortMap hostPorts,
         IServiceScopeFactory scopeFactory,
         IReadinessProber readinessProber,
         IReconcileReporter reporter,
@@ -54,6 +56,7 @@ public sealed class ReconcilerService : BackgroundService
         _runtime = runtime;
         _proxyState = proxyState;
         _addressResolver = addressResolver;
+        _hostPorts = hostPorts;
         _scopeFactory = scopeFactory;
         _readinessProber = readinessProber;
         _reporter = reporter;
@@ -143,6 +146,12 @@ public sealed class ReconcilerService : BackgroundService
 
         var desired = await BuildDesiredAsync(ct);
         var actual = await _runtime.ListManagedContainersAsync(ct);
+
+        // Refresh container-truth ports before acting: this self-heals the map after
+        // a gateway restart (a promoted-green container keeps its side port) and
+        // keeps the proxy/health prober pointed at real ports (tech-spec §7).
+        _hostPorts.ReplaceFrom(actual);
+
         var plan = ReconcilePlanner.Plan(desired, actual);
 
         foreach (var action in plan)
@@ -367,6 +376,8 @@ public sealed class ReconcilerService : BackgroundService
         {
             var digest = await ResolveDigestAsync(d, ct);
             await _runtime.StartServiceContainerAsync(SpecFor(d, d.Name, sidePort: null, digest), ct);
+            // A fresh canonical container publishes the manifest port.
+            _hostPorts.Set(d.Name, d.Port);
             await _proxyState.RefreshRoutesAsync(ct);
             await _reporter.ReportAsync(new ReconcileOutcome(
                 d.Name, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
@@ -384,6 +395,7 @@ public sealed class ReconcilerService : BackgroundService
         try
         {
             await _runtime.StopAndRemoveAsync(action.ServiceName, ct);
+            _hostPorts.Remove(action.ServiceName);
             await _proxyState.RefreshRoutesAsync(ct);
             await _reporter.ReportAsync(new ReconcileOutcome(
                 action.ServiceName, action.Kind, ReconcileOutcomeStatus.Succeeded, action.Reason), ct);
@@ -437,6 +449,12 @@ public sealed class ReconcilerService : BackgroundService
             await Task.Delay(_options.DrainDelay, ct);
             await _runtime.StopAndRemoveAsync(d.Name, ct);
             await _runtime.RenameContainerAsync(greenName, d.Name, ct);
+            // Docker port bindings are fixed at create time: the promoted container
+            // keeps the SIDE port for the life of its process. Record that as the
+            // canonical service's real port so clearing the swap override routes
+            // back to where the container actually listens — not the manifest port,
+            // where nothing is bound (this bug, tech-spec §7).
+            _hostPorts.Set(d.Name, sidePort);
             await _proxyState.ClearDestinationOverrideAsync(d.Name, ct);
 
             await _reporter.ReportAsync(new ReconcileOutcome(

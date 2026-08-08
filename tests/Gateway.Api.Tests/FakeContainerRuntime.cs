@@ -90,7 +90,10 @@ public sealed class FakeContainerRuntime : IContainerRuntime
                 Digest: spec.Digest,
                 State: "running",
                 StartedAt: DateTimeOffset.UnixEpoch,
-                EnvHash: spec.EnvHash);
+                EnvHash: spec.EnvHash,
+                // Model Docker's fixed binding: the host port is the side port when
+                // one is given (a green candidate), otherwise the manifest port.
+                HostPort: spec.SidePort ?? spec.Port);
         }
 
         StartedSpecs.Enqueue(spec);

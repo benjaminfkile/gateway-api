@@ -184,6 +184,7 @@ public class InstanceStatusStoreTests
             services.AddSingleton<IManifestStore>(Manifests);
             services.AddSingleton<IServiceEnvProvider, NullServiceEnvProvider>();
             services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+            services.AddSingleton<ServiceHostPortMap>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
             _provider = services.BuildServiceProvider();
@@ -197,6 +198,7 @@ public class InstanceStatusStoreTests
                 Runtime,
                 _provider.GetRequiredService<ProxyStateService>(),
                 _provider.GetRequiredService<IServiceAddressResolver>(),
+                _provider.GetRequiredService<ServiceHostPortMap>(),
                 _provider.GetRequiredService<IServiceScopeFactory>(),
                 new AlwaysReadyProber(),
                 new NullReporter(),

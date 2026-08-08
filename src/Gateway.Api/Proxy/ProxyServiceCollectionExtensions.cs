@@ -16,6 +16,9 @@ public static class ProxyServiceCollectionExtensions
         // TryAdd so a host/test can supply its own resolver (e.g. pointing routes
         // at a localhost test server) by registering it first.
         services.TryAddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+        // Container-truth port map, shared with the reconciler and health prober so
+        // routes forward to the port each container is actually bound to.
+        services.TryAddSingleton<ServiceHostPortMap>();
         services.AddSingleton<ManifestProxyConfigProvider>();
         services.AddSingleton<IProxyConfigProvider>(sp =>
             sp.GetRequiredService<ManifestProxyConfigProvider>());

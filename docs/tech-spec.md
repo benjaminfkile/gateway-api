@@ -283,7 +283,18 @@ cp /opt/gateway/gateway-api.service /etc/systemd/system/ && systemctl enable --n
 1. Manifest digest changes (CI or dashboard) — a single Postgres write, whether the fleet is 1 instance or 20.
 2. Each instance's reconciler notices on its next (jittered) loop and runs the same local sequence independently: pull image, start `svc-a-green` on a side port, container health + HTTP readiness poll.
 3. YARP config swap on that instance: destination flips to green (in-flight requests drain via YARP's graceful destination removal).
-4. Old container stopped/removed after drain timeout (30s), renamed green → canonical name; instance reports `converged` to `deploy_instance_status`.
+4. Old container stopped/removed after drain timeout (30s), then green is renamed to the canonical name; instance reports `converged` to `deploy_instance_status`.
+   - **Ports are container-truth, not manifest-derived.** Docker port bindings are
+     fixed at container creation, so a promoted green keeps the **side port** it was
+     started on — a rename does **not** move it to the manifest port. The manifest
+     `port` is therefore only the *container-side* contract. The reconciler records
+     each managed container's actual host-published port (a `gateway.host-port`
+     label, surfaced on `ContainerInfo`), and the proxy + health prober resolve each
+     destination to that real port, falling back to the manifest port only when no
+     container port is known. On startup the route table is rebuilt from the running
+     container inventory for the same reason, so a promoted-green container keeps
+     receiving traffic across a gateway restart. A container serving on its side port
+     with the correct digest/env is fully converged and never triggers a replace.
 5. Because every instance keeps its old container serving until its own green is healthy, **fleet capacity never dips** — no wave orchestration needed; convergence completes fleet-wide within ~1–2 min of the click. The **leader** marks the `deploy_history` row complete when all live instances report converged (or flags `partial` listing stragglers).
 6. Failure on an instance = automatic local abort, old container stays live there, dashboard shows exactly which instances are on which digest; `rollback` is one click and uses the identical mechanism.
 

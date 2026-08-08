@@ -22,18 +22,26 @@ public sealed class HttpHealthProber : IHealthProber
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IServiceAddressResolver _addressResolver;
+    private readonly ServiceHostPortMap? _hostPorts;
 
     public HttpHealthProber(
         IHttpClientFactory httpClientFactory,
-        IServiceAddressResolver addressResolver)
+        IServiceAddressResolver addressResolver,
+        ServiceHostPortMap? hostPorts = null)
     {
         _httpClientFactory = httpClientFactory;
         _addressResolver = addressResolver;
+        _hostPorts = hostPorts;
     }
 
     public async Task<ServiceProbeResult> ProbeAsync(ServiceManifest manifest, CancellationToken ct = default)
     {
-        var baseAddress = _addressResolver.Resolve(manifest).TrimEnd('/');
+        // Probe the port the container is actually bound to (a promoted-green
+        // container keeps its side port), falling back to the manifest port when
+        // container-truth is unavailable.
+        var baseAddress = (_hostPorts is not null && _hostPorts.TryGet(manifest.Name, out var hostPort)
+            ? _addressResolver.Resolve(manifest.Name, hostPort)
+            : _addressResolver.Resolve(manifest)).TrimEnd('/');
         var url = $"{baseAddress}/api/health";
 
         // Bound each probe independently at 3s, still honouring caller cancellation.
