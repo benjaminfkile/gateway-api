@@ -56,18 +56,38 @@ public class CorsTests
     }
 
     [Fact]
-    public async Task ProxiedApplicationPathsAreNeverCorsHandled()
+    public async Task ProxiedApplicationPreflightIsAnsweredWithWildcard()
     {
-        await using var factory = FactoryWithOrigins("https://ops.example.com");
+        // Legacy parity: the old gateway ran `cors()` in front of every proxied
+        // route; frontends on other origins depend on it.
+        await using var factory = FactoryWithOrigins(null);
         using var client = factory.CreateClient();
 
-        var response = await client.SendAsync(Preflight("/svc-a/anything", "https://ops.example.com"));
+        var response = await client.SendAsync(Preflight("/svc-a/anything", "https://some-frontend.example.com"));
 
-        Assert.False(response.Headers.Contains("Access-Control-Allow-Origin"));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal("*", Assert.Single(response.Headers.GetValues("Access-Control-Allow-Origin")));
+        Assert.False(response.Headers.Contains("Access-Control-Allow-Credentials"));
     }
 
     [Fact]
-    public async Task WithoutConfiguredOriginsNoCorsHeadersAppear()
+    public async Task ProxiedApplicationResponseGetsWildcardOnlyWhenDownstreamSetNone()
+    {
+        // The gateway's own /api/health stands in for a downstream that emits
+        // no CORS headers of its own: a cross-origin GET gets the wildcard.
+        await using var factory = FactoryWithOrigins(null);
+        using var client = factory.CreateClient();
+
+        var request = new HttpRequestMessage(HttpMethod.Get, "/api/health");
+        request.Headers.Add("Origin", "https://some-frontend.example.com");
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("*", Assert.Single(response.Headers.GetValues("Access-Control-Allow-Origin")));
+    }
+
+    [Fact]
+    public async Task WithoutConfiguredOriginsManagementPlaneGetsNoCorsHeaders()
     {
         await using var factory = FactoryWithOrigins(null);
         using var client = factory.CreateClient();

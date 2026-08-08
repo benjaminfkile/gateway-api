@@ -147,6 +147,52 @@ if (corsOrigins.Length > 0)
         branch => branch.UseCors("ops"));
 }
 
+// Legacy-parity CORS for application traffic: the old gateway ran `cors()` —
+// any origin, no credentials — in front of every proxied route, and the
+// downstream apps rely on it (none terminate CORS themselves). Preflights are
+// answered here because a downstream without an OPTIONS handler would 404
+// them; response headers are only added when the downstream didn't set its
+// own, so an app that owns its CORS is passed through untouched. /mgmt and
+// /hub are excluded — they keep the stricter dashboard policy above.
+app.Use(async (ctx, next) =>
+{
+    var path = ctx.Request.Path;
+    if (path.StartsWithSegments("/mgmt")
+        || path.StartsWithSegments("/hub")
+        || string.IsNullOrEmpty(ctx.Request.Headers.Origin))
+    {
+        await next();
+        return;
+    }
+
+    if (HttpMethods.IsOptions(ctx.Request.Method)
+        && !string.IsNullOrEmpty(ctx.Request.Headers.AccessControlRequestMethod))
+    {
+        ctx.Response.StatusCode = StatusCodes.Status204NoContent;
+        ctx.Response.Headers.AccessControlAllowOrigin = "*";
+        ctx.Response.Headers.AccessControlAllowMethods =
+            ctx.Request.Headers.AccessControlRequestMethod;
+        if (!string.IsNullOrEmpty(ctx.Request.Headers.AccessControlRequestHeaders))
+        {
+            ctx.Response.Headers.AccessControlAllowHeaders =
+                ctx.Request.Headers.AccessControlRequestHeaders;
+        }
+        ctx.Response.Headers["Access-Control-Max-Age"] = "600";
+        return;
+    }
+
+    ctx.Response.OnStarting(() =>
+    {
+        if (string.IsNullOrEmpty(ctx.Response.Headers.AccessControlAllowOrigin))
+        {
+            ctx.Response.Headers.AccessControlAllowOrigin = "*";
+        }
+        return Task.CompletedTask;
+    });
+
+    await next();
+});
+
 // Management-plane configuration guard (tech-spec §5): /mgmt/* returns 503 when
 // no Cognito authority is set. Runs before authentication so the closed-plane
 // response never depends on a token; leaves proxy/health/hub traffic untouched.
