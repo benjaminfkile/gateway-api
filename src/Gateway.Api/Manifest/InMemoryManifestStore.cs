@@ -68,6 +68,19 @@ public sealed class InMemoryManifestStore : IManifestStore
         return Task.CompletedTask;
     }
 
+    public Task DeleteAsync(string name, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            if (!_byName.Remove(name))
+            {
+                throw new KeyNotFoundException($"No manifest entry for service '{name}'.");
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
     // Copies are handed out (and stored) so callers can never mutate the store's
     // state by holding on to a reference.
     private static ServiceManifest Clone(ServiceManifest m) => new()

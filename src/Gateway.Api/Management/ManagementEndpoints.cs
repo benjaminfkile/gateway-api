@@ -4,6 +4,7 @@ using Gateway.Api.Auth;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
 using Gateway.Api.Manifest;
+using Gateway.Api.Proxy;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
 using Microsoft.AspNetCore.Http;
@@ -63,6 +64,7 @@ public static partial class ManagementEndpoints
         mgmt.MapPost("/services/{name}/start", StartAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
         mgmt.MapPost("/services/{name}/restart", RestartAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
         mgmt.MapPut("/services/{name}", UpsertServiceAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
+        mgmt.MapDelete("/services/{name}", DeleteServiceAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
 
         mgmt.MapPost("/services/{name}/deploy", DeployAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
         mgmt.MapPost("/services/{name}/rollback", RollbackAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
@@ -301,6 +303,50 @@ public static partial class ManagementEndpoints
         return existing is null
             ? Results.Json(body, statusCode: StatusCodes.Status201Created)
             : Results.Json(body);
+    }
+
+    private static async Task<IResult> DeleteServiceAsync(
+        string name,
+        ClaimsPrincipal user,
+        IManifestStore manifests,
+        IDeployStore deploys,
+        ProxyStateService proxyState,
+        CancellationToken ct,
+        bool force = false)
+    {
+        if (IsReserved(name, out var reserved))
+        {
+            return reserved;
+        }
+
+        var manifest = await manifests.GetAsync(name, ct);
+        if (manifest is null)
+        {
+            return NotFoundService(name);
+        }
+
+        // Guardrail mirroring stop (tech-spec §4.5): removing a health-check
+        // dependency requires an explicit confirm flag, else 409.
+        if (manifest.IncludeInHealth && !force)
+        {
+            return Results.Conflict(new
+            {
+                error = $"Service '{name}' participates in the aggregated health check; retry with ?force=true to delete it.",
+            });
+        }
+
+        // Purely a manifest-row operation: the reconciler treats the now-unmanifested
+        // container as an orphan and stops/removes it on its next loop (tech-spec §4.3).
+        await manifests.DeleteAsync(name, ct);
+
+        // Audit the removal: from = the digest that was live, to = null (tech-spec §4.5, §8).
+        await AuditAsync(deploys, name, DeployAction.Delete, user, manifest.Digest, null, ct);
+
+        // Drop the service's route immediately on this serving instance so requests to
+        // it 404 without waiting for a reconcile loop.
+        await proxyState.RefreshRoutesAsync(ct);
+
+        return Results.Json(new { name, action = DeployAction.Delete });
     }
 
     // ---------- deploy / rollback (OpsDeploy) ----------

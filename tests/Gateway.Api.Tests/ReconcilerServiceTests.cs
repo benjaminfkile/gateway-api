@@ -472,6 +472,27 @@ public class ReconcilerServiceTests
     }
 
     [Fact]
+    public async Task OrphanContainer_NoManifestEntry_StopRemove()
+    {
+        // The delete → orphan-cleanup handshake (tech-spec §4.3): after
+        // DELETE /mgmt/services/{name} removes the row, the still-running managed
+        // container has no manifest entry, so the next reconcile loop treats it as
+        // an orphan and stops/removes it — no separate teardown call needed.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        harness.HostPorts.Set("svc-a", 8080);
+        // Manifest store is empty (the row was deleted).
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.False(harness.Runtime.Exists("svc-a"));
+        Assert.False(harness.HostPorts.TryGet("svc-a", out _));
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.StopRemove, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+    }
+
+    [Fact]
     public async Task AfterRestart_RoutesBuiltFromInventory_TargetAssignedHostPort()
     {
         // Simulate a gateway restart after a successful deploy: the container is

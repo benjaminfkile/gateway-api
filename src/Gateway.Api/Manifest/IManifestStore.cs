@@ -25,4 +25,12 @@ public interface IManifestStore
     /// Throws <see cref="KeyNotFoundException"/> if the service is unknown.
     /// </summary>
     Task SetDesiredStatusAsync(string name, string desiredStatus, CancellationToken ct = default);
+
+    /// <summary>
+    /// Remove the manifest row for <paramref name="name"/>. The reconciler treats a
+    /// managed container with no manifest entry as an orphan and stops/removes it on
+    /// its next loop (tech-spec §4.3), so deletion is purely a manifest-row operation.
+    /// Throws <see cref="KeyNotFoundException"/> if the service is unknown.
+    /// </summary>
+    Task DeleteAsync(string name, CancellationToken ct = default);
 }

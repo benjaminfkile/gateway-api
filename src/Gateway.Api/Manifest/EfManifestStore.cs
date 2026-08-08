@@ -58,4 +58,18 @@ public sealed class EfManifestStore : IManifestStore
         existing.DesiredStatus = desiredStatus;
         await _db.SaveChangesAsync(ct);
     }
+
+    public async Task DeleteAsync(string name, CancellationToken ct = default)
+    {
+        var existing = await _db.ServiceManifests
+            .FirstOrDefaultAsync(x => x.Name == name, ct);
+
+        if (existing is null)
+        {
+            throw new KeyNotFoundException($"No manifest entry for service '{name}'.");
+        }
+
+        _db.ServiceManifests.Remove(existing);
+        await _db.SaveChangesAsync(ct);
+    }
 }

@@ -104,6 +104,25 @@ Tune the retry window via the `Migration` configuration section
 migrations still uses the EF Core tools (`dotnet ef migrations add …`) against
 `GatewayDbContextFactory`; applying them is automatic.
 
+## Management API
+
+All endpoints live under `/mgmt/*` on the public listener but require a Cognito
+JWT with MFA (tech-spec §4.5); every mutating call is audit-logged to
+`deploy_history` with the caller's username. Read endpoints and deploy/rollback
+accept an `ops-deploy` token (the CI machine credential); lifecycle and manifest
+edits require `ops-admin`.
+
+| Endpoint | Action |
+|---|---|
+| `GET  /mgmt/services` | Manifest + per-service fleet rollup |
+| `GET  /mgmt/instances` | Fleet list from `instance_status` |
+| `GET  /mgmt/deploys` · `GET /mgmt/deploys/{id}` | Deploy history + live per-instance rollout progress |
+| `GET  /mgmt/services/{name}/logs` | Centralized logs for a service/instance |
+| `POST /mgmt/services/{name}/stop` · `/start` · `/restart` | Set desired status (fleet converges) |
+| `POST /mgmt/services/{name}/deploy` · `/rollback` | Resolve digest and roll the fleet |
+| `PUT  /mgmt/services/{name}` | Create/update a manifest entry |
+| `DELETE /mgmt/services/{name}` | Remove a service from the manifest — the reconciler stops/removes the now-orphaned container on its next loop. `?force=true` is required when the service participates in the aggregated health check (mirrors `stop`) |
+
 ## CI
 
 `.github/workflows/ci.yml`:

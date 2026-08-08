@@ -197,13 +197,15 @@ balancer routes the dashboard's request to.
 | `POST /mgmt/services/{name}/deploy` | `{tag}` → resolve digest once, update manifest → every instance blue-greens locally |
 | `POST /mgmt/services/{name}/rollback` | Redeploy previous digest from history (fleet-wide, same mechanism) |
 | `PUT  /mgmt/services/{name}` | Create/update manifest entry (add a new app from the dashboard) |
+| `DELETE /mgmt/services/{name}` | Remove a service from the manifest; the reconciler stops/removes the now-orphaned container next loop. `?force=true` required for a health-check dependency (mirrors stop) |
 | `GET  /mgmt/services/{name}/logs?instance={id}&tail=500` | Logs from the centralized log store — works for any instance regardless of which one serves the request, and survives instance replacement |
 | `GET  /mgmt/deploys` · `GET /mgmt/deploys/{id}` | History + live per-instance rollout progress (`deploy_instance_status`) |
 | `WS   /hub` (`ops` channel) | Live status pushes to the dashboard — Redis backplane means events from *any* instance reach the dashboard's single connection |
 
-Guardrails: `stop` on a health-check dependency requires a confirm flag
-(`?force=true`); the gateway itself is **not** in the manifest and cannot be
-stopped from the dashboard (its lifecycle = systemd + instance replacement).
+Guardrails: `stop` (and `delete`) on a health-check dependency requires a
+confirm flag (`?force=true`); the gateway itself is **not** in the manifest and
+cannot be stopped from the dashboard (its lifecycle = systemd + instance
+replacement).
 
 ### 4.6 Dashboard (ops UI)
 A separate SPA (any static host) at e.g. `ops.example.com`:
