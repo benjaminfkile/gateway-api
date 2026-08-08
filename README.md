@@ -83,6 +83,10 @@ feature degrades gracefully when its variable is unset, so a bare
 `NOTIFY_SOCKET`/`WATCHDOG_USEC` are provided by the unit for the watchdog
 self-check.
 
+The lease-fencing staleness threshold for leader election is tuned via the
+`LeaderElection` configuration section — `LeaderElection:LeaseStaleThreshold`
+(a `TimeSpan`, default `00:01:30` = 90s; see [Leader election](#leader-election-lease-fenced) below).
+
 ### Database migrations (applied automatically)
 
 When `GATEWAY_DB_CONNECTION` is set the gateway **owns its schema and applies
@@ -103,6 +107,35 @@ Tune the retry window via the `Migration` configuration section
 `Migration:BackoffFactor`); the defaults give a ~2 minute window. Authoring new
 migrations still uses the EF Core tools (`dotnet ef migrations add …`) against
 `GatewayDbContextFactory`; applying them is automatic.
+
+### Leader election (lease-fenced)
+
+With more than one instance, every box converges its own containers, but exactly
+one — the **leader** — runs fleet-wide duties (pruning stale `instance_status`
+rows, marking deploys complete). Leadership is a Postgres **session advisory
+lock**: the primary mutex, held while a dedicated connection stays open.
+
+A hard-killed leader (EC2 terminate, kernel panic) never closes its TCP
+connection, so Postgres can keep that session — and the lock — alive until TCP
+keepalives expire (potentially hours). Followers would then wait indefinitely and
+leader-only duties silently stop. To survive that, the leader also holds a DB
+**lease** (`leader_lease` singleton row) as the liveness truth, renewed every
+reconcile loop:
+
+- A follower that cannot get the lock reads the lease. If `renewed_at` is older
+  than `LeaderElection:LeaseStaleThreshold` (default **90s**, matching the
+  `instance_status` stale threshold), the holder is dead: the follower **fences**
+  it — `pg_terminate_backend` on the backend pinning the lock (same login role, no
+  superuser needed) — then retries the lock once and, on success, upserts the
+  lease under its own instance id.
+- **Guard rails:** a follower only fences when the lease is provably stale (never a
+  merely-slow but live leader, whose renewals keep the lease fresh), re-checks the
+  lease immediately before fencing so a peer that just won the race isn't
+  terminated, and logs fencing loudly (who fenced whom, and the lease age). A
+  graceful shutdown clears the lease so a successor need not wait out the threshold.
+
+Net effect: **leadership survives leader-instance death within ~1 reconcile loop
+after the lease threshold** — no more hours-long leaderless windows.
 
 ## Management API
 

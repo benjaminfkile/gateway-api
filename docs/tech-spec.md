@@ -140,6 +140,36 @@ survive gateway restarts.
   executes *fleet-wide* actions (e.g. marking a deploy record complete,
   pruning history).
 
+**Leader election — lease-fenced (zombie-proof).** Leadership is a session-scoped
+`pg_try_advisory_lock` on a fixed key: the primary mutex, held while a dedicated
+connection stays open. That alone is not enough — a **hard-killed** leader (EC2
+terminate, kernel panic) never closes its TCP connection, so Postgres keeps the
+session (`state=idle`) and the lock alive until TCP keepalives expire (potentially
+hours), during which every follower's `pg_try_advisory_lock` returns false and
+leader-only duties silently stop. The fix adds a DB **lease** as the liveness
+truth: a singleton `leader_lease (holder_instance_id, acquired_at, renewed_at)`
+row the leader renews every reconcile loop (same cadence as heartbeats).
+
+- A follower that cannot get the lock reads the lease. When `renewed_at` is older
+  than `LeaderElection:LeaseStaleThreshold` (default **90s**, same as the
+  `instance_status` `InstanceStaleThreshold`), the holder is dead: the follower
+  **fences** it — looks up the advisory-lock holder's backend via
+  `pg_locks`/`pg_stat_activity` and `pg_terminate_backend`s it (the owning login
+  role suffices; **no superuser** required) — then retries the lock once and, on
+  success, upserts the lease under its own instance id.
+- **Guard rails:** fence only when the lease is provably stale (never a
+  merely-slow but live leader), re-check the lease right before fencing so a peer
+  that just won the race is not terminated, and log fencing loudly (who fenced
+  whom, and the lease age). On acquiring leadership (fresh or after fencing) the
+  new leader upserts the lease immediately; on graceful release/dispose it clears
+  the lease so a successor need not wait out the threshold.
+- All Postgres-specific SQL sits behind a small internal seam
+  (`ILeaderLockGateway`) so the election algorithm is unit-tested against a fake —
+  the build box has no Postgres. **Leadership survives leader-instance death within
+  ~1 reconcile loop after the lease threshold** (observed live 2026-08-08: a killed
+  leader's session pinned the lock for 5+ minutes with three healthy followers
+  waiting; fencing closes that gap automatically).
+
 ### 4.4 Desired-state manifest (PostgreSQL)
 Single source of truth, mutated only by the Management API, consumed by reconcilers.
 
@@ -172,6 +202,10 @@ instance_status (
 -- per-instance rollout progress for a deploy ("17/20 converged")
 deploy_instance_status (deploy_id, instance_id, status, detail, updated_at,
                         primary key (deploy_id, instance_id))
+
+-- singleton leader-liveness lease (§4.3): the leader renews renewed_at every
+-- reconcile loop; a stale row lets a follower fence the dead holder
+leader_lease (id, holder_instance_id, acquired_at, renewed_at)  -- one row (id=1)
 ```
 
 - CI integration: the build pipeline pushes the image, then calls one
