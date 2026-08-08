@@ -296,6 +296,26 @@ public class ReconcilerServiceTests
     }
 
     [Fact]
+    public async Task BlueGreen_ConsecutiveDeploys_AlternateBetweenManifestAndSidePort()
+    {
+        // After a promote the canonical container occupies the side port (Docker
+        // bindings are immutable); the next candidate must bind the manifest port
+        // or green creation collides with the canonical container.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash));
+        harness.Prober.Ready = true;
+
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2"));
+        await harness.Service.RunOnceAsync();
+        Assert.Equal(8081, harness.Runtime.Get("svc-a")!.HostPort);
+
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v3"));
+        await harness.Service.RunOnceAsync();
+        Assert.Equal(8080, harness.Runtime.Get("svc-a")!.HostPort);
+        Assert.Equal("sha256:v3", harness.Runtime.Get("svc-a")!.Digest);
+    }
+
+    [Fact]
     public async Task BlueGreen_OldKeepsServing_UntilGreenHealthy()
     {
         var harness = new Harness();

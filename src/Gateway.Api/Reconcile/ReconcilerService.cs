@@ -418,7 +418,13 @@ public sealed class ReconcilerService : BackgroundService
     {
         var d = action.Desired!;
         var greenName = ReconcileNaming.GreenNameFor(d.Name);
-        var sidePort = d.Port + _options.SidePortOffset;
+
+        // The candidate must bind a host port the canonical container is NOT
+        // occupying. After a promote the canonical container sits on the side
+        // port (bindings are immutable), so consecutive deploys alternate
+        // between the manifest port and the side port.
+        var canonicalPort = _hostPorts.TryGet(d.Name, out var current) ? current : d.Port;
+        var sidePort = canonicalPort == d.Port ? d.Port + _options.SidePortOffset : d.Port;
 
         try
         {
