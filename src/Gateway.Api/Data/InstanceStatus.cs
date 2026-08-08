@@ -18,7 +18,11 @@ public class InstanceStatus
     /// <summary>Gateway binary version running on the instance.</summary>
     public string? GatewayVer { get; set; }
 
-    /// <summary>Whether this instance currently holds the leader lock.</summary>
+    /// <summary>
+    /// Whether this instance is the fleet leader (tech-spec §4.3): heartbeat-derived
+    /// as the lowest live <c>instance_id</c>, written each reconcile loop from that
+    /// evaluation so the dashboard leader badge follows automatically.
+    /// </summary>
     public bool IsLeader { get; set; }
 
     /// <summary>

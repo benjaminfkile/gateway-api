@@ -1,5 +1,4 @@
 using Gateway.Api.Data;
-using Gateway.Api.Instances;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Gateway.Api.Tests;
@@ -136,15 +135,5 @@ public class DatabaseMigrationTests
         await waiter; // now completes
 
         Assert.True(gate.IsReady);
-    }
-
-    [Fact]
-    public void MigrationLockKey_IsDistinctFromLeaderElectionKey()
-    {
-        // Requirement 2: reuse the advisory-lock pattern but a distinct key so
-        // migration serialization never contends with leader election.
-        Assert.NotEqual(
-            PostgresAdvisoryLockLeaderElection.DefaultLockKey,
-            EfDatabaseMigrator.MigrationLockKey);
     }
 }

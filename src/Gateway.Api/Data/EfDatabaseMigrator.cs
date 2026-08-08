@@ -7,11 +7,11 @@ namespace Gateway.Api.Data;
 
 /// <summary>
 /// Applies the gateway's pending EF Core migrations, serialized fleet-wide with a
-/// Postgres advisory lock (tech-spec §6, §7; same mechanism as
-/// <see cref="Instances.PostgresAdvisoryLockLeaderElection"/> on a <b>distinct</b>
-/// key). On boot several ASG instances may race to migrate a fresh database; the
-/// lock guarantees exactly one runs <c>Database.Migrate</c> while the rest block,
-/// then find nothing pending and proceed.
+/// Postgres advisory lock (tech-spec §6, §7). On boot several ASG instances may race
+/// to migrate a fresh database; the lock guarantees exactly one runs
+/// <c>Database.Migrate</c> while the rest block, then find nothing pending and
+/// proceed. (Leader election, by contrast, uses no lock — see
+/// <see cref="Instances.HeartbeatLeaderElection"/>.)
 /// <para>
 /// A single <see cref="MigrateAsync"/> call is one attempt and throws if the
 /// database is unreachable or a migration fails; the surrounding retry/backoff and
@@ -24,9 +24,9 @@ namespace Gateway.Api.Data;
 public sealed class EfDatabaseMigrator : IDatabaseMigrator
 {
     /// <summary>
-    /// Advisory-lock key identifying "the gateway is migrating the schema".
-    /// Deliberately distinct from <see cref="Instances.PostgresAdvisoryLockLeaderElection.DefaultLockKey"/>
-    /// so migration serialization and leader election never contend on the same lock.
+    /// Advisory-lock key identifying "the gateway is migrating the schema". Leader
+    /// election no longer uses any lock (it is heartbeat-derived), so this lock is
+    /// only ever contended by the migration path itself.
     /// </summary>
     public const long MigrationLockKey = 0x6761_7465_6d69_67L; // "gatemig" in hex-ish
 

@@ -78,7 +78,7 @@ public static class ReconcilerServiceCollectionExtensions
 
         // Leader election + instance-status persistence. Defaults suit a box with
         // no Postgres (single-node dev / tests); Program.cs registers the
-        // Postgres-advisory-lock leader and EF-backed store when a DB is configured.
+        // heartbeat-derived leader and EF-backed store when a DB is configured.
         services.TryAddSingleton<ILeaderElection>(new InMemoryLeaderElection());
         services.TryAddSingleton<IInstanceStatusStore, NullInstanceStatusStore>();
 

@@ -18,7 +18,6 @@ public class GatewayDbContext : DbContext
     public DbSet<DeployHistory> DeployHistory => Set<DeployHistory>();
     public DbSet<InstanceStatus> InstanceStatus => Set<InstanceStatus>();
     public DbSet<DeployInstanceStatus> DeployInstanceStatus => Set<DeployInstanceStatus>();
-    public DbSet<LeaderLease> LeaderLease => Set<LeaderLease>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -81,17 +80,6 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.Status).HasColumnName("status").IsRequired();
             e.Property(x => x.Detail).HasColumnName("detail");
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
-        });
-
-        modelBuilder.Entity<LeaderLease>(e =>
-        {
-            // Singleton leader-liveness lease (tech-spec §4.3): one row, fixed key.
-            e.ToTable("leader_lease");
-            e.HasKey(x => x.Id);
-            e.Property(x => x.Id).HasColumnName("id").ValueGeneratedNever();
-            e.Property(x => x.HolderInstanceId).HasColumnName("holder_instance_id").IsRequired();
-            e.Property(x => x.AcquiredAt).HasColumnName("acquired_at");
-            e.Property(x => x.RenewedAt).HasColumnName("renewed_at");
         });
     }
 }

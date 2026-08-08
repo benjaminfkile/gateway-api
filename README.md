@@ -83,9 +83,9 @@ feature degrades gracefully when its variable is unset, so a bare
 `NOTIFY_SOCKET`/`WATCHDOG_USEC` are provided by the unit for the watchdog
 self-check.
 
-The lease-fencing staleness threshold for leader election is tuned via the
-`LeaderElection` configuration section — `LeaderElection:LeaseStaleThreshold`
-(a `TimeSpan`, default `00:01:30` = 90s; see [Leader election](#leader-election-lease-fenced) below).
+Leader election is heartbeat-derived and reuses the `instance_status` staleness
+threshold — `Reconciler:InstanceStaleThreshold` (a `TimeSpan`, default `00:01:30`
+= 90s; see [Leader election](#leader-election-heartbeat-derived) below).
 
 ### Database migrations (applied automatically)
 
@@ -95,8 +95,9 @@ update` step. This runs before the reconciler, heartbeat, or any endpoint that
 reads the schema, so pointing a fresh instance at an empty database just works.
 
 - **Fleet-safe:** when several instances boot at once (ASG scale-out) a Postgres
-  advisory lock (a distinct key from leader election) serializes migration —
-  exactly one instance migrates while the rest wait, then proceed.
+  advisory lock serializes migration — exactly one instance migrates while the rest
+  wait, then proceed. (This lock is only used for migration; leader election uses
+  none — see below.)
 - **Resilient:** if the database is not yet reachable, migration is retried with
   exponential backoff for a bounded window; if it is still failing the process
   exits non-zero so systemd (`Restart=always`) restarts it, rather than serving
@@ -108,34 +109,27 @@ Tune the retry window via the `Migration` configuration section
 migrations still uses the EF Core tools (`dotnet ef migrations add …`) against
 `GatewayDbContextFactory`; applying them is automatic.
 
-### Leader election (lease-fenced)
+### Leader election (heartbeat-derived)
 
-With more than one instance, every box converges its own containers, but exactly
-one — the **leader** — runs fleet-wide duties (pruning stale `instance_status`
-rows, marking deploys complete). Leadership is a Postgres **session advisory
-lock**: the primary mutex, held while a dedicated connection stays open.
+With more than one instance, every box converges its own containers, but the
+**leader** additionally runs fleet-wide duties (pruning stale `instance_status`
+rows, marking deploys complete). Leadership is **not** a lock: the leader is simply
+the live instance with the **lowest `instance_id`** (ordinal compare) among the
+`instance_status` rows whose `heartbeat_at` is within
+`Reconciler:InstanceStaleThreshold` (default **90s**). No extra table, no advisory
+lock, no session state.
 
-A hard-killed leader (EC2 terminate, kernel panic) never closes its TCP
-connection, so Postgres can keep that session — and the lock — alive until TCP
-keepalives expire (potentially hours). Followers would then wait indefinitely and
-leader-only duties silently stop. To survive that, the leader also holds a DB
-**lease** (`leader_lease` singleton row) as the liveness truth, renewed every
-reconcile loop:
-
-- A follower that cannot get the lock reads the lease. If `renewed_at` is older
-  than `LeaderElection:LeaseStaleThreshold` (default **90s**, matching the
-  `instance_status` stale threshold), the holder is dead: the follower **fences**
-  it — `pg_terminate_backend` on the backend pinning the lock (same login role, no
-  superuser needed) — then retries the lock once and, on success, upserts the
-  lease under its own instance id.
-- **Guard rails:** a follower only fences when the lease is provably stale (never a
-  merely-slow but live leader, whose renewals keep the lease fresh), re-checks the
-  lease immediately before fencing so a peer that just won the race isn't
-  terminated, and logs fencing loudly (who fenced whom, and the lease age). A
-  graceful shutdown clears the lease so a successor need not wait out the threshold.
-
-Net effect: **leadership survives leader-instance death within ~1 reconcile loop
-after the lease threshold** — no more hours-long leaderless windows.
+- Each reconcile loop an instance **upserts its own heartbeat first, then evaluates
+  leadership from a fresh read** — so a booting instance sees itself and takes
+  leadership when it is the lowest live id. The `is_leader` flag on its own row
+  reflects that evaluation, so the dashboard leader badge follows automatically.
+- A hard-killed leader (EC2 terminate, kernel panic) simply stops heartbeating; its
+  row ages out and drops from the candidate set, so the next-lowest live id takes
+  over within **~1 reconcile loop after the stale threshold** — there is no zombie
+  Postgres session that could pin leadership for hours.
+- The leader-only duties are **idempotent**, so strict mutual exclusion is
+  unnecessary: a brief **dual-leader overlap** during a transition is harmless and
+  tolerated by design. Liveness matters more than exclusivity.
 
 ## Management API
 
