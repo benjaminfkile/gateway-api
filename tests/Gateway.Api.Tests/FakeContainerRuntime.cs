@@ -35,6 +35,13 @@ public sealed class FakeContainerRuntime : IContainerRuntime
     /// <summary>The next ephemeral host port the fake will assign on the next start.</summary>
     public int NextHostPort => _nextHostPort;
 
+    /// <summary>
+    /// Digests that are "missing" locally: a start referencing one throws
+    /// <see cref="ContainerImageNotFoundException"/>, modelling Docker's
+    /// "No such image ...@&lt;digest&gt;" for a stale pinned digest.
+    /// </summary>
+    public HashSet<string> MissingDigests { get; } = new(StringComparer.Ordinal);
+
     /// <summary>Seed a pre-existing container (e.g. an already-running old service).</summary>
     public void Seed(ContainerInfo container)
     {
@@ -90,6 +97,13 @@ public sealed class FakeContainerRuntime : IContainerRuntime
 
     public Task<int> StartServiceContainerAsync(ServiceContainerSpec spec, CancellationToken ct = default)
     {
+        if (!string.IsNullOrEmpty(spec.Digest) && MissingDigests.Contains(spec.Digest))
+        {
+            var imageRef = $"{spec.Image}@{spec.Digest}";
+            Operations.Enqueue($"StartFailedImageNotFound:{spec.Name}");
+            throw new ContainerImageNotFoundException($"No such image {imageRef}", imageRef);
+        }
+
         int hostPort;
         lock (_gate)
         {

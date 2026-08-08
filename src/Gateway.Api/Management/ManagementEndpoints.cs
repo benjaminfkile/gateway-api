@@ -281,13 +281,24 @@ public static partial class ManagementEndpoints
         }
 
         var existing = await manifests.GetAsync(name, ct);
+        // A pinned digest is only valid for the exact image:tag it was resolved from.
+        // If the edit changes the image or tag, the old digest is stale — clear it so
+        // the next reconcile re-resolves the digest from the new tag (production bug
+        // 2026-08-08: a tag change left the stale digest and every instance failed to
+        // start image@<stale digest> on a loop). Editing only port/health/desired on an
+        // unchanged image+tag keeps the pinned digest so a digest-pinned deploy is not
+        // silently unpinned.
+        var imageOrTagChanged = existing is not null
+            && (!string.Equals(existing.Image, request.Image, StringComparison.Ordinal)
+                || !string.Equals(existing.Tag, request.Tag, StringComparison.Ordinal));
         var manifest = new ServiceManifest
         {
             Name = name,
             Image = request.Image,
             Tag = request.Tag,
-            // Preserve a previously-resolved digest across an edit; a deploy re-resolves it.
-            Digest = existing?.Digest,
+            // New services always start with a null digest; edits keep the pinned
+            // digest only while image+tag are unchanged (see above).
+            Digest = imageOrTagChanged ? null : existing?.Digest,
             Port = request.Port,
             DesiredStatus = string.IsNullOrWhiteSpace(request.DesiredStatus) ? "running" : request.DesiredStatus,
             EnvSecretRef = request.EnvSecretRef,
