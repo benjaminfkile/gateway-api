@@ -19,6 +19,10 @@ public static class ProxyServiceCollectionExtensions
         // Container-truth port map, shared with the reconciler and health prober so
         // routes forward to the port each container is actually bound to.
         services.TryAddSingleton<ServiceHostPortMap>();
+        // Host-based routes (domains fronting a single service) from
+        // GATEWAY_HOST_ROUTES; TryAdd so tests can inject their own map.
+        services.TryAddSingleton(sp =>
+            HostRouteMap.FromConfiguration(sp.GetRequiredService<IConfiguration>()));
         services.AddSingleton<ManifestProxyConfigProvider>();
         services.AddSingleton<IProxyConfigProvider>(sp =>
             sp.GetRequiredService<ManifestProxyConfigProvider>());

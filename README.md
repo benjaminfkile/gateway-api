@@ -65,6 +65,7 @@ feature degrades gracefully when its variable is unset, so a bare
 | `GATEWAY_REDIS_ENDPOINT` | unset | Redis endpoint for the SignalR backplane. Unset → hub runs without a backplane (single instance). |
 | `GATEWAY_REDIS_SSL` | `true` | TLS for the Redis backplane connection. |
 | `GATEWAY_CORS_ORIGINS` | unset | Comma-separated origins allowed CORS access to `/mgmt/*` and `/hub` (the ops dashboard's origin). Unset → no CORS; proxied application traffic is never CORS-handled either way. |
+| `GATEWAY_HOST_ROUTES` | unset | Comma-separated `host=service` pairs for domains that front a single service directly (bare paths, no `/{service}` prefix). The domain must already resolve to the load balancer and be on its certificate. |
 | `GATEWAY_INTERNAL_BIND` | `0.0.0.0:8080` | Bind address of the internal listener hosting `POST /internal/publish` (never routed by the load balancer). |
 | `GATEWAY_INSTANCE_ID` | unset | Instance identity fallback when EC2 IMDS is unreachable (local dev). |
 | `GATEWAY_PRIVATE_IP` | unset | Private IP fallback for local dev. |

@@ -29,12 +29,16 @@ public sealed class ProxyStateService
     private readonly ConcurrentDictionary<string, string> _destinationOverrides =
         new(StringComparer.Ordinal);
 
+    private readonly HostRouteMap _hostRoutes;
+
     public ProxyStateService(
         ManifestProxyConfigProvider provider,
         IServiceScopeFactory scopeFactory,
         IServiceAddressResolver addressResolver,
-        ServiceHostPortMap hostPorts)
+        ServiceHostPortMap hostPorts,
+        HostRouteMap? hostRoutes = null)
     {
+        _hostRoutes = hostRoutes ?? HostRouteMap.Empty;
         _provider = provider;
         _scopeFactory = scopeFactory;
         _addressResolver = addressResolver;
@@ -78,6 +82,24 @@ public sealed class ProxyStateService
                     new Dictionary<string, string> { ["PathRemovePrefix"] = $"/{manifest.Name}" },
                 },
             });
+
+            // Domains that front this service directly (tech-spec §4.1): match on
+            // the Host header, forward bare paths unchanged — the app sees exactly
+            // what the browser sent, same as with the path-prefix form after the
+            // strip. Same cluster, so blue-green swaps cover both route shapes.
+            foreach (var host in _hostRoutes.HostsFor(manifest.Name))
+            {
+                routes.Add(new RouteConfig
+                {
+                    RouteId = $"route-host-{host}",
+                    ClusterId = clusterId,
+                    Match = new RouteMatch
+                    {
+                        Hosts = new[] { host },
+                        Path = "/{**catch-all}",
+                    },
+                });
+            }
 
             clusters.Add(new ClusterConfig
             {
