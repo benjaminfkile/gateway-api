@@ -40,9 +40,18 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     // instance's status row via the EF store, and leadership — which gates the
     // stale-row cleanup — is a Postgres advisory lock on a dedicated connection.
     builder.Services.AddScoped<IInstanceStatusStore, EfInstanceStatusStore>();
+    // Lease-fenced leader election (tech-spec §4.3): the advisory lock is the primary
+    // mutex; a DB lease is the liveness truth so a hard-killed leader is fenced within
+    // ~1 reconcile loop after the lease threshold instead of pinning the lock for hours.
+    var leaseStaleThreshold = builder.Configuration.GetValue<TimeSpan?>(
+        PostgresAdvisoryLockLeaderElection.StaleThresholdConfigKey)
+        ?? PostgresAdvisoryLockLeaderElection.DefaultStaleThreshold;
     builder.Services.AddSingleton<ILeaderElection>(sp =>
         new PostgresAdvisoryLockLeaderElection(
             dbConnection,
+            instanceIdProvider: async ct =>
+                (await sp.GetRequiredService<InstanceMetadataProvider>().GetAsync(ct)).InstanceId,
+            staleThreshold: leaseStaleThreshold,
             logger: sp.GetRequiredService<ILoggerFactory>()
                 .CreateLogger<PostgresAdvisoryLockLeaderElection>()));
 
