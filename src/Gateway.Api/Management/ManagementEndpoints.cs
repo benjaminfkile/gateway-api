@@ -36,6 +36,14 @@ public static partial class ManagementEndpoints
     /// <summary>Hub channel the dashboard listens on for live deploy events (tech-spec §4.5).</summary>
     public const string OpsDeploysChannel = "ops:deploys";
 
+    /// <summary>
+    /// Hub channel the dashboard listens on for live fleet events — heartbeat,
+    /// serviceError, leaderChange, instances (tech-spec §4.3, §4.4). Fleet-wide events
+    /// (heartbeat/leaderChange/instances) are published by the leader only so a fleet of
+    /// N instances emits each exactly once; serviceError is per-instance.
+    /// </summary>
+    public const string OpsFleetChannel = "ops:fleet";
+
     /// <summary>The gateway is never a managed service; its name is reserved (tech-spec §4.5).</summary>
     public const string ReservedGatewayName = "gateway";
 
