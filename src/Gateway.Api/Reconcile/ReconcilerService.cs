@@ -4,6 +4,7 @@ using Gateway.Api.Instances;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
+using Gateway.Api.RealTime;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -39,6 +40,13 @@ public sealed class ReconcilerService : BackgroundService
     private readonly ILogger<ReconcilerService> _logger;
     private readonly MigrationReadinessGate? _migrationGate;
 
+    // Real-time broadcaster for terminal deploy + per-instance convergence events
+    // (tech-spec §4.2, §4.5). Optional: a DB-less / minimal test host may run the
+    // reconciler with no hub wired, so this stays null and every publish is skipped.
+    // Broadcasts always go through TryPublish so a backplane blip can never affect
+    // reconciliation; on the leader the Redis backplane fans them out fleet-wide.
+    private readonly IChannelEventPublisher? _publisher;
+
     // Service log groups whose 30-day retention has already been ensured this
     // process, so PutRetentionPolicy is issued at most once per group (tech-spec §9).
     private readonly HashSet<string> _retentionEnsured = new(StringComparer.Ordinal);
@@ -65,7 +73,8 @@ public sealed class ReconcilerService : BackgroundService
         ILeaderElection leaderElection,
         ReconcilerOptions options,
         ILogger<ReconcilerService> logger,
-        MigrationReadinessGate? migrationGate = null)
+        MigrationReadinessGate? migrationGate = null,
+        IChannelEventPublisher? publisher = null)
     {
         _runtime = runtime;
         _proxyState = proxyState;
@@ -79,6 +88,7 @@ public sealed class ReconcilerService : BackgroundService
         _options = options;
         _logger = logger;
         _migrationGate = migrationGate;
+        _publisher = publisher;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -310,6 +320,17 @@ public sealed class ReconcilerService : BackgroundService
                         Status = DeployInstanceState.Converged,
                         UpdatedAt = DateTimeOffset.UtcNow,
                     }, ct);
+
+                    // Broadcast this instance's convergence (tech-spec §4.5) so the dashboard
+                    // can tick the rollout count up live. Best-effort: a publish failure must
+                    // never affect the reconcile that already committed the status row.
+                    _publisher?.TryPublish(ManagementEndpoints.OpsDeploysChannel, "deployInstance", new
+                    {
+                        deployId = deploy.Id,
+                        instanceId = identity.InstanceId,
+                        status = DeployInstanceState.Converged,
+                        error = (string?)null,
+                    });
                 }
             }
 
@@ -361,11 +382,35 @@ public sealed class ReconcilerService : BackgroundService
             && string.Equals(e.Digest, digest, StringComparison.Ordinal));
     }
 
-    private static Task MarkDeployAsync(IDeployStore store, DeployHistory deploy, string status, CancellationToken ct)
+    /// <summary>
+    /// Transition a deploy to a terminal <paramref name="status"/> (done/partial/failed):
+    /// stamp <c>FinishedAt</c>, persist, then broadcast the terminal <c>deploy</c> event on
+    /// <c>ops:deploys</c> using the ChannelEvent envelope (tech-spec §4.2, §4.5). The
+    /// broadcast rides <see cref="IChannelEventPublisher.TryPublish"/> so a backplane
+    /// failure can never affect the transition that has already committed; on the leader
+    /// the Redis backplane fans it out to clients on every instance. <paramref name="error"/>
+    /// is null unless the deploy failed.
+    /// </summary>
+    private async Task MarkDeployAsync(
+        IDeployStore store, DeployHistory deploy, string status, CancellationToken ct, string? error = null)
     {
         deploy.Status = status;
         deploy.FinishedAt = DateTimeOffset.UtcNow;
-        return store.UpdateAsync(deploy, ct);
+        await store.UpdateAsync(deploy, ct);
+
+        _publisher?.TryPublish(ManagementEndpoints.OpsDeploysChannel, "deploy", new
+        {
+            deployId = deploy.Id,
+            service = deploy.Service,
+            action = deploy.Action,
+            fromDigest = deploy.FromDigest,
+            toDigest = deploy.ToDigest,
+            status = deploy.Status,
+            // Terminal now, so FinishedAt is set; emit it as an ISO 8601 string per the
+            // wire contract (round-trip "O" format).
+            finishedAt = deploy.FinishedAt?.ToString("O"),
+            error,
+        });
     }
 
     /// <summary>
