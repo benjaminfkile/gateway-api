@@ -27,6 +27,14 @@ public class ReconcilerDeployProgressTests
             Task.FromResult(true);
     }
 
+    /// <summary>A prober that never reports ready — models a green candidate that fails
+    /// its health check, so a blue-green replace aborts and reports Failed.</summary>
+    private sealed class FailingReadinessProber : IReadinessProber
+    {
+        public Task<bool> WaitForReadyAsync(string address, string healthPath, TimeSpan timeout, CancellationToken ct = default) =>
+            Task.FromResult(false);
+    }
+
     private sealed class NullEnvProvider : IServiceEnvProvider
     {
         public Task<IReadOnlyDictionary<string, string>> GetEnvAsync(ServiceManifest manifest, CancellationToken ct = default) =>
@@ -66,7 +74,11 @@ public class ReconcilerDeployProgressTests
         public IChannelEventPublisher Publisher { get; }
         public ReconcilerService Service { get; }
 
-        public Harness(bool isLeader = true, IChannelEventPublisher? publisher = null)
+        public Harness(
+            bool isLeader = true,
+            IChannelEventPublisher? publisher = null,
+            IReadinessProber? readiness = null,
+            TimeSpan? deployTimeout = null)
         {
             Publisher = publisher ?? new RecordingPublisher();
             var options = new ReconcilerOptions
@@ -75,6 +87,7 @@ public class ReconcilerDeployProgressTests
                 DrainDelay = TimeSpan.Zero,
                 ReadinessTimeout = TimeSpan.FromMilliseconds(10),
                 ReadinessPollInterval = TimeSpan.FromMilliseconds(1),
+                DeployTimeout = deployTimeout ?? TimeSpan.FromMinutes(10),
             };
 
             var services = new ServiceCollection();
@@ -99,7 +112,7 @@ public class ReconcilerDeployProgressTests
                 provider.GetRequiredService<IServiceAddressResolver>(),
                 provider.GetRequiredService<ServiceHostPortMap>(),
                 provider.GetRequiredService<IServiceScopeFactory>(),
-                new FakeReadinessProber(),
+                readiness ?? new FakeReadinessProber(),
                 new NullReporter(),
                 metadata,
                 new InMemoryLeaderElection(isLeader),
@@ -306,5 +319,156 @@ public class ReconcilerDeployProgressTests
         Assert.Equal(DeployInstanceState.Converged, progress.Status);
         var deploy = Assert.Single(harness.DeployStore.History);
         Assert.Equal(DeployStatus.Done, deploy.Status);
+    }
+
+    [Fact]
+    public async Task InstanceFailure_MarksDeployFailed_WhenNoInstanceConverged()
+    {
+        // The one live instance's blue-green replace fails its health check, so no
+        // instance ever reaches the target digest — the deploy is terminal "failed".
+        var recorder = new RecordingPublisher();
+        var harness = new Harness(isLeader: true, publisher: recorder, readiness: new FailingReadinessProber());
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", FromDigest = "sha256:v1", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow,
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        // The failed blue-green replace wrote a Failed per-instance row correlated to the deploy...
+        var progress = Assert.Single(harness.DeployStore.InstanceStatuses);
+        Assert.Equal("i-test", progress.InstanceId);
+        Assert.Equal(DeployInstanceState.Failed, progress.Status);
+        Assert.False(string.IsNullOrEmpty(progress.Detail));
+
+        // ...and the leader marked the whole deploy failed (nobody converged), with an error.
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Failed, deploy.Status);
+        Assert.NotNull(deploy.FinishedAt);
+
+        // The per-instance failure was broadcast with status "failed" and an error...
+        var instanceEvent = Assert.Single(recorder.Published.Where(p => p.Event == "deployInstance"));
+        Assert.Equal(DeployInstanceState.Failed, instanceEvent.Get("status"));
+        Assert.Equal("i-test", instanceEvent.Get("instanceId"));
+        Assert.NotNull(instanceEvent.Get("error"));
+
+        // ...and the terminal "deploy" event carries the failed status + a non-null error.
+        var terminal = Assert.Single(recorder.Published.Where(p => p.Event == "deploy"));
+        Assert.Equal(DeployStatus.Failed, terminal.Get("status"));
+        Assert.NotNull(terminal.Get("error"));
+        Assert.IsType<string>(terminal.Get("finishedAt"));
+    }
+
+    [Fact]
+    public async Task InstanceFailure_MarksDeployPartial_WhenAnotherInstanceConverged()
+    {
+        // This instance's blue-green replace fails, but a second live instance is already
+        // on the target digest — so the deploy is "partial", not "failed".
+        var recorder = new RecordingPublisher();
+        var harness = new Harness(isLeader: true, publisher: recorder, readiness: new FailingReadinessProber());
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        harness.StatusStore.Seed(ManagementTestData.Instance(
+            "i-2", heartbeatAt: DateTimeOffset.UtcNow, running: ("svc-a", "sha256:v2")));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow,
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var progress = Assert.Single(harness.DeployStore.InstanceStatuses);
+        Assert.Equal(DeployInstanceState.Failed, progress.Status);
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Partial, deploy.Status);
+        Assert.NotNull(deploy.FinishedAt);
+
+        var terminal = Assert.Single(recorder.Published.Where(p => p.Event == "deploy"));
+        Assert.Equal(DeployStatus.Partial, terminal.Get("status"));
+        Assert.NotNull(terminal.Get("error"));
+    }
+
+    [Fact]
+    public async Task Leader_TimesOutStaleDeploy_MarksFailed_WhenNoneConverged()
+    {
+        // A deploy older than the timeout whose target digest nobody runs: the leader
+        // fails it with "deploy timed out" instead of rescanning it forever.
+        var recorder = new RecordingPublisher();
+        var harness = new Harness(
+            isLeader: true, publisher: recorder, deployTimeout: TimeSpan.FromMinutes(10));
+        // Fleet is fully converged on v1; the deploy targets an unreachable v2.
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v1"));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(20),
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Failed, deploy.Status);
+        Assert.NotNull(deploy.FinishedAt);
+
+        var terminal = Assert.Single(recorder.Published.Where(p => p.Event == "deploy"));
+        Assert.Equal(DeployStatus.Failed, terminal.Get("status"));
+        Assert.Equal("deploy timed out", terminal.Get("error"));
+    }
+
+    [Fact]
+    public async Task Leader_TimesOutStaleDeploy_MarksPartial_WhenSomeConverged()
+    {
+        // Some of the fleet converged before the deploy went stale: timeout → "partial".
+        var harness = new Harness(isLeader: true, deployTimeout: TimeSpan.FromMinutes(10));
+        harness.Runtime.Seed(Running("svc-a", "sha256:v2"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        // A straggler that never converged keeps the fleet from being all-converged.
+        harness.StatusStore.Seed(ManagementTestData.Instance(
+            "i-2", heartbeatAt: DateTimeOffset.UtcNow, running: ("svc-a", "sha256:v1")));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(20),
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Partial, deploy.Status);
+        Assert.NotNull(deploy.FinishedAt);
+    }
+
+    [Fact]
+    public async Task Leader_DoesNotTimeOut_FreshDeploy_WithStraggler()
+    {
+        // The same shape as the partial-timeout case but the deploy is fresh: it must
+        // stay in progress — the timeout must not fire early.
+        var harness = new Harness(isLeader: true, deployTimeout: TimeSpan.FromMinutes(10));
+        harness.Runtime.Seed(Running("svc-a", "sha256:v2"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        harness.StatusStore.Seed(ManagementTestData.Instance(
+            "i-2", heartbeatAt: DateTimeOffset.UtcNow, running: ("svc-a", "sha256:v1")));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow,
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.InProgress, deploy.Status);
+        Assert.Null(deploy.FinishedAt);
     }
 }

@@ -13,6 +13,12 @@ public sealed class ReconcilerOptions
     /// <summary>Environment variable that gates the reconciler; must equal <c>true</c> to enable.</summary>
     public const string EnabledEnvVar = "GATEWAY_RECONCILER_ENABLED";
 
+    /// <summary>
+    /// Environment variable overriding <see cref="DeployTimeout"/>, expressed as a
+    /// whole number of seconds (e.g. <c>600</c> for ten minutes).
+    /// </summary>
+    public const string DeployTimeoutEnvVar = "GATEWAY_DEPLOY_TIMEOUT";
+
     /// <summary>Whether the reconcile loop runs. Off unless the env flag is set.</summary>
     public bool Enabled { get; set; }
 
@@ -56,4 +62,14 @@ public sealed class ReconcilerOptions
     /// instance and pruned by the leader (tech-spec §4.4: rows stale &gt; 90s).
     /// </summary>
     public TimeSpan InstanceStaleThreshold { get; set; } = TimeSpan.FromSeconds(90);
+
+    /// <summary>
+    /// How long an <c>in_progress</c> deploy may run before the leader gives up on it
+    /// (tech-spec §4.5, §7). A deploy older than this whose fleet has not fully
+    /// converged is marked <c>failed</c> (or <c>partial</c> if some instances did
+    /// converge) with error "deploy timed out" — so a stuck rollout stops being
+    /// rescanned every loop instead of sitting <c>in_progress</c> forever. Default
+    /// 10 minutes; override with <see cref="DeployTimeoutEnvVar"/>.
+    /// </summary>
+    public TimeSpan DeployTimeout { get; set; } = TimeSpan.FromMinutes(10);
 }

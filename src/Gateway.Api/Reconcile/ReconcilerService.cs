@@ -351,6 +351,7 @@ public sealed class ReconcilerService : BackgroundService
                 return;
             }
 
+            var now = DateTimeOffset.UtcNow;
             foreach (var deploy in inProgress)
             {
                 var converged = live.Count(i => InstanceRunsDigest(i, deploy.Service, deploy.ToDigest));
@@ -360,11 +361,25 @@ public sealed class ReconcilerService : BackgroundService
                     continue;
                 }
 
+                // A live instance reported an explicit convergence failure (bug #1), or the
+                // deploy has been running past the staleness timeout (bug: an in_progress
+                // deploy would otherwise be rescanned forever): terminate it. It is
+                // "partial" when some instances converged and "failed" when none did.
                 var childStatuses = await deployStore.ListInstanceStatusesAsync(deploy.Id, ct);
-                if (childStatuses.Any(s => string.Equals(s.Status, DeployInstanceState.Failed, StringComparison.Ordinal)))
+                var failure = childStatuses.FirstOrDefault(
+                    s => string.Equals(s.Status, DeployInstanceState.Failed, StringComparison.Ordinal));
+                var timedOut = now - deploy.StartedAt > _options.DeployTimeout;
+
+                if (failure is null && !timedOut)
                 {
-                    await MarkDeployAsync(deployStore, deploy, DeployStatus.Partial, ct);
+                    // Still rolling out and within the timeout — leave it in progress.
+                    continue;
                 }
+
+                var status = converged > 0 ? DeployStatus.Partial : DeployStatus.Failed;
+                var error = failure?.Detail
+                    ?? (timedOut ? "deploy timed out" : "reconcile failed on one or more instances");
+                await MarkDeployAsync(deployStore, deploy, status, ct, error);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -514,7 +529,7 @@ public sealed class ReconcilerService : BackgroundService
     /// so a service failing every loop — even one with no container (absent) — is
     /// visible through the management API. Trimmed to keep the jsonb small.
     /// </summary>
-    private Task ReportOutcomeAsync(ReconcileOutcome outcome, CancellationToken ct)
+    private async Task ReportOutcomeAsync(ReconcileOutcome outcome, CancellationToken ct)
     {
         lock (_serviceErrors)
         {
@@ -529,7 +544,80 @@ public sealed class ReconcilerService : BackgroundService
             }
         }
 
-        return _reporter.ReportAsync(outcome, ct);
+        // A failed action that was servicing an active deploy must be correlated back to
+        // the deploy row (bugs #1/#2): record this instance's failure so the leader's
+        // progress scan can drive the deploy to a terminal partial/failed state instead
+        // of leaving it in_progress forever. Only Start and BlueGreenReplace service a
+        // deploy; a StopRemove or an env-resolution (None) outcome does not.
+        if (outcome.Status == ReconcileOutcomeStatus.Failed
+            && (outcome.Kind == ReconcileActionKind.Start || outcome.Kind == ReconcileActionKind.BlueGreenReplace))
+        {
+            await RecordDeployInstanceFailureAsync(outcome.ServiceName, outcome.Detail, ct);
+        }
+
+        await _reporter.ReportAsync(outcome, ct);
+    }
+
+    /// <summary>
+    /// Correlate a failed reconcile action back to any <c>in_progress</c> deploy for the
+    /// service (tech-spec §4.5, §7): write a <see cref="DeployInstanceState.Failed"/>
+    /// <c>deploy_instance_status</c> row for this instance, keyed by the matching
+    /// deploy's id, and broadcast a per-instance <c>deployInstance</c> failure event —
+    /// the mirror of the convergence broadcast. Best-effort and DB-optional: no
+    /// <see cref="IDeployStore"/> (DB-less box / minimal test host) or no matching
+    /// in-progress deploy is a no-op, and any bookkeeping failure is logged rather than
+    /// allowed to disturb the reconcile that already ran.
+    /// </summary>
+    private async Task RecordDeployInstanceFailureAsync(string service, string error, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var deployStore = scope.ServiceProvider.GetService<IDeployStore>();
+            if (deployStore is null)
+            {
+                return;
+            }
+
+            var inProgress = await deployStore.ListInProgressAsync(ct);
+            var matches = inProgress
+                .Where(d => string.Equals(d.Service, service, StringComparison.Ordinal))
+                .ToList();
+            if (matches.Count == 0)
+            {
+                return;
+            }
+
+            var identity = await _metadata.GetAsync(ct);
+            var detail = InstanceServicesJson.TrimError(error);
+
+            foreach (var deploy in matches)
+            {
+                await deployStore.UpsertInstanceStatusAsync(new DeployInstanceStatus
+                {
+                    DeployId = deploy.Id,
+                    InstanceId = identity.InstanceId,
+                    Status = DeployInstanceState.Failed,
+                    Detail = detail,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                }, ct);
+
+                // Mirror the convergence broadcast (tech-spec §4.5) so the dashboard can
+                // show this instance failing to roll out live. Best-effort: a publish
+                // failure must never affect the status row that already committed.
+                _publisher?.TryPublish(ManagementEndpoints.OpsDeploysChannel, "deployInstance", new
+                {
+                    deployId = deploy.Id,
+                    instanceId = identity.InstanceId,
+                    status = DeployInstanceState.Failed,
+                    error = detail,
+                });
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Failed to record deploy-instance failure for {Service}", service);
+        }
     }
 
     /// <summary>Snapshot the per-service error state for a heartbeat build (see <see cref="ReportOutcomeAsync"/>).</summary>
