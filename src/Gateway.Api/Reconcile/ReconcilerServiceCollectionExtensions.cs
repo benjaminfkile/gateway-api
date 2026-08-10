@@ -44,6 +44,15 @@ public static class ReconcilerServiceCollectionExtensions
             options.LogDriver.Driver = logDriver.Trim();
         }
 
+        // Deploy-staleness timeout escape hatch (tech-spec §4.5): GATEWAY_DEPLOY_TIMEOUT
+        // overrides the in-progress deploy timeout, in whole seconds, so an operator can
+        // tune how long the leader waits before failing a stuck rollout.
+        var deployTimeout = Environment.GetEnvironmentVariable(ReconcilerOptions.DeployTimeoutEnvVar);
+        if (int.TryParse(deployTimeout, out var deployTimeoutSeconds) && deployTimeoutSeconds > 0)
+        {
+            options.DeployTimeout = TimeSpan.FromSeconds(deployTimeoutSeconds);
+        }
+
         services.TryAddSingleton(options);
 
         // Container runtime: real Docker only where the socket exists. Pulls
