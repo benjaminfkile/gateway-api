@@ -74,9 +74,10 @@ public sealed class InternalPublishTests
             .WithUrl($"http://127.0.0.1:{gateway.PublicPort}/hub")
             .Build();
 
-        var received = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        connection.On<JsonElement>("orderPlaced", payload =>
-            received.TrySetResult(payload.GetProperty("id").GetString()!));
+        // Clients register ONE handler on the ChannelEvent method and route on the
+        // envelope's channel/event fields (§4.2 wire contract).
+        var received = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        connection.On<JsonElement>("ChannelEvent", envelope => received.TrySetResult(envelope));
 
         await connection.StartAsync();
         await connection.InvokeAsync("JoinChannel", "svc-a:orders");
@@ -90,7 +91,11 @@ public sealed class InternalPublishTests
 
         var completed = await Task.WhenAny(received.Task, Task.Delay(TimeSpan.FromSeconds(10)));
         Assert.True(completed == received.Task, "joined client did not receive the published message");
-        Assert.Equal("o-42", await received.Task);
+
+        var envelope = await received.Task;
+        Assert.Equal("svc-a:orders", envelope.GetProperty("channel").GetString());
+        Assert.Equal("orderPlaced", envelope.GetProperty("event").GetString());
+        Assert.Equal("o-42", envelope.GetProperty("data").GetProperty("id").GetString());
     }
 
     [Fact]

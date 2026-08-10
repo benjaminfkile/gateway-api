@@ -37,6 +37,11 @@ public static class RealtimeServiceCollectionExtensions
             });
         }
 
+        // The single envelope publisher every server-side broadcast goes through
+        // (§4.2 ChannelEvent wire contract). Singleton — it holds only the hub
+        // context and a logger, both singletons.
+        services.TryAddSingleton<IChannelEventPublisher, ChannelEventPublisher>();
+
         return services;
     }
 }

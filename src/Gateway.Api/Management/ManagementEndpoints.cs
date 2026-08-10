@@ -9,7 +9,6 @@ using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
-using Microsoft.AspNetCore.SignalR;
 
 namespace Gateway.Api.Management;
 
@@ -382,7 +381,7 @@ public static partial class ManagementEndpoints
         IManifestStore manifests,
         IDeployStore deploys,
         IImageRegistry registry,
-        IHubContext<GatewayHub> hub,
+        IChannelEventPublisher publisher,
         CancellationToken ct)
     {
         if (IsReserved(name, out var reserved))
@@ -423,7 +422,10 @@ public static partial class ManagementEndpoints
         var record = await AuditAsync(
             deploys, name, DeployAction.Deploy, user, fromDigest, digest, ct, DeployStatus.InProgress);
 
-        await BroadcastAsync(hub, record, ct);
+        // Best-effort broadcast AFTER the manifest mutation has committed. Fire-and-
+        // forget so a Redis blip can never turn an already-committed deploy into a 500;
+        // the 202 below does not depend on the publish (tech-spec §4.5).
+        BroadcastDeploy(publisher, record);
 
         return Results.Json(
             new { deployId = record.Id, service = name, tag = request.Tag, digest, status = record.Status },
@@ -435,7 +437,7 @@ public static partial class ManagementEndpoints
         ClaimsPrincipal user,
         IManifestStore manifests,
         IDeployStore deploys,
-        IHubContext<GatewayHub> hub,
+        IChannelEventPublisher publisher,
         CancellationToken ct)
     {
         if (IsReserved(name, out var reserved))
@@ -469,7 +471,8 @@ public static partial class ManagementEndpoints
         var record = await AuditAsync(
             deploys, name, DeployAction.Rollback, user, fromDigest, toDigest, ct, DeployStatus.InProgress);
 
-        await BroadcastAsync(hub, record, ct);
+        // Best-effort broadcast (see DeployAsync): the 202 must not depend on the publish.
+        BroadcastDeploy(publisher, record);
 
         return Results.Json(
             new { deployId = record.Id, service = name, digest = toDigest, status = record.Status },
@@ -535,8 +538,14 @@ public static partial class ManagementEndpoints
         }, ct);
     }
 
-    private static Task BroadcastAsync(IHubContext<GatewayHub> hub, DeployHistory record, CancellationToken ct) =>
-        hub.Clients.Group(OpsDeploysChannel).SendAsync("deploy", new
+    /// <summary>
+    /// Fire-and-forget the initiation <c>deploy</c> event on <c>ops:deploys</c> using
+    /// the ChannelEvent envelope (tech-spec §4.2). At initiation the deploy is
+    /// <c>in_progress</c>, so <c>finishedAt</c> and <c>error</c> are null; the
+    /// reconciler publishes the terminal update once the fleet converges.
+    /// </summary>
+    private static void BroadcastDeploy(IChannelEventPublisher publisher, DeployHistory record) =>
+        publisher.TryPublish(OpsDeploysChannel, "deploy", new
         {
             deployId = record.Id,
             service = record.Service,
@@ -544,7 +553,9 @@ public static partial class ManagementEndpoints
             fromDigest = record.FromDigest,
             toDigest = record.ToDigest,
             status = record.Status,
-        }, ct);
+            finishedAt = (string?)null,
+            error = (string?)null,
+        });
 
     private static object ServiceView(ServiceManifest m, FleetRollup rollup)
     {
