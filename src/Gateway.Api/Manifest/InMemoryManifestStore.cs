@@ -94,6 +94,7 @@ public sealed class InMemoryManifestStore : IManifestStore
         EnvSecretRef = m.EnvSecretRef,
         RealtimePublishToken = m.RealtimePublishToken,
         RealtimeAuthPath = m.RealtimeAuthPath,
+        RealtimeAllowedOrigins = m.RealtimeAllowedOrigins,
         IncludeInHealth = m.IncludeInHealth,
         UpdatedBy = m.UpdatedBy,
         UpdatedAt = m.UpdatedAt,

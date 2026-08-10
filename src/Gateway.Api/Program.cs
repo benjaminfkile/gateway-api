@@ -9,6 +9,7 @@ using Gateway.Api.Proxy;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
 using Gateway.Api.Systemd;
+using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -114,14 +115,27 @@ var corsOrigins = (Environment.GetEnvironmentVariable("GATEWAY_CORS_ORIGINS")
         ?? builder.Configuration["GATEWAY_CORS_ORIGINS"])
     ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     ?? Array.Empty<string>();
-if (corsOrigins.Length > 0)
+// The static "ops" policy (dashboard origins) is registered only when configured and
+// stays exactly as before — it is what /mgmt uses. CORS services are always added,
+// though, because /hub now carries a second, dynamic policy (task #595): the manifest-
+// driven "hub" policy resolved by HubCorsPolicyProvider from HubCorsOriginCache. That
+// policy's origin set is the static ops origins ∪ every service's realtime_allowed_
+// origins, refreshed on a short TTL so a manifest CORS change needs no gateway restart
+// and never runs a DB query per preflight.
+builder.Services.AddCors(options =>
 {
-    builder.Services.AddCors(options => options.AddPolicy("ops", policy => policy
-        .WithOrigins(corsOrigins)
-        .AllowAnyHeader()
-        .AllowAnyMethod()
-        .AllowCredentials()));
-}
+    if (corsOrigins.Length > 0)
+    {
+        options.AddPolicy("ops", policy => policy
+            .WithOrigins(corsOrigins)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+    }
+});
+builder.Services.AddSingleton(sp => new HubCorsOriginCache(
+    sp.GetRequiredService<IServiceScopeFactory>(), corsOrigins));
+builder.Services.AddSingleton<ICorsPolicyProvider, HubCorsPolicyProvider>();
 
 // Node bootstrap (tech-spec §4.3, §2): the idempotent pipeline that provisions the
 // box (Docker daemon log rotation, internal network, registry login refreshed on a
@@ -145,15 +159,21 @@ app.UseInternalListenerIsolation();
 // SignalR hub's WebSocket transport rides the same middleware.
 app.UseWebSockets();
 
-// Ops CORS runs only on the management/hub surface and only when configured,
-// ahead of the plane guard so preflights succeed without a token.
+// CORS runs on the management/hub surface only, ahead of the plane guard so preflights
+// succeed without a token. /mgmt keeps the strict static "ops" dashboard policy exactly
+// as before (only when configured). /hub carries the dynamic, manifest-driven "hub"
+// policy (task #595) — always active, since its allowed set includes consumer origins
+// that exist independently of GATEWAY_CORS_ORIGINS; when nothing (static or manifest)
+// is allowed it simply emits no CORS headers, matching the prior behaviour.
 if (corsOrigins.Length > 0)
 {
     app.UseWhen(
-        ctx => ctx.Request.Path.StartsWithSegments("/mgmt")
-            || ctx.Request.Path.StartsWithSegments("/hub"),
+        ctx => ctx.Request.Path.StartsWithSegments("/mgmt"),
         branch => branch.UseCors("ops"));
 }
+app.UseWhen(
+    ctx => ctx.Request.Path.StartsWithSegments("/hub"),
+    branch => branch.UseCors(HubCorsPolicyProvider.PolicyName));
 
 // Legacy-parity CORS for application traffic: the old gateway ran `cors()` —
 // any origin, no credentials — in front of every proxied route, and the
