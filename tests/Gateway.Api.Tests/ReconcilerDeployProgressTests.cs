@@ -4,6 +4,7 @@ using Gateway.Api.Instances;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
+using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -37,16 +38,37 @@ public class ReconcilerDeployProgressTests
         public Task ReportAsync(ReconcileOutcome outcome, CancellationToken ct = default) => Task.CompletedTask;
     }
 
+    /// <summary>A published envelope: the channel, event name, and its anonymous data object.</summary>
+    private sealed record Published(string Channel, string Event, object Data)
+    {
+        /// <summary>Read a property off the anonymous <c>data</c> object by name.</summary>
+        public object? Get(string name) => Data.GetType().GetProperty(name)?.GetValue(Data);
+    }
+
+    /// <summary>Records every <c>TryPublish</c> so a test can assert the envelope shape.</summary>
+    private sealed class RecordingPublisher : IChannelEventPublisher
+    {
+        public List<Published> Published { get; } = new();
+
+        public Task PublishAsync(string channel, string @event, object data, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public void TryPublish(string channel, string @event, object data) =>
+            Published.Add(new Published(channel, @event, data));
+    }
+
     private sealed class Harness
     {
         public InMemoryManifestStore Store { get; } = new();
         public FakeContainerRuntime Runtime { get; } = new();
         public FakeInstanceStatusStore StatusStore { get; } = new();
         public FakeDeployStore DeployStore { get; } = new();
+        public IChannelEventPublisher Publisher { get; }
         public ReconcilerService Service { get; }
 
-        public Harness(bool isLeader = true)
+        public Harness(bool isLeader = true, IChannelEventPublisher? publisher = null)
         {
+            Publisher = publisher ?? new RecordingPublisher();
             var options = new ReconcilerOptions
             {
                 Enabled = true,
@@ -82,7 +104,9 @@ public class ReconcilerDeployProgressTests
                 metadata,
                 new InMemoryLeaderElection(isLeader),
                 options,
-                NullLogger<ReconcilerService>.Instance);
+                NullLogger<ReconcilerService>.Instance,
+                migrationGate: null,
+                publisher: Publisher);
         }
     }
 
@@ -189,5 +213,98 @@ public class ReconcilerDeployProgressTests
         Assert.Empty(harness.DeployStore.InstanceStatuses);
         var deploy = Assert.Single(harness.DeployStore.History);
         Assert.Equal(DeployStatus.InProgress, deploy.Status);
+    }
+
+    [Fact]
+    public async Task MarkDeploy_PublishesTerminalDeployEnvelope_WhenFleetConverged()
+    {
+        var recorder = new RecordingPublisher();
+        var harness = new Harness(isLeader: true, publisher: recorder);
+        harness.Runtime.Seed(Running("svc-a", "sha256:v2"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", FromDigest = "sha256:v1", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow,
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Done, deploy.Status);
+
+        // The terminal "deploy" event carries the full contract shape with the terminal
+        // status, an ISO finishedAt, and a null error (the deploy did not fail).
+        var terminal = Assert.Single(
+            recorder.Published.Where(p => p.Event == "deploy"));
+        Assert.Equal(ManagementEndpoints.OpsDeploysChannel, terminal.Channel);
+        Assert.Equal(deploy.Id, terminal.Get("deployId"));
+        Assert.Equal("svc-a", terminal.Get("service"));
+        Assert.Equal(DeployAction.Deploy, terminal.Get("action"));
+        Assert.Equal("sha256:v1", terminal.Get("fromDigest"));
+        Assert.Equal("sha256:v2", terminal.Get("toDigest"));
+        Assert.Equal(DeployStatus.Done, terminal.Get("status"));
+        Assert.Null(terminal.Get("error"));
+        var finishedAt = Assert.IsType<string>(terminal.Get("finishedAt"));
+        Assert.Equal(deploy.FinishedAt!.Value, DateTimeOffset.Parse(finishedAt));
+    }
+
+    [Fact]
+    public async Task Convergence_PublishesDeployInstanceEnvelope()
+    {
+        // A straggler keeps the deploy in progress, so the only "deploy" here is none —
+        // this isolates the per-instance convergence broadcast.
+        var recorder = new RecordingPublisher();
+        var harness = new Harness(isLeader: true, publisher: recorder);
+        harness.Runtime.Seed(Running("svc-a", "sha256:v2"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        harness.StatusStore.Seed(ManagementTestData.Instance(
+            "i-2", heartbeatAt: DateTimeOffset.UtcNow, running: ("svc-a", "sha256:v1")));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow,
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        var instanceEvent = Assert.Single(
+            recorder.Published.Where(p => p.Event == "deployInstance"));
+        Assert.Equal(ManagementEndpoints.OpsDeploysChannel, instanceEvent.Channel);
+        Assert.Equal(deploy.Id, instanceEvent.Get("deployId"));
+        Assert.Equal("i-test", instanceEvent.Get("instanceId"));
+        Assert.Equal(DeployInstanceState.Converged, instanceEvent.Get("status"));
+        Assert.Null(instanceEvent.Get("error"));
+    }
+
+    [Fact]
+    public async Task ThrowingPublisher_DoesNotBreakDeployProgress()
+    {
+        // The REAL publisher over a hub that always throws — a backplane outage on the
+        // leader's reconcile path. TryPublish swallows it, so the reconcile is untouched.
+        var throwingPublisher = new ChannelEventPublisher(
+            new FakeGatewayHubContext { SendError = new InvalidOperationException("backplane down") },
+            NullLogger<ChannelEventPublisher>.Instance);
+        var harness = new Harness(isLeader: true, publisher: throwingPublisher);
+        harness.Runtime.Seed(Running("svc-a", "sha256:v2"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v2"));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow,
+        });
+
+        // A publisher that throws on every TryPublish must not disturb the reconcile:
+        // the convergence row is still written and the deploy is still marked done.
+        await harness.Service.RunOnceAsync();
+
+        var progress = Assert.Single(harness.DeployStore.InstanceStatuses);
+        Assert.Equal(DeployInstanceState.Converged, progress.Status);
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Done, deploy.Status);
     }
 }
