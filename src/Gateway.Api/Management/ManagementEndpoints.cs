@@ -47,6 +47,20 @@ public static partial class ManagementEndpoints
     /// <summary>The gateway is never a managed service; its name is reserved (tech-spec §4.5).</summary>
     public const string ReservedGatewayName = "gateway";
 
+    /// <summary>
+    /// Service names the manifest may never claim. Beyond the gateway itself,
+    /// <c>hub</c> and <c>internal</c> are reserved because a manifest service by
+    /// either name would generate a YARP route (<c>/hub/{**catch-all}</c>,
+    /// <c>/internal/{**catch-all}</c>) that shadows the SignalR hub endpoint and the
+    /// internal publish listener respectively.
+    /// </summary>
+    private static readonly string[] ReservedServiceNames =
+    {
+        ReservedGatewayName,
+        "hub",
+        "internal",
+    };
+
     [GeneratedRegex("^[a-z0-9-]+$")]
     private static partial Regex ServiceNameRegex();
 
@@ -491,13 +505,16 @@ public static partial class ManagementEndpoints
 
     private static bool IsReserved(string name, out IResult result)
     {
-        if (string.Equals(name, ReservedGatewayName, StringComparison.OrdinalIgnoreCase))
+        foreach (var reserved in ReservedServiceNames)
         {
-            result = Results.BadRequest(new
+            if (string.Equals(name, reserved, StringComparison.OrdinalIgnoreCase))
             {
-                error = "The gateway is not a managed service and cannot be controlled from the dashboard.",
-            });
-            return true;
+                result = Results.BadRequest(new
+                {
+                    error = $"'{reserved}' is a reserved name and cannot be used for a managed service.",
+                });
+                return true;
+            }
         }
 
         result = Results.Empty;

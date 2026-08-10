@@ -23,7 +23,21 @@ public static class RealtimeServiceCollectionExtensions
         // (GatewayHub.OpsChannelPolicy) is defined by AddManagementAuthentication
         // (§4.2, §5), so the hub gate shares the exact Cognito-group requirement the
         // /mgmt endpoints enforce.
-        var signalR = services.AddSignalR();
+        //
+        // Pin the real-time timeouts instead of riding SignalR's framework defaults
+        // — these values are part of the contract with the dashboard client, which
+        // matches its own ServerTimeout/KeepAlive to them:
+        //   KeepAliveInterval    15s — server→client ping cadence.
+        //   ClientTimeoutInterval 30s — drop a connection after 2 missed pings.
+        //   HandshakeTimeout      15s — cap the initial negotiate handshake.
+        // The ALB idle timeout (900s) far exceeds the 15s keepalive, so it is the
+        // app-layer ping — not the load balancer — that holds the WebSocket open.
+        var signalR = services.AddSignalR(options =>
+        {
+            options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+            options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
+            options.HandshakeTimeout = TimeSpan.FromSeconds(15);
+        });
 
         // Backplane only when GATEWAY_REDIS_ENDPOINT is set (§4.2). Otherwise the
         // hub runs single-node with no Redis dependency — correct for one

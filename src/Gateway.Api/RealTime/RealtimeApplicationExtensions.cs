@@ -75,7 +75,16 @@ public static class RealtimeApplicationExtensions
     /// <summary>Map the real-time hub at <c>/hub</c> (tech-spec §4.2).</summary>
     public static IEndpointRouteBuilder MapGatewayHub(this IEndpointRouteBuilder endpoints)
     {
-        endpoints.MapHub<GatewayHub>("/hub");
+        endpoints.MapHub<GatewayHub>("/hub", options =>
+        {
+            // ops:* channel auth runs only inside JoinChannel, so without this an
+            // expired-token connection that already joined ops:* would keep
+            // receiving privileged events until it happened to disconnect. Closing
+            // the connection at token expiry forces the dashboard to reconnect,
+            // which pulls a fresh Cognito token from its accessTokenFactory — a
+            // clean close is exactly the signal that refresh flow expects.
+            options.CloseOnAuthenticationExpiration = true;
+        });
         return endpoints;
     }
 
