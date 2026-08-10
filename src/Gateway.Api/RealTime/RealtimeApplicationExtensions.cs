@@ -1,7 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
-using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Gateway.Api.RealTime;
@@ -82,18 +81,19 @@ public static class RealtimeApplicationExtensions
 
     /// <summary>
     /// Map the internal publish endpoint (tech-spec §4.2). Broadcasts the request
-    /// payload to the channel's SignalR group as a message of type
-    /// <c>{event}</c> and returns <c>202 Accepted</c>. The isolation middleware
-    /// guarantees this is reachable only on the internal listener.
+    /// payload to the channel's SignalR group inside the ChannelEvent envelope
+    /// (method <c>ChannelEvent</c>, <c>{ channel, event, data }</c>) and returns
+    /// <c>202 Accepted</c>. The isolation middleware guarantees this is reachable
+    /// only on the internal listener.
     /// </summary>
     public static IEndpointRouteBuilder MapInternalPublish(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapPost("/internal/publish", async (
             InternalPublishRequest request,
-            IHubContext<GatewayHub> hub,
+            IChannelEventPublisher publisher,
             CancellationToken ct) =>
         {
-            await hub.Clients.Group(request.Channel).SendAsync(request.Event, request.Payload, ct);
+            await publisher.PublishAsync(request.Channel, request.Event, request.Payload, ct);
             return Results.Accepted();
         });
         return endpoints;
