@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 
 namespace Gateway.Api.RealTime;
 
@@ -29,11 +30,58 @@ public sealed class GatewayHub : Hub
     public const string OpsChannelPrefix = "ops:";
 
     private readonly IAuthorizationService _authorization;
+    private readonly ILogger<GatewayHub> _logger;
 
-    public GatewayHub(IAuthorizationService authorization)
+    public GatewayHub(IAuthorizationService authorization, ILogger<GatewayHub> logger)
     {
         _authorization = authorization;
+        _logger = logger;
     }
+
+    /// <summary>
+    /// Log every accepted connection with its id and authenticated user (or
+    /// <c>anonymous</c>) at Information — no metrics infra, just a trail for
+    /// correlating dashboard reconnects and the token-expiry closes.
+    /// </summary>
+    public override async Task OnConnectedAsync()
+    {
+        _logger.LogInformation(
+            "Hub connection {ConnectionId} established for {User}.",
+            Context.ConnectionId,
+            DescribeUser());
+        await base.OnConnectedAsync();
+    }
+
+    /// <summary>
+    /// Log every disconnect at Information, or at Warning with the exception when
+    /// the connection dropped abnormally (transport fault, token-expiry close).
+    /// </summary>
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        if (exception is null)
+        {
+            _logger.LogInformation(
+                "Hub connection {ConnectionId} for {User} disconnected.",
+                Context.ConnectionId,
+                DescribeUser());
+        }
+        else
+        {
+            _logger.LogWarning(
+                exception,
+                "Hub connection {ConnectionId} for {User} disconnected with an error.",
+                Context.ConnectionId,
+                DescribeUser());
+        }
+
+        await base.OnDisconnectedAsync(exception);
+    }
+
+    /// <summary>The connection's authenticated identity name, or <c>anonymous</c>.</summary>
+    private string DescribeUser() =>
+        Context.User?.Identity?.IsAuthenticated == true
+            ? Context.User.Identity!.Name ?? "authenticated"
+            : "anonymous";
 
     /// <summary>
     /// Subscribe the caller to a <c>{app}:{topic}</c> channel. Public for every

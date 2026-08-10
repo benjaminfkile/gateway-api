@@ -295,6 +295,28 @@ public class ManagementDeployTests
     }
 
     [Theory]
+    [InlineData("gateway")]   // the gateway is never a managed service
+    [InlineData("hub")]        // would shadow the SignalR /hub endpoint
+    [InlineData("internal")]   // would shadow the internal publish listener
+    public async Task Put_ReservedName_Returns400(string name)
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync($"/mgmt/services/{name}", new
+        {
+            image = "registry/x",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Contains("reserved", body.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(70000)]
     public async Task Put_InvalidPort_Returns400(int port)
