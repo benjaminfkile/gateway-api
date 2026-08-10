@@ -23,7 +23,8 @@ public sealed record UpsertServiceRequest(
     string? DesiredStatus,
     string? EnvSecretRef,
     bool IncludeInHealth,
-    string? RealtimeAuthPath = null);
+    string? RealtimeAuthPath = null,
+    string? RealtimeAllowedOrigins = null);
 
 /// <summary>
 /// The fleet-aware Management API (tech-spec §4.5). Every endpoint reads/writes the
@@ -324,6 +325,19 @@ public static partial class ManagementEndpoints
             return Results.BadRequest(new { error = "realtimeAuthPath must be a rooted path beginning with '/'." });
         }
 
+        // realtime_allowed_origins (task #595) is the comma-separated set of exact
+        // browser origins whose frontends may negotiate /hub for this service. Validate
+        // and canonicalize here so the dynamic hub CORS policy only ever stores absolute
+        // http(s) origins with no path/wildcard (a wildcard would break the credentialed
+        // exact-match the policy relies on).
+        if (!RealtimeAllowedOrigins.TryNormalize(request.RealtimeAllowedOrigins, out var allowedOrigins, out var badOrigin))
+        {
+            return Results.BadRequest(new
+            {
+                error = $"realtimeAllowedOrigins entry '{badOrigin}' must be an absolute http(s) origin (scheme://host[:port]) with no path or wildcard.",
+            });
+        }
+
         var existing = await manifests.GetAsync(name, ct);
         // A pinned digest is only valid for the exact image:tag it was resolved from.
         // If the edit changes the image or tag, the old digest is stale — clear it so
@@ -347,6 +361,7 @@ public static partial class ManagementEndpoints
             DesiredStatus = string.IsNullOrWhiteSpace(request.DesiredStatus) ? "running" : request.DesiredStatus,
             EnvSecretRef = request.EnvSecretRef,
             RealtimeAuthPath = authPath,
+            RealtimeAllowedOrigins = allowedOrigins,
             IncludeInHealth = request.IncludeInHealth,
             UpdatedBy = ManagementAuth.ResolveUsername(user),
             UpdatedAt = DateTimeOffset.UtcNow,
@@ -629,6 +644,9 @@ public static partial class ManagementEndpoints
             // Non-secret (unlike the publish token): null = public channels, non-null =
             // every JoinChannel for this service triggers its auth callback (task #594).
             realtimeAuthPath = m.RealtimeAuthPath,
+            // Non-secret consumer-origin allowlist for /hub CORS (task #595); null when
+            // the service contributes no origins.
+            realtimeAllowedOrigins = m.RealtimeAllowedOrigins,
             includeInHealth = m.IncludeInHealth,
             updatedBy = m.UpdatedBy,
             updatedAt = m.UpdatedAt,

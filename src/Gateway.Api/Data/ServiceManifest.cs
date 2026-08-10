@@ -59,6 +59,20 @@ public class ServiceManifest
     /// </summary>
     public string? RealtimeAuthPath { get; set; }
 
+    /// <summary>
+    /// Optional comma-separated list of exact browser origins (e.g.
+    /// <c>https://chat.example.com,https://app.example.com</c>) that this service's
+    /// frontend negotiates its SignalR connection from (tech-spec §4.2, task #595).
+    /// Null/empty means the service contributes no origins. Each entry is an absolute
+    /// <c>http</c>/<c>https</c> origin with no path, query, fragment, or wildcard —
+    /// validated at upsert and rejected otherwise. The gateway folds the union of every
+    /// service's origins (plus the static <c>GATEWAY_CORS_ORIGINS</c> ops-dashboard
+    /// origins) into the dynamic CORS policy on <c>/hub</c> only — never <c>/mgmt</c> —
+    /// so a consumer app's browser can pass the <c>/hub/negotiate</c> preflight. Not a
+    /// secret: returned by <c>GET /mgmt/services</c> and settable via upsert.
+    /// </summary>
+    public string? RealtimeAllowedOrigins { get; set; }
+
     /// <summary>Whether this service participates in the aggregated health check.</summary>
     public bool IncludeInHealth { get; set; }
 

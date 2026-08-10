@@ -369,6 +369,86 @@ public class ManagementDeployTests
     }
 
     [Fact]
+    public async Task Put_SetsRealtimeAllowedOrigins_NormalizesPersistsAndReturned()
+    {
+        // task #595: realtime_allowed_origins is settable on upsert and, like the auth
+        // path, returned by GET /mgmt/services (not a secret). Entries are canonicalized
+        // to their exact origin form so the dynamic /hub CORS policy can exact-match them.
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            // Trailing slash + default port are stripped on normalization.
+            realtimeAllowedOrigins = "https://chat.example.com/, https://app.example.com:443",
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(
+            "https://chat.example.com,https://app.example.com",
+            created.GetProperty("realtimeAllowedOrigins").GetString());
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Equal("https://chat.example.com,https://app.example.com", m.RealtimeAllowedOrigins);
+        });
+
+        var list = await client.GetFromJsonAsync<JsonElement>("/mgmt/services");
+        var svc = list.EnumerateArray().Single(s => s.GetProperty("name").GetString() == "svc-new");
+        Assert.Equal(
+            "https://chat.example.com,https://app.example.com",
+            svc.GetProperty("realtimeAllowedOrigins").GetString());
+    }
+
+    [Fact]
+    public async Task Put_NoRealtimeAllowedOrigins_DefaultsNull()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(JsonValueKind.Null, created.GetProperty("realtimeAllowedOrigins").ValueKind);
+    }
+
+    [Theory]
+    [InlineData("https://chat.example.com/path")]
+    [InlineData("https://*.example.com")]
+    [InlineData("ftp://chat.example.com")]
+    [InlineData("chat.example.com")]
+    [InlineData("https://chat.example.com,not-a-url")]
+    public async Task Put_MalformedRealtimeAllowedOrigins_Returns400(string origins)
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            realtimeAllowedOrigins = origins,
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task Put_ChangedTag_ClearsDigest_AndAudits()
     {
         await using var factory = new ManagementApiFactory();
