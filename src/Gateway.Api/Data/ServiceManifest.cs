@@ -44,6 +44,21 @@ public class ServiceManifest
     /// </summary>
     public string? RealtimePublishToken { get; set; }
 
+    /// <summary>
+    /// Optional path on the service that delegates real-time channel authorization to
+    /// the service itself (tech-spec §4.2, task #594 — the Pusher/Ably auth-delegation
+    /// pattern). Null means this service's channels are <b>public</b>: any
+    /// <c>JoinChannel</c> for a <c>{Name}:{topic}</c> channel is allowed as today.
+    /// Non-null means every join triggers an auth callback — the gateway POSTs
+    /// <c>{ channel, credential, connectionId }</c> to this path on the service
+    /// (resolved through the same host-loopback + learned-host-port mechanism the
+    /// health prober uses) and only a <c>200 { allow: true }</c> admits the join. The
+    /// gateway never parses the credential; it is an opaque string the service alone
+    /// understands. Unlike the publish token this is not a secret, so it is returned by
+    /// <c>GET /mgmt/services</c> and settable via the upsert endpoint.
+    /// </summary>
+    public string? RealtimeAuthPath { get; set; }
+
     /// <summary>Whether this service participates in the aggregated health check.</summary>
     public bool IncludeInHealth { get; set; }
 

@@ -22,7 +22,8 @@ public sealed record UpsertServiceRequest(
     int Port,
     string? DesiredStatus,
     string? EnvSecretRef,
-    bool IncludeInHealth);
+    bool IncludeInHealth,
+    string? RealtimeAuthPath = null);
 
 /// <summary>
 /// The fleet-aware Management API (tech-spec §4.5). Every endpoint reads/writes the
@@ -314,6 +315,15 @@ public static partial class ManagementEndpoints
             return Results.BadRequest(new { error = "port must be in the range 1..65535." });
         }
 
+        // realtime_auth_path (task #594) is a path on the service, appended to the
+        // gateway-resolved base address for the auth callback. Reject anything that is
+        // not a rooted path so it can never smuggle an absolute URL into the callback.
+        var authPath = string.IsNullOrWhiteSpace(request.RealtimeAuthPath) ? null : request.RealtimeAuthPath.Trim();
+        if (authPath is not null && !authPath.StartsWith('/'))
+        {
+            return Results.BadRequest(new { error = "realtimeAuthPath must be a rooted path beginning with '/'." });
+        }
+
         var existing = await manifests.GetAsync(name, ct);
         // A pinned digest is only valid for the exact image:tag it was resolved from.
         // If the edit changes the image or tag, the old digest is stale — clear it so
@@ -336,6 +346,7 @@ public static partial class ManagementEndpoints
             Port = request.Port,
             DesiredStatus = string.IsNullOrWhiteSpace(request.DesiredStatus) ? "running" : request.DesiredStatus,
             EnvSecretRef = request.EnvSecretRef,
+            RealtimeAuthPath = authPath,
             IncludeInHealth = request.IncludeInHealth,
             UpdatedBy = ManagementAuth.ResolveUsername(user),
             UpdatedAt = DateTimeOffset.UtcNow,
@@ -615,6 +626,9 @@ public static partial class ManagementEndpoints
             hostPort = rollup.HostPort,
             desiredStatus = m.DesiredStatus,
             envSecretRef = m.EnvSecretRef,
+            // Non-secret (unlike the publish token): null = public channels, non-null =
+            // every JoinChannel for this service triggers its auth callback (task #594).
+            realtimeAuthPath = m.RealtimeAuthPath,
             includeInHealth = m.IncludeInHealth,
             updatedBy = m.UpdatedBy,
             updatedAt = m.UpdatedAt,

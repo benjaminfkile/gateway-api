@@ -30,7 +30,14 @@ public sealed class DownstreamTestServer : IAsyncDisposable
     /// <summary>The dynamically-assigned localhost port the server is listening on.</summary>
     public int Port { get; }
 
-    public static async Task<DownstreamTestServer> StartAsync()
+    /// <param name="preHandler">
+    /// Optional request hook run before the default echo/WebSocket behavior. Returning
+    /// <c>true</c> means the hook fully handled the request (it wrote the response), so
+    /// nothing else runs. Used by task #594's delegated-channel-auth tests to stand in
+    /// for a service's <c>realtime_auth_path</c> callback — reading the posted
+    /// <c>{ channel, credential, connectionId }</c> and replying <c>{ allow, identity }</c>.
+    /// </param>
+    public static async Task<DownstreamTestServer> StartAsync(Func<HttpContext, Task<bool>>? preHandler = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -41,6 +48,11 @@ public sealed class DownstreamTestServer : IAsyncDisposable
 
         app.Map("/{**catch-all}", async (HttpContext ctx) =>
         {
+            if (preHandler is not null && await preHandler(ctx))
+            {
+                return;
+            }
+
             if (ctx.WebSockets.IsWebSocketRequest)
             {
                 using var socket = await ctx.WebSockets.AcceptWebSocketAsync();

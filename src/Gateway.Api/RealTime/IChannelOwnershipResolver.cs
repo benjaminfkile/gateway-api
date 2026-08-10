@@ -18,7 +18,10 @@ public interface IChannelOwnershipResolver
 }
 
 /// <summary>
-/// The owner of a channel prefix: the service <paramref name="Service"/> and its
-/// current publish token (null on a pre-migration row that has no token yet).
+/// The owner of a channel prefix: the service <paramref name="Service"/>, its current
+/// publish token (null on a pre-migration row that has no token yet), the optional
+/// delegated-auth path (task #594 — null means the service's channels are public), and
+/// the manifest (container-internal) port used as the address-resolution fallback when
+/// no host port has been learned yet.
 /// </summary>
-public sealed record ChannelOwner(string Service, string? PublishToken);
+public sealed record ChannelOwner(string Service, string? PublishToken, string? AuthPath, int Port);

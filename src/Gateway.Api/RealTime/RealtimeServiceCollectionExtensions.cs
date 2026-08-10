@@ -1,3 +1,4 @@
+using Gateway.Api.Proxy;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -63,6 +64,28 @@ public static class RealtimeServiceCollectionExtensions
         // store, reached through a scope factory like the reconciler.
         services.TryAddSingleton<IChannelOwnershipResolver>(sp =>
             new ManifestChannelOwnershipResolver(sp.GetRequiredService<IServiceScopeFactory>()));
+
+        // Delegated channel auth (task #594): a private channel's join is authorized by
+        // the owning service's own callback, not the gateway. A dedicated HttpClient
+        // bounded at 2s (also enforced per-callback in HttpChannelAuthClient) reaches the
+        // service the same way the health prober does; the decision cache (singleton so
+        // it outlives a per-invocation hub) remembers allows for the connection lifetime
+        // and denies briefly. TryAdd so a test can substitute a fake auth client first.
+        //
+        // The auth client reaches services through the same address resolution the health
+        // prober and proxy use; TryAdd its two collaborators here so the realtime layer is
+        // self-contained (a realtime-only host that never calls AddManifestProxy — the
+        // internal-publish tests — still resolves the hub). AddManifestProxy TryAdds the
+        // same defaults, so whichever runs first wins and there is no double registration.
+        services.TryAddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+        services.TryAddSingleton<ServiceHostPortMap>();
+
+        services.AddHttpClient(HttpChannelAuthClient.HttpClientName, client =>
+        {
+            client.Timeout = HttpChannelAuthClient.CallbackTimeout;
+        });
+        services.TryAddSingleton<IChannelAuthClient, HttpChannelAuthClient>();
+        services.TryAddSingleton<ChannelAuthDecisionCache>();
 
         return services;
     }

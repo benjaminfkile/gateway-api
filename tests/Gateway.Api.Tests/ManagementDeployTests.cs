@@ -293,6 +293,82 @@ public class ManagementDeployTests
     }
 
     [Fact]
+    public async Task Put_SetsRealtimeAuthPath_PersistsAndReturned()
+    {
+        // task #594: realtime_auth_path is a first-class manifest field — settable on
+        // upsert and, unlike the publish token, returned by GET /mgmt/services (it is
+        // not a secret; null = public channels, non-null = delegated auth).
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            realtimeAuthPath = "/realtime/auth",
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("/realtime/auth", created.GetProperty("realtimeAuthPath").GetString());
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Equal("/realtime/auth", m.RealtimeAuthPath);
+        });
+
+        var list = await client.GetFromJsonAsync<JsonElement>("/mgmt/services");
+        var svc = list.EnumerateArray().Single(s => s.GetProperty("name").GetString() == "svc-new");
+        Assert.Equal("/realtime/auth", svc.GetProperty("realtimeAuthPath").GetString());
+    }
+
+    [Fact]
+    public async Task Put_NoRealtimeAuthPath_DefaultsNull_PublicChannels()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(JsonValueKind.Null, created.GetProperty("realtimeAuthPath").ValueKind);
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Null(m.RealtimeAuthPath);
+        });
+    }
+
+    [Fact]
+    public async Task Put_RealtimeAuthPath_NotRooted_Returns400()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            realtimeAuthPath = "https://evil.example/auth",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task Put_ChangedTag_ClearsDigest_AndAudits()
     {
         await using var factory = new ManagementApiFactory();

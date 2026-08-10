@@ -29,17 +29,29 @@ public sealed class GatewayHub : Hub
     /// <summary>Prefix marking the authenticated dashboard channels.</summary>
     public const string OpsChannelPrefix = "ops:";
 
+    /// <summary>
+    /// The single message a delegated-auth denial reports. Deliberately generic: it
+    /// leaks neither whether the channel exists nor why the join was refused (task #594).
+    /// </summary>
+    public const string AuthDeniedMessage = "Not authorized to join this channel.";
+
     private readonly IAuthorizationService _authorization;
     private readonly IChannelOwnershipResolver _ownership;
+    private readonly IChannelAuthClient _authClient;
+    private readonly ChannelAuthDecisionCache _decisions;
     private readonly ILogger<GatewayHub> _logger;
 
     public GatewayHub(
         IAuthorizationService authorization,
         IChannelOwnershipResolver ownership,
+        IChannelAuthClient authClient,
+        ChannelAuthDecisionCache decisions,
         ILogger<GatewayHub> logger)
     {
         _authorization = authorization;
         _ownership = ownership;
+        _authClient = authClient;
+        _decisions = decisions;
         _logger = logger;
     }
 
@@ -79,6 +91,10 @@ public sealed class GatewayHub : Hub
                 DescribeUser());
         }
 
+        // Drop every delegated-auth decision cached for this connection (task #594): a
+        // reconnect gets a fresh connection id and must re-authorize from scratch.
+        _decisions.Drop(Context.ConnectionId);
+
         await base.OnDisconnectedAsync(exception);
     }
 
@@ -93,13 +109,45 @@ public sealed class GatewayHub : Hub
     /// either <c>ops</c> (gateway-owned, gated by the <see cref="OpsChannelPolicy"/>)
     /// or the name of an existing manifest service (task #593) — a channel whose
     /// prefix owns to no service is an anonymous free-for-all no longer, and the join
-    /// is rejected. Throws <see cref="HubException"/> on an invalid channel name, an
-    /// unauthorized <c>ops:*</c> join, or an unowned prefix.
+    /// is rejected.
+    /// <para>
+    /// This one-argument form carries no credential, so a join to a <b>private</b>
+    /// channel (one whose owning service set <c>realtime_auth_path</c>, task #594) runs
+    /// the delegated-auth callback with a null credential — join
+    /// <see cref="JoinPrivateChannel"/> instead to present one. Public and <c>ops:*</c>
+    /// channels are unaffected. Kept exactly one-argument so the dashboard's existing
+    /// <c>JoinChannel(channel)</c> calls keep binding.
+    /// </para>
+    /// Throws <see cref="HubException"/> on an invalid channel name, an unauthorized
+    /// <c>ops:*</c> join, an unowned prefix, or a denied delegated-auth callback.
     /// </summary>
-    public async Task JoinChannel(string channel)
+    public Task JoinChannel(string channel) => JoinChannelAsync(channel, credential: null);
+
+    /// <summary>
+    /// Subscribe the caller to a private <c>{service}:{topic}</c> channel, presenting
+    /// the service's own opaque <paramref name="credential"/> (task #594 — the
+    /// Pusher/Ably auth-delegation pattern). The gateway never parses the credential; it
+    /// forwards it verbatim on the auth callback to the owning service's
+    /// <c>realtime_auth_path</c>, and admits the join only if that callback allows it.
+    /// <para>
+    /// This is the delegated-auth companion to <see cref="JoinChannel"/>. It is a
+    /// separate hub method rather than an optional second parameter on
+    /// <c>JoinChannel</c> because SignalR binds hub methods by exact argument count — it
+    /// supports neither optional/variadic parameters nor same-name overloads — so a
+    /// single method could not bind both the legacy one-argument call and a credentialed
+    /// two-argument call. Both methods share one authorization/caching core; passing a
+    /// null credential here is identical to calling <c>JoinChannel(channel)</c>.
+    /// </para>
+    /// Throws <see cref="HubException"/> under the same conditions as
+    /// <see cref="JoinChannel"/>, including a denied auth callback.
+    /// </summary>
+    public Task JoinPrivateChannel(string channel, string? credential) =>
+        JoinChannelAsync(channel, credential);
+
+    private async Task JoinChannelAsync(string channel, string? credential)
     {
         ValidateChannel(channel);
-        await AuthorizeChannelAsync(channel);
+        await AuthorizeChannelAsync(channel, credential);
         await Groups.AddToGroupAsync(Context.ConnectionId, channel);
     }
 
@@ -114,7 +162,7 @@ public sealed class GatewayHub : Hub
     public static bool IsOpsChannel(string channel) =>
         channel.StartsWith(OpsChannelPrefix, StringComparison.Ordinal);
 
-    private async Task AuthorizeChannelAsync(string channel)
+    private async Task AuthorizeChannelAsync(string channel, string? credential)
     {
         if (IsOpsChannel(channel))
         {
@@ -139,6 +187,47 @@ public sealed class GatewayHub : Hub
             throw new HubException(
                 $"Channel '{channel}' has no owning service; '{prefix}' is not a known service.");
         }
+
+        // No auth path → the service's channels are public: join freely (as before #594).
+        if (string.IsNullOrEmpty(owner.AuthPath))
+        {
+            return;
+        }
+
+        await AuthorizeDelegatedAsync(owner, channel, credential);
+    }
+
+    /// <summary>
+    /// Delegated (private-channel) authorization (task #594): honour a decision already
+    /// cached for this connection, else ask the owning service's auth callback and cache
+    /// the result — an allow for the connection's lifetime, a deny only briefly. A deny
+    /// (whether cached or fresh) throws a generic <see cref="HubException"/> that leaks
+    /// nothing about why.
+    /// </summary>
+    private async Task AuthorizeDelegatedAsync(ChannelOwner owner, string channel, string? credential)
+    {
+        var connectionId = Context.ConnectionId;
+
+        if (_decisions.TryGet(connectionId, channel) is { } cached)
+        {
+            if (cached.Allowed)
+            {
+                return;
+            }
+
+            throw new HubException(AuthDeniedMessage);
+        }
+
+        var decision = await _authClient.AuthorizeAsync(owner, channel, credential, connectionId, Context.ConnectionAborted);
+        if (decision.Allowed)
+        {
+            // The identity (may be null) rides with the cached allow for phase 3 to use.
+            _decisions.StoreAllow(connectionId, channel, decision.Identity);
+            return;
+        }
+
+        _decisions.StoreDeny(connectionId, channel);
+        throw new HubException(AuthDeniedMessage);
     }
 
     /// <summary>The channel's owner prefix — everything before the first <c>:</c>.</summary>
