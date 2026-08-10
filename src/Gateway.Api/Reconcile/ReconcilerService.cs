@@ -61,6 +61,18 @@ public sealed class ReconcilerService : BackgroundService
     // so a subsequent successful resolution clears it. Guarded by the _serviceErrors lock.
     private readonly HashSet<string> _envErrored = new(StringComparer.Ordinal);
 
+    // Fleet-event state, touched only from the single reconcile loop (no lock needed).
+    // Was this instance the leader on the previous loop, so a "leaderChange" fires only
+    // on the transition into leadership (task #588). Starts false: a fresh process that
+    // wins the election on its first loop announces itself.
+    private bool _wasLeader;
+
+    // Live instance ids this leader saw on its previous loop, so an "instances" event
+    // reports only newly-joined ids (task #588). Null until the first leader observation,
+    // which seeds silently so acquiring leadership does not report the whole fleet as
+    // joined. Only read/written on the leader path of the single reconcile loop.
+    private HashSet<string>? _knownInstanceIds;
+
     public ReconcilerService(
         IContainerRuntime runtime,
         ProxyStateService proxyState,
@@ -257,20 +269,96 @@ public sealed class ReconcilerService : BackgroundService
 
             if (isLeader)
             {
-                var cutoff = DateTimeOffset.UtcNow - _options.InstanceStaleThreshold;
-                var pruned = await store.DeleteStaleAsync(cutoff, ct);
-                if (pruned > 0)
-                {
-                    _logger.LogInformation(
-                        "Leader pruned {Count} stale instance_status row(s) older than {Threshold}.",
-                        pruned, _options.InstanceStaleThreshold);
-                }
+                await PublishFleetEventsAsync(store, identity.InstanceId, ct);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // A heartbeat failure must not crash the loop; the next tick retries.
             _logger.LogError(ex, "Failed to publish instance_status heartbeat");
+        }
+        finally
+        {
+            // Remember this loop's leadership so the next loop can detect the flip into
+            // leadership (task #588). Kept outside the try so a heartbeat error mid-loop
+            // does not wedge the leaderChange edge detection.
+            _wasLeader = isLeader;
+        }
+    }
+
+    /// <summary>
+    /// Broadcast the leader-only fleet events on <c>ops:fleet</c> (tech-spec §4.3, §4.4;
+    /// task #588): prune stale <c>instance_status</c> rows, then publish a per-cycle
+    /// <c>heartbeat</c> liveness signal, a <c>leaderChange</c> on the transition into
+    /// leadership, and an <c>instances</c> event whenever rows were pruned or new
+    /// instances appeared. Only the leader publishes so a fleet of N emits each event
+    /// once; the Redis backplane fans them out to every connected client. Every send is
+    /// <see cref="IChannelEventPublisher.TryPublish"/> so a backplane blip can never
+    /// disturb the prune that already committed.
+    /// </summary>
+    private async Task PublishFleetEventsAsync(IInstanceStatusStore store, string leaderInstanceId, CancellationToken ct)
+    {
+        var becameLeader = !_wasLeader;
+
+        // Snapshot the fleet before pruning: DeleteStaleAsync returns only a count, so we
+        // derive the exact pruned ids (and the surviving live set) from this read. Our own
+        // row was just upserted with heartbeat=now, so it is always in the live set.
+        var rows = await store.GetAllAsync(ct);
+        var cutoff = DateTimeOffset.UtcNow - _options.InstanceStaleThreshold;
+        var prunedIds = rows.Where(r => r.HeartbeatAt < cutoff).Select(r => r.InstanceId).ToList();
+
+        var pruned = await store.DeleteStaleAsync(cutoff, ct);
+        if (pruned > 0)
+        {
+            _logger.LogInformation(
+                "Leader pruned {Count} stale instance_status row(s) older than {Threshold}.",
+                pruned, _options.InstanceStaleThreshold);
+        }
+
+        var liveIds = rows
+            .Where(r => r.HeartbeatAt >= cutoff)
+            .Select(r => r.InstanceId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        // Newly-joined relative to what this leader last saw. On the first leader
+        // observation (null) seed silently so acquiring leadership does not announce the
+        // whole fleet as joined.
+        var joinedIds = _knownInstanceIds is null
+            ? new List<string>()
+            : liveIds.Where(id => !_knownInstanceIds.Contains(id)).ToList();
+        _knownInstanceIds = liveIds;
+
+        if (_publisher is null)
+        {
+            return;
+        }
+
+        // leaderChange first: announce that THIS instance is now the leader.
+        if (becameLeader)
+        {
+            _publisher.TryPublish(ManagementEndpoints.OpsFleetChannel, "leaderChange", new
+            {
+                instanceId = leaderInstanceId,
+            });
+        }
+
+        // The end-to-end liveness heartbeat (NOT a transport keepalive): proves the
+        // hub + backplane + group delivery path works. Emitted every reconcile cycle.
+        _publisher.TryPublish(ManagementEndpoints.OpsFleetChannel, "heartbeat", new
+        {
+            ts = DateTimeOffset.UtcNow.ToString("O"),
+            leaderInstanceId,
+            instanceCount = liveIds.Count,
+        });
+
+        // Membership churn: omit entirely when nothing joined and nothing was pruned.
+        if (joinedIds.Count > 0 || prunedIds.Count > 0)
+        {
+            _publisher.TryPublish(ManagementEndpoints.OpsFleetChannel, "instances", new
+            {
+                joined = joinedIds,
+                pruned = prunedIds,
+            });
         }
     }
 
@@ -465,8 +553,13 @@ public sealed class ReconcilerService : BackgroundService
                 continue;
             }
 
-            // Env resolved: drop any prior env-resolution error for this service.
-            ClearEnvErrorIfPresent(m.Name);
+            // Env resolved: drop any prior env-resolution error for this service and, on a
+            // real clear transition, broadcast the cleared serviceError (task #588). This
+            // path removes the error outside ReportOutcomeAsync, so it publishes here.
+            if (ClearEnvErrorIfPresent(m.Name))
+            {
+                await PublishServiceErrorAsync(m.Name, null, ct);
+            }
 
             desired.Add(new DesiredService(
                 Name: m.Name,
@@ -502,16 +595,56 @@ public sealed class ReconcilerService : BackgroundService
             service, ReconcileActionKind.None, ReconcileOutcomeStatus.Failed, detail), ct);
     }
 
-    /// <summary>Clear a service's recorded env-resolution error once its env resolves again.</summary>
-    private void ClearEnvErrorIfPresent(string service)
+    /// <summary>
+    /// Clear a service's recorded env-resolution error once its env resolves again.
+    /// Returns true when an error was actually cleared (a transition worth broadcasting).
+    /// </summary>
+    private bool ClearEnvErrorIfPresent(string service)
     {
         lock (_serviceErrors)
         {
             if (_envErrored.Remove(service))
             {
-                _serviceErrors.Remove(service);
+                return _serviceErrors.Remove(service);
             }
         }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Broadcast a service's last-error transition on <c>ops:fleet</c> (task #588):
+    /// <c>{ service, instanceId, lastError, lastErrorAt }</c> with <paramref name="error"/>
+    /// null on a clear. Per-instance — the payload carries this instance's id so the
+    /// dashboard can attribute the error. Best-effort via
+    /// <see cref="IChannelEventPublisher.TryPublish"/>; a missing publisher or an identity
+    /// lookup failure is swallowed so the reconcile that already committed is untouched.
+    /// </summary>
+    private async Task PublishServiceErrorAsync(string service, ServiceError? error, CancellationToken ct)
+    {
+        if (_publisher is null)
+        {
+            return;
+        }
+
+        string instanceId;
+        try
+        {
+            instanceId = (await _metadata.GetAsync(ct)).InstanceId;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Failed to resolve instance identity to broadcast serviceError for {Service}", service);
+            return;
+        }
+
+        _publisher.TryPublish(ManagementEndpoints.OpsFleetChannel, "serviceError", new
+        {
+            service,
+            instanceId,
+            lastError = error?.Message,
+            lastErrorAt = error?.At.ToString("O"),
+        });
     }
 
     private Task ExecuteAsync(ReconcileAction action, CancellationToken ct) => action.Kind switch
@@ -531,17 +664,34 @@ public sealed class ReconcilerService : BackgroundService
     /// </summary>
     private async Task ReportOutcomeAsync(ReconcileOutcome outcome, CancellationToken ct)
     {
+        ServiceError? current;
+        bool changed;
         lock (_serviceErrors)
         {
+            _serviceErrors.TryGetValue(outcome.ServiceName, out var previous);
             if (outcome.Status == ReconcileOutcomeStatus.Succeeded)
             {
                 _serviceErrors.Remove(outcome.ServiceName);
+                current = null;
+                // Cleared transition only when there was an error to clear.
+                changed = previous is not null;
             }
             else
             {
-                _serviceErrors[outcome.ServiceName] =
-                    new ServiceError(InstanceServicesJson.TrimError(outcome.Detail), DateTimeOffset.UtcNow);
+                current = new ServiceError(InstanceServicesJson.TrimError(outcome.Detail), DateTimeOffset.UtcNow);
+                _serviceErrors[outcome.ServiceName] = current;
+                // Set transition on first failure or when the message text changed;
+                // a service failing identically every loop must not re-broadcast.
+                changed = previous is null || !string.Equals(previous.Message, current.Message, StringComparison.Ordinal);
             }
+        }
+
+        // Broadcast the last-error transition on ops:fleet (task #588). Per-instance (the
+        // payload carries this instance's id) and best-effort — a publish failure must
+        // never affect the outcome that already committed.
+        if (changed)
+        {
+            await PublishServiceErrorAsync(outcome.ServiceName, current, ct);
         }
 
         // A failed action that was servicing an active deploy must be correlated back to
