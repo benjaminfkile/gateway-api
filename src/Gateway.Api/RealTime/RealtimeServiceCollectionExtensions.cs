@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Gateway.Api.RealTime;
@@ -55,6 +56,13 @@ public static class RealtimeServiceCollectionExtensions
         // (§4.2 ChannelEvent wire contract). Singleton — it holds only the hub
         // context and a logger, both singletons.
         services.TryAddSingleton<IChannelEventPublisher, ChannelEventPublisher>();
+
+        // Channel-ownership resolver (task #593): the hub's JoinChannel and the
+        // internal publish endpoint both consult it to map a channel prefix onto the
+        // owning manifest service. Singleton with a short-TTL cache over the manifest
+        // store, reached through a scope factory like the reconciler.
+        services.TryAddSingleton<IChannelOwnershipResolver>(sp =>
+            new ManifestChannelOwnershipResolver(sp.GetRequiredService<IServiceScopeFactory>()));
 
         return services;
     }

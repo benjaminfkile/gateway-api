@@ -219,6 +219,80 @@ public class ManagementDeployTests
     }
 
     [Fact]
+    public async Task Put_CreatesNewManifest_GeneratesPublishToken_NotInResponse()
+    {
+        // task #593: a create mints a realtime publish token on the row, but the token
+        // is write-only — never echoed in the API response (exposed only via container env).
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        string token = null!;
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.False(string.IsNullOrEmpty(m.RealtimePublishToken));
+            token = m.RealtimePublishToken!;
+        });
+
+        // The token must not leak in the create response nor in GET /mgmt/services.
+        var created = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(token, created);
+        Assert.DoesNotContain("realtimePublishToken", created, StringComparison.OrdinalIgnoreCase);
+
+        var list = await client.GetStringAsync("/mgmt/services");
+        Assert.DoesNotContain(token, list);
+        Assert.DoesNotContain("realtimePublishToken", list, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Put_UpdatesExisting_PreservesPublishToken()
+    {
+        // task #593: an edit that does not change the token must preserve it — a
+        // token generated once never rotates on an unrelated manifest edit.
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+        });
+
+        string original = null!;
+        await factory.WithDbAsync(async db =>
+            original = (await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a")).RealtimePublishToken!);
+        Assert.False(string.IsNullOrEmpty(original));
+
+        // Edit the port; the token must survive unchanged.
+        await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 9090,
+            includeInHealth = false,
+        });
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal(9090, m.Port);
+            Assert.Equal(original, m.RealtimePublishToken);
+        });
+    }
+
+    [Fact]
     public async Task Put_ChangedTag_ClearsDigest_AndAudits()
     {
         await using var factory = new ManagementApiFactory();

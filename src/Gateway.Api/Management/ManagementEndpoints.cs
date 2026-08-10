@@ -341,6 +341,12 @@ public static partial class ManagementEndpoints
             UpdatedAt = DateTimeOffset.UtcNow,
         };
 
+        // Realtime publish token (task #593): preserve the token already on the row
+        // across an edit, and mint one lazily on first create — or on the first upsert
+        // of a pre-migration row that never had one. Write-only: ServiceView never
+        // echoes it back, so it is exposed to the owner only through its container env.
+        RealtimePublishToken.Ensure(manifest, existing);
+
         await manifests.UpsertAsync(manifest, ct);
         await AuditAsync(deploys, name, DeployAction.Upsert, user, existing?.Digest, manifest.Digest, ct);
 

@@ -30,11 +30,16 @@ public sealed class GatewayHub : Hub
     public const string OpsChannelPrefix = "ops:";
 
     private readonly IAuthorizationService _authorization;
+    private readonly IChannelOwnershipResolver _ownership;
     private readonly ILogger<GatewayHub> _logger;
 
-    public GatewayHub(IAuthorizationService authorization, ILogger<GatewayHub> logger)
+    public GatewayHub(
+        IAuthorizationService authorization,
+        IChannelOwnershipResolver ownership,
+        ILogger<GatewayHub> logger)
     {
         _authorization = authorization;
+        _ownership = ownership;
         _logger = logger;
     }
 
@@ -84,10 +89,12 @@ public sealed class GatewayHub : Hub
             : "anonymous";
 
     /// <summary>
-    /// Subscribe the caller to a <c>{app}:{topic}</c> channel. Public for every
-    /// channel except <c>ops:*</c>, which requires the connection to satisfy the
-    /// <see cref="OpsChannelPolicy"/>. Throws <see cref="HubException"/> on an
-    /// invalid channel name or an unauthorized <c>ops:*</c> join.
+    /// Subscribe the caller to a <c>{prefix}:{topic}</c> channel. The prefix must be
+    /// either <c>ops</c> (gateway-owned, gated by the <see cref="OpsChannelPolicy"/>)
+    /// or the name of an existing manifest service (task #593) — a channel whose
+    /// prefix owns to no service is an anonymous free-for-all no longer, and the join
+    /// is rejected. Throws <see cref="HubException"/> on an invalid channel name, an
+    /// unauthorized <c>ops:*</c> join, or an unowned prefix.
     /// </summary>
     public async Task JoinChannel(string channel)
     {
@@ -109,18 +116,36 @@ public sealed class GatewayHub : Hub
 
     private async Task AuthorizeChannelAsync(string channel)
     {
-        if (!IsOpsChannel(channel))
+        if (IsOpsChannel(channel))
         {
+            var user = Context.User ?? new ClaimsPrincipal(new ClaimsIdentity());
+            var result = await _authorization.AuthorizeAsync(user, resource: null, OpsChannelPolicy);
+            if (!result.Succeeded)
+            {
+                throw new HubException(
+                    $"Channel '{channel}' requires an authenticated connection.");
+            }
+
             return;
         }
 
-        var user = Context.User ?? new ClaimsPrincipal(new ClaimsIdentity());
-        var result = await _authorization.AuthorizeAsync(user, resource: null, OpsChannelPolicy);
-        if (!result.Succeeded)
+        // Every non-ops channel must be owned by an existing manifest service (task
+        // #593): the prefix is the service name. Reject a channel whose prefix owns to
+        // no service — channels are no longer an anonymous free-for-all.
+        var prefix = PrefixOf(channel);
+        var owner = await _ownership.ResolveAsync(prefix);
+        if (owner is null)
         {
             throw new HubException(
-                $"Channel '{channel}' requires an authenticated connection.");
+                $"Channel '{channel}' has no owning service; '{prefix}' is not a known service.");
         }
+    }
+
+    /// <summary>The channel's owner prefix — everything before the first <c>:</c>.</summary>
+    public static string PrefixOf(string channel)
+    {
+        var separator = channel.IndexOf(':');
+        return separator <= 0 ? channel : channel[..separator];
     }
 
     /// <summary>
