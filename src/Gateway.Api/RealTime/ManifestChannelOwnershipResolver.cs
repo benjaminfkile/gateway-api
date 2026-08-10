@@ -39,12 +39,10 @@ public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
     public async Task<ChannelOwner?> ResolveAsync(string prefix, CancellationToken ct = default)
     {
         var services = await GetServicesAsync(ct);
-        return services.TryGetValue(prefix, out var token)
-            ? new ChannelOwner(prefix, token)
-            : null;
+        return services.TryGetValue(prefix, out var owner) ? owner : null;
     }
 
-    private async Task<IReadOnlyDictionary<string, string?>> GetServicesAsync(CancellationToken ct)
+    private async Task<IReadOnlyDictionary<string, ChannelOwner>> GetServicesAsync(CancellationToken ct)
     {
         var current = _snapshot;
         if (current is not null && DateTimeOffset.UtcNow - current.TakenAt < _ttl)
@@ -66,10 +64,10 @@ public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
             var store = scope.ServiceProvider.GetRequiredService<IManifestStore>();
             var all = await store.GetAllAsync(ct);
 
-            var map = new Dictionary<string, string?>(StringComparer.Ordinal);
+            var map = new Dictionary<string, ChannelOwner>(StringComparer.Ordinal);
             foreach (var m in all)
             {
-                map[m.Name] = m.RealtimePublishToken;
+                map[m.Name] = new ChannelOwner(m.Name, m.RealtimePublishToken, m.RealtimeAuthPath, m.Port);
             }
 
             _snapshot = new Snapshot(map, DateTimeOffset.UtcNow);
@@ -81,5 +79,5 @@ public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
         }
     }
 
-    private sealed record Snapshot(IReadOnlyDictionary<string, string?> Services, DateTimeOffset TakenAt);
+    private sealed record Snapshot(IReadOnlyDictionary<string, ChannelOwner> Services, DateTimeOffset TakenAt);
 }
