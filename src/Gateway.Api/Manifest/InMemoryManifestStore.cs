@@ -92,6 +92,7 @@ public sealed class InMemoryManifestStore : IManifestStore
         Port = m.Port,
         DesiredStatus = m.DesiredStatus,
         EnvSecretRef = m.EnvSecretRef,
+        RealtimePublishToken = m.RealtimePublishToken,
         IncludeInHealth = m.IncludeInHealth,
         UpdatedBy = m.UpdatedBy,
         UpdatedAt = m.UpdatedAt,

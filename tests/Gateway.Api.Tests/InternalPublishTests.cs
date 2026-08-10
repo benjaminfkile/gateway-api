@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text.Json;
+using Gateway.Api.Data;
+using Gateway.Api.Manifest;
 using Gateway.Api.RealTime;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -39,6 +41,23 @@ public sealed class InternalPublishTests
         return port;
     }
 
+    // Two owned channels (task #593): svc-a and svc-b are manifest services, each with
+    // its own publish token. A downstream may publish only to its own prefix.
+    private const string TokenA = "token-a-secret";
+    private const string TokenB = "token-b-secret";
+
+    private static ServiceManifest Owned(string name, string token) => new()
+    {
+        Name = name,
+        Image = $"registry/{name}",
+        Tag = "latest",
+        Port = 8080,
+        DesiredStatus = "running",
+        RealtimePublishToken = token,
+        UpdatedBy = "seed",
+        UpdatedAt = DateTimeOffset.UnixEpoch,
+    };
+
     private static async Task<Gateway> StartGatewayAsync()
     {
         var publicPort = GetFreePort();
@@ -55,6 +74,14 @@ public sealed class InternalPublishTests
         builder.AddGatewayInternalListener();
         builder.Services.AddGatewayRealtime(builder.Configuration);
 
+        // The publish endpoint and the hub's JoinChannel resolve channel ownership
+        // through the manifest store (task #593); seed the owned services + tokens.
+        builder.Services.AddSingleton<IManifestStore>(new InMemoryManifestStore(new[]
+        {
+            Owned("svc-a", TokenA),
+            Owned("svc-b", TokenB),
+        }));
+
         var app = builder.Build();
         app.UseInternalListenerIsolation();
         app.UseWebSockets();
@@ -63,6 +90,24 @@ public sealed class InternalPublishTests
 
         await app.StartAsync();
         return new Gateway(app, publicPort, internalPort);
+    }
+
+    /// <summary>POST /internal/publish with an optional publish token header.</summary>
+    private static async Task<HttpResponseMessage> PublishAsync(
+        Gateway gateway, string channel, object payload, string? token)
+    {
+        using var http = new HttpClient();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, $"http://127.0.0.1:{gateway.InternalPort}/internal/publish")
+        {
+            Content = JsonContent.Create(new { channel, @event = "evt", payload }),
+        };
+        if (token is not null)
+        {
+            request.Headers.Add(RealtimePublishToken.Header, token);
+        }
+
+        return await http.SendAsync(request);
     }
 
     [Fact]
@@ -83,9 +128,15 @@ public sealed class InternalPublishTests
         await connection.InvokeAsync("JoinChannel", "svc-a:orders");
 
         using var http = new HttpClient();
-        var response = await http.PostAsJsonAsync(
-            $"http://127.0.0.1:{gateway.InternalPort}/internal/publish",
-            new { channel = "svc-a:orders", @event = "orderPlaced", payload = new { id = "o-42" } });
+        var request = new HttpRequestMessage(
+            HttpMethod.Post, $"http://127.0.0.1:{gateway.InternalPort}/internal/publish")
+        {
+            Content = JsonContent.Create(
+                new { channel = "svc-a:orders", @event = "orderPlaced", payload = new { id = "o-42" } }),
+        };
+        // svc-a owns svc-a:*, so its token authorizes the publish (task #593).
+        request.Headers.Add(RealtimePublishToken.Header, TokenA);
+        var response = await http.SendAsync(request);
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
 
@@ -96,6 +147,60 @@ public sealed class InternalPublishTests
         Assert.Equal("svc-a:orders", envelope.GetProperty("channel").GetString());
         Assert.Equal("orderPlaced", envelope.GetProperty("event").GetString());
         Assert.Equal("o-42", envelope.GetProperty("data").GetProperty("id").GetString());
+    }
+
+    [Fact]
+    public async Task InternalPublish_WrongToken_IsForbidden()
+    {
+        await using var gateway = await StartGatewayAsync();
+
+        // svc-b's token does not authorize svc-a's channel (cross-service token).
+        var response = await PublishAsync(gateway, "svc-a:orders", new { id = "x" }, TokenB);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InternalPublish_MissingToken_IsForbidden()
+    {
+        await using var gateway = await StartGatewayAsync();
+
+        var response = await PublishAsync(gateway, "svc-a:orders", new { id = "x" }, token: null);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InternalPublish_UnknownPrefix_IsForbidden()
+    {
+        await using var gateway = await StartGatewayAsync();
+
+        // No manifest service named 'ghost' → no owner → 403 regardless of any token.
+        var response = await PublishAsync(gateway, "ghost:orders", new { id = "x" }, TokenA);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InternalPublish_OpsChannel_IsForbidden_EvenWithToken()
+    {
+        await using var gateway = await StartGatewayAsync();
+
+        // ops:* is gateway-owned and never publishable through the HTTP passthrough,
+        // regardless of any token — gateway-internal events bypass this endpoint.
+        var response = await PublishAsync(gateway, "ops:fleet", new { id = "x" }, TokenA);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InternalPublish_CorrectToken_FansOutEnvelope_Succeeds()
+    {
+        await using var gateway = await StartGatewayAsync();
+
+        var response = await PublishAsync(gateway, "svc-b:events", new { id = "b-1" }, TokenB);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
     }
 
     [Fact]

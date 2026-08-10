@@ -89,19 +89,71 @@ public static class RealtimeApplicationExtensions
     }
 
     /// <summary>
-    /// Map the internal publish endpoint (tech-spec §4.2). Broadcasts the request
-    /// payload to the channel's SignalR group inside the ChannelEvent envelope
-    /// (method <c>ChannelEvent</c>, <c>{ channel, event, data }</c>) and returns
-    /// <c>202 Accepted</c>. The isolation middleware guarantees this is reachable
-    /// only on the internal listener.
+    /// Map the internal publish endpoint (tech-spec §4.2, task #593). A downstream
+    /// container publishes to its own <c>{service}:{topic}</c> channels only: the
+    /// request must carry header <c>X-Gateway-Realtime-Token</c> matching the publish
+    /// token of the manifest service that owns the target channel's prefix, and the
+    /// token is constant-time compared. On success the payload is broadcast to the
+    /// channel's SignalR group inside the ChannelEvent envelope (method
+    /// <c>ChannelEvent</c>, <c>{ channel, event, data }</c>) and the call returns
+    /// <c>202 Accepted</c>. Rejected with <c>403</c> when the prefix owns to no
+    /// service, its token has not been minted yet (pre-migration row), or the token
+    /// does not match. <c>ops:*</c> channels are gateway-owned and never publishable
+    /// through this HTTP path — gateway-internal events go through
+    /// <see cref="IChannelEventPublisher"/> directly. The isolation middleware
+    /// guarantees this endpoint is reachable only on the internal listener.
     /// </summary>
     public static IEndpointRouteBuilder MapInternalPublish(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapPost("/internal/publish", async (
             InternalPublishRequest request,
+            HttpContext context,
             IChannelEventPublisher publisher,
+            IChannelOwnershipResolver ownership,
             CancellationToken ct) =>
         {
+            if (string.IsNullOrWhiteSpace(request.Channel))
+            {
+                return Results.BadRequest(new { error = "channel is required." });
+            }
+
+            // ops:* is gateway-owned and never publishable through the HTTP passthrough,
+            // regardless of any token presented. Gateway-internal ops events ride
+            // IChannelEventPublisher directly, bypassing this endpoint entirely.
+            if (GatewayHub.IsOpsChannel(request.Channel))
+            {
+                return Results.Json(
+                    new { error = $"Channel '{request.Channel}' is gateway-owned and cannot be published via /internal/publish." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var prefix = GatewayHub.PrefixOf(request.Channel);
+            var owner = await ownership.ResolveAsync(prefix, ct);
+            if (owner is null)
+            {
+                return Results.Json(
+                    new { error = $"Channel '{request.Channel}' has no owning service; '{prefix}' is not a known service." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            if (string.IsNullOrEmpty(owner.PublishToken))
+            {
+                // Pre-migration row (or a service upserted before this column existed):
+                // no token has been minted yet, so no publish can be authorized. The
+                // next upsert of the service generates one (tech-spec §4.2, task #593).
+                return Results.Json(
+                    new { error = $"Service '{prefix}' has no realtime publish token yet; re-upsert the service to generate one before publishing." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
+            if (!RealtimePublishToken.Matches(presented, owner.PublishToken))
+            {
+                return Results.Json(
+                    new { error = $"The {RealtimePublishToken.Header} header does not authorize publishing to '{request.Channel}'." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
             await publisher.PublishAsync(request.Channel, request.Event, request.Payload, ct);
             return Results.Accepted();
         });

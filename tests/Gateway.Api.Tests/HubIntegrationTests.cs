@@ -1,11 +1,14 @@
 using System.Text.Json;
+using Gateway.Api.Manifest;
 using Gateway.Api.RealTime;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Gateway.Api.Tests;
 
@@ -19,6 +22,17 @@ public class HubIntegrationTests
 {
     private sealed class HubTestFactory : WebApplicationFactory<Program>
     {
+        // Channels are owned by manifest services now (task #593): a join to
+        // svc-a:* only succeeds when svc-a is a known service, so seed one.
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IManifestStore>();
+                services.AddSingleton<IManifestStore>(new InMemoryManifestStore(
+                    new[] { ManagementTestData.Manifest("svc-a") }));
+            });
+        }
     }
 
     private static HubConnection BuildConnection(WebApplicationFactory<Program> factory)
@@ -99,7 +113,23 @@ public class HubIntegrationTests
 
         await connection.StartAsync();
 
-        // A non-ops channel is public broadcast — no auth required (design invariant).
+        // A manifest-owned channel is public broadcast — no auth required, but the
+        // prefix (svc-a) must be an existing manifest service (task #593).
         await connection.InvokeAsync("JoinChannel", "svc-a:public");
+    }
+
+    [Fact]
+    public async Task JoinChannel_UnknownPrefix_IsRejected()
+    {
+        await using var factory = new HubTestFactory();
+        await using var connection = BuildConnection(factory);
+
+        await connection.StartAsync();
+
+        // No manifest service is named 'ghost', so the channel has no owner and the
+        // join is rejected — channels are no longer an anonymous free-for-all (#593).
+        var ex = await Assert.ThrowsAsync<HubException>(
+            () => connection.InvokeAsync("JoinChannel", "ghost:updates"));
+        Assert.Contains("ghost", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }

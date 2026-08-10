@@ -561,6 +561,14 @@ public sealed class ReconcilerService : BackgroundService
                 await PublishServiceErrorAsync(m.Name, null, ct);
             }
 
+            // Inject the per-service real-time publish token so the container can
+            // authorize POST /internal/publish for its own channels (task #593). Folded
+            // into the resolved env before hashing so a first-time token mint (or a
+            // rotation) drifts the env hash and blue-green-recreates the container with
+            // the token present. Pre-migration rows have no token yet; they simply run
+            // without one until the next upsert generates it.
+            env = WithRealtimeToken(env, m.RealtimePublishToken);
+
             desired.Add(new DesiredService(
                 Name: m.Name,
                 Image: m.Image,
@@ -574,6 +582,27 @@ public sealed class ReconcilerService : BackgroundService
         }
 
         return (desired, envFailed);
+    }
+
+    /// <summary>
+    /// Return the resolved env with <c>GATEWAY_REALTIME_TOKEN</c> added when the
+    /// service has a publish token (task #593). Copied into a fresh map so the
+    /// provider's (possibly shared/immutable) dictionary is never mutated; a service
+    /// with no token yet is returned unchanged.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string> WithRealtimeToken(
+        IReadOnlyDictionary<string, string> env, string? token)
+    {
+        if (string.IsNullOrEmpty(token))
+        {
+            return env;
+        }
+
+        var merged = new Dictionary<string, string>(env, StringComparer.Ordinal)
+        {
+            [RealtimePublishToken.ContainerEnvVar] = token,
+        };
+        return merged;
     }
 
     /// <summary>

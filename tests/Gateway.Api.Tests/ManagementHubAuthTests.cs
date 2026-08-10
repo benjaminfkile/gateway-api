@@ -1,4 +1,5 @@
 using Gateway.Api.Auth;
+using Gateway.Api.Manifest;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http.Connections;
@@ -8,6 +9,7 @@ using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Gateway.Api.Tests;
 
@@ -37,6 +39,12 @@ public class ManagementHubAuthTests
                 services.PostConfigure<JwtBearerOptions>(
                     JwtBearerDefaults.AuthenticationScheme,
                     TestManagementAuth.ApplyTestSigningKey);
+
+                // svc-a must be a known manifest service so its public channel is
+                // joinable now that channels are owned by services (task #593).
+                services.RemoveAll<IManifestStore>();
+                services.AddSingleton<IManifestStore>(new InMemoryManifestStore(
+                    new[] { ManagementTestData.Manifest("svc-a") }));
             });
         }
     }

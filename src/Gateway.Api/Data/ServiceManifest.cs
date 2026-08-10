@@ -28,6 +28,22 @@ public class ServiceManifest
     /// <summary>Optional secrets-store reference for the container's env.</summary>
     public string? EnvSecretRef { get; set; }
 
+    /// <summary>
+    /// Per-service secret that authorizes publishing to this service's real-time
+    /// channels (channel prefix == <see cref="Name"/>). A cryptographically random,
+    /// url-safe token generated lazily the first time the row is created or upserted
+    /// without one (tech-spec §4.2). Injected into the managed container as
+    /// <c>GATEWAY_REALTIME_TOKEN</c> and required — constant-time compared — on the
+    /// <c>X-Gateway-Realtime-Token</c> header of <c>POST /internal/publish</c>.
+    /// <para>
+    /// Write-only from the API's perspective: never surfaced in
+    /// <c>GET /mgmt/services</c>, like a secret. Null only on pre-migration rows that
+    /// have not been upserted since this column was added; publishes to such a
+    /// service's channels are rejected until the next upsert mints one.
+    /// </para>
+    /// </summary>
+    public string? RealtimePublishToken { get; set; }
+
     /// <summary>Whether this service participates in the aggregated health check.</summary>
     public bool IncludeInHealth { get; set; }
 

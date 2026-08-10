@@ -154,7 +154,8 @@ public class ReconcilerServiceTests
         string? digest = "sha256:v1",
         int port = 8080,
         DateTimeOffset? restartRequestedAt = null,
-        string? envSecretRef = null) => new()
+        string? envSecretRef = null,
+        string? realtimePublishToken = null) => new()
     {
         Name = name,
         Image = $"registry/{name}",
@@ -167,6 +168,7 @@ public class ReconcilerServiceTests
         UpdatedAt = DateTimeOffset.UnixEpoch,
         RestartRequestedAt = restartRequestedAt,
         EnvSecretRef = envSecretRef,
+        RealtimePublishToken = realtimePublishToken,
     };
 
     private static ContainerInfo Running(string name, string digest, string? envHash, int hostPort = 8080) =>
@@ -252,6 +254,33 @@ public class ReconcilerServiceTests
         var outcome = Assert.Single(harness.Reporter.Outcomes);
         Assert.Equal(ReconcileActionKind.Start, outcome.Kind);
         Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+    }
+
+    [Fact]
+    public async Task Start_InjectsRealtimeToken_IntoContainerEnv()
+    {
+        // task #593: the reconciler injects GATEWAY_REALTIME_TOKEN into every managed
+        // container's env so the service can authorize POST /internal/publish for its
+        // own channels. A service with no token yet gets no such variable.
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", realtimePublishToken: "secret-a"));
+
+        await harness.Service.RunOnceAsync();
+
+        var spec = Assert.Single(harness.Runtime.StartedSpecs);
+        Assert.Equal("secret-a", spec.EnvVars["GATEWAY_REALTIME_TOKEN"]);
+    }
+
+    [Fact]
+    public async Task Start_NoRealtimeToken_OmitsEnvVar()
+    {
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", realtimePublishToken: null));
+
+        await harness.Service.RunOnceAsync();
+
+        var spec = Assert.Single(harness.Runtime.StartedSpecs);
+        Assert.DoesNotContain("GATEWAY_REALTIME_TOKEN", spec.EnvVars.Keys);
     }
 
     [Fact]
