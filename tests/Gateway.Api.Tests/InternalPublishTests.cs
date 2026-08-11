@@ -181,6 +181,22 @@ public sealed class InternalPublishTests
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
 
+    [Theory]
+    [InlineData("svc-a")]   // no separator at all
+    [InlineData("svc-a:")]  // present prefix, empty topic
+    public async Task InternalPublish_MalformedChannel_IsBadRequest(string channel)
+    {
+        await using var gateway = await StartGatewayAsync();
+
+        // Task #608 finding 3: a channel that can never be joined (no {service}:{topic}
+        // shape) must be rejected 400 before ownership/token checks — otherwise it would
+        // 202 and broadcast into a permanently-empty group (silent event loss). svc-a IS a
+        // known service with a valid token, isolating the shape check from ownership/auth.
+        var response = await PublishAsync(gateway, channel, new { id = "x" }, TokenA);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
     [Fact]
     public async Task InternalPublish_OpsChannel_IsForbidden_EvenWithToken()
     {

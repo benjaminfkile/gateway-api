@@ -425,6 +425,30 @@ public class ReconcilerDeployProgressTests
     }
 
     [Fact]
+    public async Task Leader_TimesOutStaleDeploy_PersistsDetail_ViaStore()
+    {
+        // Task #608 finding 5: the terminal failure reason must be PERSISTED, not just ride
+        // the fire-and-forget event — GET /mgmt/deploys reads the store, so a timed-out
+        // deploy must have a non-null Detail there (events are hints, the store is truth).
+        var harness = new Harness(isLeader: true, deployTimeout: TimeSpan.FromMinutes(10));
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1"));
+        await harness.Store.UpsertAsync(Manifest("svc-a", "sha256:v1"));
+        await harness.DeployStore.AddAsync(new DeployHistory
+        {
+            Service = "svc-a", ToDigest = "sha256:v2", Actor = "bob",
+            Action = DeployAction.Deploy, Status = DeployStatus.InProgress,
+            StartedAt = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(20),
+        });
+
+        await harness.Service.RunOnceAsync();
+
+        var deploy = Assert.Single(harness.DeployStore.History);
+        Assert.Equal(DeployStatus.Failed, deploy.Status);
+        // The reason is persisted on the stored row, not only broadcast.
+        Assert.Equal("deploy timed out", deploy.Detail);
+    }
+
+    [Fact]
     public async Task Leader_TimesOutStaleDeploy_MarksPartial_WhenSomeConverged()
     {
         // Some of the fleet converged before the deploy went stale: timeout → "partial".

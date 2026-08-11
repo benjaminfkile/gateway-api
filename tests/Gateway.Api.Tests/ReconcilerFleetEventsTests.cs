@@ -262,6 +262,77 @@ public class ReconcilerFleetEventsTests
         Assert.Null(clear.Get("lastErrorAt"));
     }
 
+    /// <summary>Wraps a real store but throws on the first <c>UpsertAsync</c> only —
+    /// models a heartbeat that fails mid-loop before the fleet events are published.</summary>
+    private sealed class ThrowOnceStatusStore : IInstanceStatusStore
+    {
+        private readonly FakeInstanceStatusStore _inner = new();
+        private int _upserts;
+
+        public Task UpsertAsync(InstanceStatus status, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _upserts) == 1)
+            {
+                throw new InvalidOperationException("heartbeat store unavailable");
+            }
+
+            return _inner.UpsertAsync(status, ct);
+        }
+
+        public Task<IReadOnlyList<InstanceStatus>> GetAllAsync(CancellationToken ct = default) =>
+            _inner.GetAllAsync(ct);
+
+        public Task<int> DeleteStaleAsync(DateTimeOffset cutoff, CancellationToken ct = default) =>
+            _inner.DeleteStaleAsync(cutoff, ct);
+    }
+
+    [Fact]
+    public async Task Leader_PublishesLeaderChange_AfterThrowingFirstCycle()
+    {
+        // Task #608 finding 4: if the heartbeat body throws before PublishFleetEventsAsync
+        // runs, the leaderChange edge must NOT be consumed — the next successful cycle must
+        // still announce this instance as leader (rather than swallowing it for the term).
+        var options = new ReconcilerOptions { Enabled = true };
+        var services = new ServiceCollection();
+        services.AddSingleton<IManifestStore>(new InMemoryManifestStore());
+        services.AddSingleton<IServiceEnvProvider, ToggleEnvProvider>();
+        services.AddSingleton<IInstanceStatusStore>(new ThrowOnceStatusStore());
+        services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+        services.AddSingleton<ServiceHostPortMap>();
+        services.AddSingleton<ManifestProxyConfigProvider>();
+        services.AddSingleton<ProxyStateService>();
+        var provider = services.BuildServiceProvider();
+        var metadata = new InstanceMetadataProvider(new IInstanceMetadata[]
+        {
+            new StubInstanceMetadata(new InstanceIdentity("i-test", "10.0.0.9", null)),
+        });
+        var publisher = new RecordingPublisher();
+        var service = new ReconcilerService(
+            new FakeContainerRuntime(),
+            provider.GetRequiredService<ProxyStateService>(),
+            provider.GetRequiredService<IServiceAddressResolver>(),
+            provider.GetRequiredService<ServiceHostPortMap>(),
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new FakeReadinessProber(),
+            new NullReporter(),
+            metadata,
+            new InMemoryLeaderElection(true),
+            options,
+            NullLogger<ReconcilerService>.Instance,
+            migrationGate: null,
+            publisher: publisher);
+
+        // First cycle: the heartbeat upsert throws, so no leaderChange is published and the
+        // edge is left unconsumed.
+        await service.RunOnceAsync();
+        Assert.Empty(publisher.OfEvent("leaderChange"));
+
+        // Second cycle succeeds: the retained edge now fires the leaderChange.
+        await service.RunOnceAsync();
+        var change = Assert.Single(publisher.OfEvent("leaderChange"));
+        Assert.Equal("i-test", change.Get("instanceId"));
+    }
+
     [Fact]
     public async Task ThrowingPublisher_DoesNotBreakReconcile()
     {

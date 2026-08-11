@@ -208,7 +208,10 @@ public sealed class GatewayHub : Hub
     {
         var connectionId = Context.ConnectionId;
 
-        if (_decisions.TryGet(connectionId, channel) is { } cached)
+        // A cached decision short-circuits: an allow admits any credential; a deny only
+        // short-circuits a retry of the SAME credential, so a retry with a different,
+        // now-valid credential still reaches the owning service (task #608 finding 1).
+        if (_decisions.TryGet(connectionId, channel, credential) is { } cached)
         {
             if (cached.Allowed)
             {
@@ -218,7 +221,24 @@ public sealed class GatewayHub : Hub
             throw new HubException(AuthDeniedMessage);
         }
 
-        var decision = await _authClient.AuthorizeAsync(owner, channel, credential, connectionId, Context.ConnectionAborted);
+        // Cap concurrent in-flight callbacks per connection at one: a join-loop cannot
+        // hold multiple 2s downstream slots. If a callback is already running for this
+        // connection, fail closed without caching — the in-flight one decides the join.
+        if (!_decisions.TryBeginAuthCallback(connectionId))
+        {
+            throw new HubException(AuthDeniedMessage);
+        }
+
+        ChannelAuthDecision decision;
+        try
+        {
+            decision = await _authClient.AuthorizeAsync(owner, channel, credential, connectionId, Context.ConnectionAborted);
+        }
+        finally
+        {
+            _decisions.EndAuthCallback(connectionId);
+        }
+
         if (decision.Allowed)
         {
             // The identity (may be null) rides with the cached allow for phase 3 to use.
@@ -226,7 +246,8 @@ public sealed class GatewayHub : Hub
             return;
         }
 
-        _decisions.StoreDeny(connectionId, channel);
+        // Key the deny on this credential so a later retry with a different one is not blocked.
+        _decisions.StoreDeny(connectionId, channel, credential);
         throw new HubException(AuthDeniedMessage);
     }
 
@@ -238,11 +259,25 @@ public sealed class GatewayHub : Hub
     }
 
     /// <summary>
-    /// Enforce the <c>{app}:{topic}</c> shape. Kept deliberately permissive — the
-    /// hub is opt-in infrastructure, not an app-level validator — but a missing
-    /// <c>:</c> separator or empty segment is rejected so a bad name can never
-    /// collide with the <c>ops:</c> namespace check.
+    /// The single <c>{app}:{topic}</c> shape rule, shared by <see cref="ValidateChannel"/>
+    /// (joins) and <c>POST /internal/publish</c> (task #608 finding 3) so a channel that
+    /// can never be joined can never be published to either. Deliberately permissive — the
+    /// hub is opt-in infrastructure, not an app-level validator — but a missing <c>:</c>
+    /// separator or empty segment is rejected so a bad name can never collide with the
+    /// <c>ops:</c> namespace check or broadcast into a permanently-empty group.
     /// </summary>
+    public static bool IsValidChannel(string channel)
+    {
+        if (string.IsNullOrWhiteSpace(channel))
+        {
+            return false;
+        }
+
+        var separator = channel.IndexOf(':');
+        return separator > 0 && separator != channel.Length - 1;
+    }
+
+    /// <summary>Enforce the <c>{app}:{topic}</c> shape on a join, throwing on a bad name.</summary>
     private static void ValidateChannel(string channel)
     {
         if (string.IsNullOrWhiteSpace(channel))
@@ -250,8 +285,7 @@ public sealed class GatewayHub : Hub
             throw new HubException("Channel name is required.");
         }
 
-        var separator = channel.IndexOf(':');
-        if (separator <= 0 || separator == channel.Length - 1)
+        if (!IsValidChannel(channel))
         {
             throw new HubException(
                 $"Channel '{channel}' must be in '{{app}}:{{topic}}' form.");

@@ -247,9 +247,15 @@ and admits the join only if you allow it. Exact contract:
 - **A denied join throws** a single generic error on the client
   (`"Not authorized to join this channel."`) that reveals nothing about why or
   whether the channel exists.
-- **Caching.** An *allow* is cached for the lifetime of that connection id, so a
-  reconnect (new connection id) re-authorizes from scratch — your callback must
-  work idempotently and expect to be called again after any reconnect.
+- **Caching.** An *allow* is cached per `(connection, channel)` for a finite window
+  (~15 minutes), then a re-join re-authorizes — so a credential you later revoke cannot
+  ride a long-lived connection indefinitely, and your callback must work idempotently and
+  expect to be called again (after that window, on any reconnect, or when a client presents
+  a new credential). A reconnect gets a new connection id and re-authorizes from scratch.
+  A *deny* is cached only briefly (~10s) and is keyed to the exact credential that was
+  rejected: a client that immediately retries with a **different, now-valid** credential
+  (the normal token-refresh flow) reaches your callback again rather than being blocked for
+  the deny window.
 
 ### Worked example: a minimal Express auth endpoint
 
