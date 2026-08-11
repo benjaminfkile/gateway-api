@@ -221,6 +221,9 @@ public class ChannelAuthDecisionCacheTests
             new StubOwnership(),
             new StubAuthClient(),
             cache,
+            new HubChannelMembership(),
+            new MessageRateLimiter(new RealtimeRateLimitOptions()),
+            new StubMessageClient(),
             NullLogger<GatewayHub>.Instance)
         {
             Context = new StubContext("conn-1"),
@@ -291,6 +294,14 @@ public class ChannelAuthDecisionCacheTests
     {
         public Task<ChannelAuthDecision> AuthorizeAsync(
             ChannelOwner owner, string channel, string? credential, string connectionId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class StubMessageClient : IChannelMessageClient
+    {
+        public Task<bool> ForwardAsync(
+            ChannelOwner owner, string channel, string @event, object? data,
+            string connectionId, string? identity, CancellationToken ct = default) =>
             throw new NotSupportedException();
     }
 }

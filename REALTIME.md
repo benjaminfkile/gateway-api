@@ -359,20 +359,153 @@ never to "the UI is permanently wrong."
 
 ---
 
-## 5. Limits and operational notes
+## 5. Receiving messages from clients (full-duplex)
+
+Everything above is one-directional: your container publishes, browsers receive.
+The hub can also carry messages the **other** way — from a connected client up to
+your service — without the gateway learning any of your app's semantics. This is
+opt-in per service and off by default.
+
+### Turn it on: `realtime_message_path`
+
+Set `realtime_message_path` on your manifest entry (API field
+`realtimeMessagePath` on `PUT /mgmt/services/{name}`) to a **rooted path** on your
+service that will receive client messages:
+
+```
+realtimeMessagePath = "/realtime/message"
+```
+
+- Same validation as `realtime_auth_path`: it must begin with `/` (a bare path, not
+  an absolute URL), and it is **tri-state on upsert** — omitting the field
+  **preserves** the stored value, an **empty string** clears it (turning the
+  feature off), and a non-empty value sets it. A minimal `{image, tag, port}`
+  re-upsert never silently disables it.
+- Not a secret: it is returned by `GET /mgmt/services`.
+- While it is null, any client `SendToChannel` to one of your channels is rejected.
+
+### The client method: `SendToChannel`
+
+```js
+await connection.invoke("SendToChannel", "chat-api:room-42", "typing", { userId: 7 });
+```
+
+`SendToChannel(channel, event, data)` asks the gateway to hand your service one
+message. The gateway checks, **in order**:
+
+1. **Membership.** The connection must already be joined to `channel` (via
+   `JoinChannel`/`JoinPrivateChannel`) and not have left it. A send to a channel
+   you never joined is rejected with the same generic "not authorized" message a
+   denied join uses — join first.
+2. **Opt-in.** The channel's owning service must have `realtime_message_path`
+   configured, or the send is rejected with a distinct "does not accept client
+   messages" error.
+3. **Rate limit.** Each connection has a token-bucket budget (default **10
+   messages/second, burst 20**, shared across *all* its channels). Over budget is
+   rejected with a throttled error — back off and retry.
+4. **Size.** The payload rides SignalR's 32 KB receive cap (§6). Keep it small.
+
+If all four pass, the gateway POSTs the message to your `realtime_message_path`.
+
+### What your service receives
+
+The gateway `POST`s this JSON to your `realtime_message_path` (reached on the
+Docker network exactly as the auth callback is — no public exposure):
+
+```
+POST http://<your-service>/realtime/message
+Content-Type: application/json
+
+{
+  "channel": "chat-api:room-42",
+  "event": "typing",
+  "data": { "userId": 7 },
+  "connectionId": "abc123…",
+  "identity": "user-7"
+}
+```
+
+- `channel`, `event`, `data` — exactly what the client passed to `SendToChannel`.
+- `connectionId` — the sender's hub connection id (opaque; useful for correlation).
+- `identity` — the string **your own auth callback** returned when this connection
+  joined the channel (§3). It is `null` for public channels (no auth callback ran).
+  This is how you know *who* sent the message without the gateway ever
+  understanding your credentials.
+
+**Delivery is fire-and-forget toward the client.** The gateway ignores your
+response **body**; it only looks at the status code, with a **5-second** timeout.
+A `2xx` means "accepted" and the client's `invoke` resolves. A **non-2xx or a
+timeout** is logged and surfaced to the sending client as a thrown hub error, so
+the sender knows delivery failed — but nothing is retried.
+
+### The gateway never broadcasts your client's message — you do
+
+This is the crucial rule. When a client calls `SendToChannel`, the gateway hands
+the message **only to your service**. It does **not** fan it out to the channel's
+other subscribers. If you want other clients to see it, **you** publish it back
+out via `POST /internal/publish` (§4) — after you have validated, stored, and
+shaped it however your app needs.
+
+This keeps the gateway ignorant of your semantics and puts you in control: you
+decide what is persisted, what is rebroadcast, to which channel, and in what form.
+
+### Worked example: a chat message round-trip
+
+1. **Client sends.** A browser in room 42 invokes
+   `SendToChannel("chat-api:room-42", "message", { text: "hi" })`.
+2. **Gateway forwards.** The gateway POSTs
+   `{ channel: "chat-api:room-42", event: "message", data: { text: "hi" },
+   connectionId, identity: "user-7" }` to your `realtime_message_path`.
+3. **Your service decides.** Your handler authenticates via `identity`, validates
+   and **persists** the message (assigning it an id, timestamp, etc.), and returns
+   `202`. The client's `invoke` resolves.
+4. **Your service fans out.** To let everyone in the room see it, your service now
+   `POST`s to `/internal/publish`:
+
+   ```
+   POST http://gateway:8080/internal/publish
+   X-Gateway-Realtime-Token: <your token>
+
+   { "channel": "chat-api:room-42", "event": "messagePosted",
+     "payload": { "id": 91234, "from": "user-7" } }
+   ```
+
+5. **Everyone receives.** Every subscriber of `chat-api:room-42` (including the
+   original sender) gets the `ChannelEvent` envelope and — per the golden rule —
+   re-fetches the message by id.
+
+The inbound leg (`SendToChannel` → your service) and the outbound leg (your
+service → `/internal/publish` → all clients) are deliberately separate. The
+gateway never short-circuits them into a direct client-to-client broadcast.
+
+---
+
+## 6. Limits and operational notes
 
 ### Current limits
 
 - **Message size: 32 KB.** The hub keeps SignalR's default maximum receive
-  message size (32,768 bytes). Keep published payloads small — remember payloads
-  are hints, so prefer sending an id the client re-fetches over embedding a large
+  message size (32,768 bytes). This caps both `SendToChannel` payloads (§5) and,
+  by symmetry, what you should publish. Keep payloads small — remember they are
+  hints, so prefer sending an id the client re-fetches over embedding a large
   object.
-- **Rate limiting is minimal.** Private-channel join *auth callbacks* are capped per
-  connection+channel (a handful of attempts per ~10s window, plus at most one in-flight
-  callback per connection), so a credential-guessing loop cannot hammer your auth
-  endpoint through the gateway. There is no throttle on *publishes* (planned for
-  phase 3) — do not assume the gateway will protect you from your own publish
-  volume; self-limit chatty event sources.
+- **Client message rate (`SendToChannel`): 10 msg/s, burst 20, per connection.**
+  A token bucket shared across *all* a connection's channels; over budget throws a
+  throttled error (§5). Tunable per gateway via `GATEWAY_REALTIME_MSG_RATE` /
+  `GATEWAY_REALTIME_MSG_BURST`.
+- **Publish rate (`/internal/publish`): 50/s, burst 100, per service.** A token
+  bucket keyed on the owning service; over budget returns `429` with a
+  `Retry-After` header. Tunable via `GATEWAY_REALTIME_PUBLISH_RATE` /
+  `GATEWAY_REALTIME_PUBLISH_BURST`. Still self-limit genuinely chatty event
+  sources — the throttle is a backstop, not a queue.
+- **Private-channel join auth callbacks** are additionally capped per
+  connection+channel (a handful of attempts per ~10s window, plus at most one
+  in-flight callback per connection), so a credential-guessing loop cannot hammer
+  your auth endpoint through the gateway.
+- **Rate limits are per gateway instance.** A connection lives on exactly one
+  instance and a publish is limited by whichever instance served it, so the
+  buckets above are instance-local (not fleet-wide) — sized generously so a
+  well-behaved app never notices.
 - **No presence yet.** The hub does not tell you who is connected or subscribed,
   and there are no join/leave notifications to other clients (planned for phase
   3). Do not build presence/"who's online" features on the hub today.

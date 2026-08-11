@@ -98,6 +98,27 @@ public static class RealtimeServiceCollectionExtensions
         services.TryAddSingleton<IChannelAuthClient, HttpChannelAuthClient>();
         services.TryAddSingleton<ChannelAuthDecisionCache>();
 
+        // Full-duplex client→owner messaging (task #611): SendToChannel forwards a message
+        // to the owning service's realtime_message_path. Reuses the same address resolution
+        // as the auth callback; a dedicated HttpClient bounded at 5s. The membership
+        // registry lets the hub enforce "must be a member" locally (SignalR exposes no
+        // group-membership query) and carries the auth-callback identity onto the forward.
+        // The rate-limit options are read once; the per-connection message limiter and the
+        // per-service publish throttle are singletons so their token buckets outlive a
+        // per-invocation hub / per-request endpoint. All in-memory and instance-local —
+        // no Redis (a connection lives on one instance; a publish is limited by whichever
+        // instance served it), so single-instance mode is fully exercised offline.
+        services.TryAddSingleton(RealtimeRateLimitOptions.FromConfiguration(configuration));
+        services.TryAddSingleton<HubChannelMembership>();
+        services.TryAddSingleton<MessageRateLimiter>();
+        services.TryAddSingleton<PublishRateLimiter>();
+
+        services.AddHttpClient(HttpChannelMessageClient.HttpClientName, client =>
+        {
+            client.Timeout = HttpChannelMessageClient.ForwardTimeout;
+        });
+        services.TryAddSingleton<IChannelMessageClient, HttpChannelMessageClient>();
+
         return services;
     }
 }

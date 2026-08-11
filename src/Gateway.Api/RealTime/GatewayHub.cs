@@ -32,13 +32,41 @@ public sealed class GatewayHub : Hub
     /// <summary>
     /// The single message a delegated-auth denial reports. Deliberately generic: it
     /// leaks neither whether the channel exists nor why the join was refused (task #594).
+    /// Reused by <c>SendToChannel</c> when the caller is not a member of the target
+    /// channel (task #611, rule a) — the same "not authorized" answer.
     /// </summary>
     public const string AuthDeniedMessage = "Not authorized to join this channel.";
+
+    /// <summary>
+    /// <c>SendToChannel</c> rejection when the owning service has no
+    /// <c>realtime_message_path</c> configured (task #611, rule b): full-duplex is opt-in
+    /// per service, so this is a distinct, clear error rather than the generic denial.
+    /// </summary>
+    public const string MessagingNotEnabledMessage =
+        "This channel's service does not accept client messages (no realtime_message_path configured).";
+
+    /// <summary>
+    /// <c>SendToChannel</c> rejection when the connection is over its per-connection
+    /// message rate budget (task #611, rule c).
+    /// </summary>
+    public const string MessageRateLimitedMessage =
+        "Message rate limit exceeded; slow down and retry.";
+
+    /// <summary>
+    /// <c>SendToChannel</c> rejection when the owning service did not accept delivery —
+    /// a non-2xx response or a timeout on the message forward (task #611, item 3). The
+    /// gateway never broadcasts the message, so the sender is told delivery failed.
+    /// </summary>
+    public const string DeliveryFailedMessage =
+        "The channel's service did not accept the message.";
 
     private readonly IAuthorizationService _authorization;
     private readonly IChannelOwnershipResolver _ownership;
     private readonly IChannelAuthClient _authClient;
     private readonly ChannelAuthDecisionCache _decisions;
+    private readonly HubChannelMembership _membership;
+    private readonly MessageRateLimiter _messageRateLimiter;
+    private readonly IChannelMessageClient _messageClient;
     private readonly ILogger<GatewayHub> _logger;
 
     public GatewayHub(
@@ -46,12 +74,18 @@ public sealed class GatewayHub : Hub
         IChannelOwnershipResolver ownership,
         IChannelAuthClient authClient,
         ChannelAuthDecisionCache decisions,
+        HubChannelMembership membership,
+        MessageRateLimiter messageRateLimiter,
+        IChannelMessageClient messageClient,
         ILogger<GatewayHub> logger)
     {
         _authorization = authorization;
         _ownership = ownership;
         _authClient = authClient;
         _decisions = decisions;
+        _membership = membership;
+        _messageRateLimiter = messageRateLimiter;
+        _messageClient = messageClient;
         _logger = logger;
     }
 
@@ -92,8 +126,12 @@ public sealed class GatewayHub : Hub
         }
 
         // Drop every delegated-auth decision cached for this connection (task #594): a
-        // reconnect gets a fresh connection id and must re-authorize from scratch.
+        // reconnect gets a fresh connection id and must re-authorize from scratch. Also
+        // drop its channel memberships and its message-rate bucket (task #611) so neither
+        // side-registry pins memory for a connection id that will never be seen again.
         _decisions.Drop(Context.ConnectionId);
+        _membership.Drop(Context.ConnectionId);
+        _messageRateLimiter.Drop(Context.ConnectionId);
 
         await base.OnDisconnectedAsync(exception);
     }
@@ -147,8 +185,14 @@ public sealed class GatewayHub : Hub
     private async Task JoinChannelAsync(string channel, string? credential)
     {
         ValidateChannel(channel);
-        await AuthorizeChannelAsync(channel, credential);
+        var identity = await AuthorizeChannelAsync(channel, credential);
         await Groups.AddToGroupAsync(Context.ConnectionId, channel);
+
+        // Record the membership (and the auth-callback identity, null for public/ops) so
+        // SendToChannel can enforce "must be a member" locally and stamp the forward with
+        // who sent it (task #611). Record AFTER the group add so a failed add never leaves
+        // a phantom membership.
+        _membership.Join(Context.ConnectionId, channel, identity);
     }
 
     /// <summary>Unsubscribe the caller from a channel.</summary>
@@ -156,13 +200,75 @@ public sealed class GatewayHub : Hub
     {
         ValidateChannel(channel);
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, channel);
+        _membership.Leave(Context.ConnectionId, channel);
+    }
+
+    /// <summary>
+    /// Send a message FROM the caller's client TO the channel's owning service (task #611 —
+    /// full-duplex). The gateway forwards it to the owner's <c>realtime_message_path</c> and
+    /// never broadcasts it itself; if the owner wants fan-out it publishes via
+    /// <c>/internal/publish</c>. Rules are enforced in order:
+    /// <list type="number">
+    /// <item>the connection must currently be a member of <paramref name="channel"/>
+    /// (it joined and was not evicted) — else the generic <see cref="AuthDeniedMessage"/>;</item>
+    /// <item>the owning service must have <c>realtime_message_path</c> configured (opt-in) —
+    /// else the distinct <see cref="MessagingNotEnabledMessage"/>;</item>
+    /// <item>the per-connection message rate budget must not be exceeded (token bucket,
+    /// shared across all the connection's channels) — else <see cref="MessageRateLimitedMessage"/>;</item>
+    /// <item>the payload is capped by SignalR's 32 KB receive limit — no extra check here.</item>
+    /// </list>
+    /// The owner's response body is ignored (fire-and-forget toward the client); a non-2xx
+    /// or timeout on the forward is surfaced to the caller as <see cref="DeliveryFailedMessage"/>
+    /// so the sender knows delivery failed. Throws <see cref="HubException"/> on any rejection.
+    /// </summary>
+    public async Task SendToChannel(string channel, string @event, object? data)
+    {
+        ValidateChannel(channel);
+
+        // (a) Membership: only a current member of the channel may send to it. The identity
+        // recorded at join time (null for public/ops) rides along on the forward.
+        if (!_membership.TryGetIdentity(Context.ConnectionId, channel, out var identity))
+        {
+            throw new HubException(AuthDeniedMessage);
+        }
+
+        // (b) Opt-in: the owning service must have a message path. A reserved/ops prefix
+        // resolves to no owner, so ops:* sends fall here too — the distinct clear error.
+        var prefix = PrefixOf(channel);
+        var owner = await _ownership.ResolveAsync(prefix, Context.ConnectionAborted);
+        if (owner is null || string.IsNullOrEmpty(owner.MessagePath))
+        {
+            throw new HubException(MessagingNotEnabledMessage);
+        }
+
+        // (c) Per-connection message rate limit (shared across every channel).
+        if (!_messageRateLimiter.TryTake(Context.ConnectionId))
+        {
+            throw new HubException(MessageRateLimitedMessage);
+        }
+
+        // Forward to the owner's message path. The response body is ignored; the hub
+        // method returns as soon as the forward is accepted (2xx). A non-2xx or timeout
+        // is surfaced to the sender so it knows delivery failed — the gateway never
+        // broadcasts on the client's behalf.
+        var delivered = await _messageClient.ForwardAsync(
+            owner, channel, @event, data, Context.ConnectionId, identity, Context.ConnectionAborted);
+        if (!delivered)
+        {
+            throw new HubException(DeliveryFailedMessage);
+        }
     }
 
     /// <summary>True for channel names in the authenticated <c>ops:*</c> namespace.</summary>
     public static bool IsOpsChannel(string channel) =>
         channel.StartsWith(OpsChannelPrefix, StringComparison.Ordinal);
 
-    private async Task AuthorizeChannelAsync(string channel, string? credential)
+    /// <summary>
+    /// Authorize a join and return the identity to record with the membership: null for an
+    /// <c>ops:*</c> or public channel, or the owner-supplied identity for a delegated-auth
+    /// (private) channel (task #611). Throws <see cref="HubException"/> on any refusal.
+    /// </summary>
+    private async Task<string?> AuthorizeChannelAsync(string channel, string? credential)
     {
         if (IsOpsChannel(channel))
         {
@@ -174,7 +280,7 @@ public sealed class GatewayHub : Hub
                     $"Channel '{channel}' requires an authenticated connection.");
             }
 
-            return;
+            return null;
         }
 
         // Every non-ops channel must be owned by an existing manifest service (task
@@ -191,10 +297,10 @@ public sealed class GatewayHub : Hub
         // No auth path → the service's channels are public: join freely (as before #594).
         if (string.IsNullOrEmpty(owner.AuthPath))
         {
-            return;
+            return null;
         }
 
-        await AuthorizeDelegatedAsync(owner, channel, credential);
+        return await AuthorizeDelegatedAsync(owner, channel, credential);
     }
 
     /// <summary>
@@ -204,7 +310,7 @@ public sealed class GatewayHub : Hub
     /// (whether cached or fresh) throws a generic <see cref="HubException"/> that leaks
     /// nothing about why.
     /// </summary>
-    private async Task AuthorizeDelegatedAsync(ChannelOwner owner, string channel, string? credential)
+    private async Task<string?> AuthorizeDelegatedAsync(ChannelOwner owner, string channel, string? credential)
     {
         var connectionId = Context.ConnectionId;
 
@@ -215,7 +321,7 @@ public sealed class GatewayHub : Hub
         {
             if (cached.Allowed)
             {
-                return;
+                return cached.Identity;
             }
 
             throw new HubException(AuthDeniedMessage);
@@ -250,9 +356,10 @@ public sealed class GatewayHub : Hub
 
         if (decision.Allowed)
         {
-            // The identity (may be null) rides with the cached allow for phase 3 to use.
+            // The identity (may be null) rides with the cached allow and is recorded on the
+            // membership so SendToChannel can stamp forwards with who sent them (task #611).
             _decisions.StoreAllow(connectionId, channel, decision.Identity);
-            return;
+            return decision.Identity;
         }
 
         // Key the deny on this credential so a later retry with a different one is not blocked.

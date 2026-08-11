@@ -110,6 +110,7 @@ public static class RealtimeApplicationExtensions
             HttpContext context,
             IChannelEventPublisher publisher,
             IChannelOwnershipResolver ownership,
+            PublishRateLimiter throttle,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(request.Channel))
@@ -164,6 +165,20 @@ public static class RealtimeApplicationExtensions
                 return Results.Json(
                     new { error = $"The {RealtimePublishToken.Header} header does not authorize publishing to '{request.Channel}'." },
                     statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            // Per-service publish throttle (task #611, item 4): a token bucket keyed on the
+            // owning service caps its publish volume so one chatty service cannot exhaust the
+            // hub for everyone. Checked only after the token authorizes the caller, so an
+            // unauthorized request (already 403'd above) never consumes the service's budget.
+            // Over budget → 429 with Retry-After (whole seconds, floored at 1).
+            if (!throttle.TryTake(owner.Service, out var retryAfter))
+            {
+                var seconds = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
+                context.Response.Headers.RetryAfter = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return Results.Json(
+                    new { error = $"Publish rate limit exceeded for service '{owner.Service}'; retry after {seconds}s." },
+                    statusCode: StatusCodes.Status429TooManyRequests);
             }
 
             await publisher.PublishAsync(request.Channel, request.Event, request.Payload, ct);
