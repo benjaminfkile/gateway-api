@@ -183,6 +183,18 @@ foreach (var entry in canonicalCors)
     }
 }
 
+// If GATEWAY_CORS_ORIGINS was SET but canonicalization dropped every entry, the "ops"
+// policy above was silently not registered and /mgmt became same-origin-only with no
+// browser-visible error (review finding). That total-loss mode deserves a louder
+// signal than the per-entry warnings.
+if (canonicalCors.Count > 0 && corsOrigins.Length == 0)
+{
+    app.Logger.LogError(
+        "GATEWAY_CORS_ORIGINS was configured but every entry was dropped by canonicalization; "
+        + "the 'ops' CORS policy is NOT registered and /mgmt will reject all cross-origin "
+        + "browser requests. Fix the entries (absolute http(s) origins, no path/wildcard).");
+}
+
 // Keep the public and internal listeners' surfaces disjoint before any endpoint
 // runs (tech-spec §8): /internal/* only on the internal port, nothing else there.
 app.UseInternalListenerIsolation();

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Gateway.Api.Containers;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
@@ -284,6 +285,18 @@ public sealed class ReconcilerService : BackgroundService
             // A heartbeat failure must not crash the loop; the next tick retries.
             _logger.LogError(ex, "Failed to publish instance_status heartbeat");
         }
+        finally
+        {
+            // Record the LOSS edge unconditionally (review follow-up to #608 finding 4):
+            // only the gain edge must survive a thrown cycle. If a failing cycle also
+            // left _wasLeader=true while leadership was actually lost, a later
+            // re-acquisition would read becameLeader=false and never announce the new
+            // term — the inverse of the bug the try-placement fixed.
+            if (!isLeader)
+            {
+                _wasLeader = false;
+            }
+        }
     }
 
     /// <summary>
@@ -502,7 +515,11 @@ public sealed class ReconcilerService : BackgroundService
         // Persist the terminal failure reason, not just ride it on the fire-and-forget
         // event (task #608 finding 5): events are hints, the store is truth, so GET
         // /mgmt/deploys must return a non-null detail for a timed-out / failed deploy.
-        deploy.Detail = error;
+        // deploy_history.detail is a jsonb column on Postgres (jsonb-as-string, spec
+        // §3): a bare string is not valid jsonb and makes SaveChanges throw 22P02 in
+        // production (Sqlite tests map it as text and can't catch this), wedging the
+        // deploy in_progress forever — so wrap the reason in a JSON object.
+        deploy.Detail = error is null ? null : JsonSerializer.Serialize(new { error });
         await store.UpdateAsync(deploy, ct);
 
         _publisher?.TryPublish(ManagementEndpoints.OpsDeploysChannel, "deploy", new

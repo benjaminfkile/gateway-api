@@ -163,7 +163,7 @@ public class HubCorsTests
 
         // Advance past the TTL: the next preflight refreshes and the new origin is allowed —
         // no gateway restart.
-        factory.Clock.Now += HubCorsOriginCache.DefaultTtl + TimeSpan.FromSeconds(1);
+        factory.Clock.Now += ManifestSnapshotCache.DefaultTtl + TimeSpan.FromSeconds(1);
         var afterTtl = await client.SendAsync(Preflight("/hub/negotiate", NewOrigin));
         Assert.Equal(NewOrigin, Assert.Single(afterTtl.Headers.GetValues("Access-Control-Allow-Origin")));
     }

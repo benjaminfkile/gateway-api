@@ -69,6 +69,41 @@ public class ManifestSnapshotCacheTests
         public Task DeleteAsync(string name, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
+    [Fact]
+    public async Task RefreshFailure_BeforeFirstLoad_FailsClosed()
+    {
+        // Review finding: the empty pre-first-load seed must never be served as
+        // authoritative — a gateway that has never read the manifest surfaces a
+        // retryable error, not definitive-looking empty state.
+        var (cache, store, _) = Build();
+        store.Services.Add(Service("svc-a"));
+        store.Throw = true;
+
+        await Assert.ThrowsAnyAsync<Exception>(() => cache.GetAsync());
+    }
+
+    [Fact]
+    public async Task RefreshFailure_PastMaxStaleAge_FailsClosed()
+    {
+        // Review finding: serve-stale is bounded. Beyond the max-stale age a failed
+        // refresh throws instead of letting rotated tokens / deleted services /
+        // removed origins keep working on dead state for the whole outage.
+        var (cache, store, clock) = Build();
+        store.Services.Add(Service("svc-a"));
+        await cache.GetAsync(); // first good load
+
+        store.Throw = true;
+
+        // Within the bound: stale is served.
+        clock.Now += ManifestSnapshotCache.DefaultTtl + TimeSpan.FromSeconds(1);
+        var stale = await cache.GetAsync();
+        Assert.Single(stale.Services);
+
+        // Past the bound: fail closed (advance beyond DefaultMaxStaleAge since the load).
+        clock.Now += ManifestSnapshotCache.DefaultMaxStaleAge;
+        await Assert.ThrowsAnyAsync<Exception>(() => cache.GetAsync());
+    }
+
     private static (ManifestSnapshotCache Cache, ControllableStore Store, ManualTimeProvider Clock) Build()
     {
         var store = new ControllableStore();

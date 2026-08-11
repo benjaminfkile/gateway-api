@@ -221,6 +221,15 @@ public sealed class GatewayHub : Hub
             throw new HubException(AuthDeniedMessage);
         }
 
+        // Rate floor (review finding): denies are keyed per-credential, so a loop over
+        // VARYING credentials always misses the deny cache — without this cap it would
+        // reach the owner's auth endpoint once per round-trip. Over budget → deny
+        // without a callback and without caching (the window itself is the block).
+        if (!_decisions.TryRecordAuthAttempt(connectionId, channel))
+        {
+            throw new HubException(AuthDeniedMessage);
+        }
+
         // Cap concurrent in-flight callbacks per connection at one: a join-loop cannot
         // hold multiple 2s downstream slots. If a callback is already running for this
         // connection, fail closed without caching — the in-flight one decides the join.

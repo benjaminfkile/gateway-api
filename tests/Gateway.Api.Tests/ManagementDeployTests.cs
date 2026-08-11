@@ -757,4 +757,59 @@ public class ManagementDeployTests
 
         Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
     }
+
+    [Fact]
+    public async Task Put_MinimalReupsert_PreservesEnvSecretRefDesiredStatusAndHealth()
+    {
+        // Review finding: the tri-state merge must be an upsert-wide rule, not a
+        // per-field patch. A pre-phase-2 CI pipeline PUTting only {image, tag, port}
+        // must not strip the secret ref (next reconcile would recreate the container
+        // without its DB credentials), restart a stopped service, or flip health.
+        await using var factory = new ManagementApiFactory();
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+
+        var created = await client.PutAsJsonAsync("/mgmt/services/svc-keep", new
+        {
+            image = "repo/app",
+            tag = "v1",
+            port = 8080,
+            includeInHealth = true,
+            envSecretRef = "app-secrets-dev",
+            desiredStatus = "stopped",
+        });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+
+        // The minimal CI-shaped re-upsert: none of the preserved fields present.
+        var minimal = await client.PutAsJsonAsync("/mgmt/services/svc-keep", new
+        {
+            image = "repo/app",
+            tag = "v2",
+            port = 8080,
+        });
+        Assert.Equal(HttpStatusCode.OK, minimal.StatusCode);
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-keep");
+            Assert.Equal("app-secrets-dev", m.EnvSecretRef);
+            Assert.Equal("stopped", m.DesiredStatus);
+            Assert.True(m.IncludeInHealth);
+        });
+
+        // Explicit empty string CLEARS the ref (the dashboard's clear-field path).
+        var cleared = await client.PutAsJsonAsync("/mgmt/services/svc-keep", new
+        {
+            image = "repo/app",
+            tag = "v2",
+            port = 8080,
+            envSecretRef = "",
+        });
+        Assert.Equal(HttpStatusCode.OK, cleared.StatusCode);
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-keep");
+            Assert.Null(m.EnvSecretRef);
+        });
+    }
 }

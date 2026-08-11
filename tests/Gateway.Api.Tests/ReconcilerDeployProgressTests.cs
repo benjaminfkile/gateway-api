@@ -444,8 +444,11 @@ public class ReconcilerDeployProgressTests
 
         var deploy = Assert.Single(harness.DeployStore.History);
         Assert.Equal(DeployStatus.Failed, deploy.Status);
-        // The reason is persisted on the stored row, not only broadcast.
-        Assert.Equal("deploy timed out", deploy.Detail);
+        // The reason is persisted on the stored row, not only broadcast — wrapped in a
+        // JSON object because deploy_history.detail is jsonb on Postgres: a bare string
+        // is invalid jsonb and would throw 22P02 in production, which Sqlite-backed
+        // tests cannot catch (review finding), so this asserts the exact stored JSON.
+        Assert.Equal("""{"error":"deploy timed out"}""", deploy.Detail);
     }
 
     [Fact]

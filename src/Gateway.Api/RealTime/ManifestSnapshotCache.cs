@@ -36,6 +36,17 @@ public sealed class ManifestSnapshotCache
     /// <summary>How long a failed refresh suppresses further store probes.</summary>
     public static readonly TimeSpan DefaultRetryBackoff = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Upper bound on how stale a served snapshot may be. Serve-stale exists to ride out
+    /// a transient DB blip, not to run open-ended on dead state: manifest rows carry
+    /// security-relevant data (publish tokens, auth paths, CORS origins), so past this
+    /// age a failed refresh FAILS CLOSED (throws) instead of letting a rotated token or
+    /// deleted service keep working for the whole outage (review finding). The same rule
+    /// rejects the empty pre-first-load seed — a gateway that never managed to read the
+    /// manifest must surface retryable errors, not authoritative-looking empty state.
+    /// </summary>
+    public static readonly TimeSpan DefaultMaxStaleAge = TimeSpan.FromMinutes(5);
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TimeSpan _ttl;
     private readonly TimeSpan _retryBackoff;
@@ -59,14 +70,22 @@ public sealed class ManifestSnapshotCache
         IServiceScopeFactory scopeFactory,
         TimeSpan? ttl = null,
         TimeProvider? clock = null,
-        ILogger<ManifestSnapshotCache>? logger = null)
+        ILogger<ManifestSnapshotCache>? logger = null,
+        TimeSpan? maxStaleAge = null)
     {
         _scopeFactory = scopeFactory;
         _ttl = ttl ?? DefaultTtl;
         _retryBackoff = DefaultRetryBackoff;
         _clock = clock ?? TimeProvider.System;
         _logger = logger;
+        _maxStaleAge = maxStaleAge ?? DefaultMaxStaleAge;
     }
+
+    private readonly TimeSpan _maxStaleAge;
+
+    /// <summary>True when this snapshot may still be served in lieu of a fresh read.</summary>
+    private bool IsServableStale(Snapshot snapshot, DateTimeOffset now) =>
+        snapshot.TakenAt != DateTimeOffset.MinValue && now - snapshot.TakenAt <= _maxStaleAge;
 
     /// <summary>
     /// The current manifest snapshot, refreshing it when the cached one has aged past
@@ -98,8 +117,16 @@ public sealed class ManifestSnapshotCache
             {
                 // Inside the retry backoff after a failed refresh: serve the stale
                 // snapshot without touching the store, so a hard-down DB is probed
-                // once per backoff rather than once per request.
-                return current;
+                // once per backoff rather than once per request — but only within the
+                // max-stale bound, and never the pre-first-load empty seed.
+                if (IsServableStale(current, now))
+                {
+                    return current;
+                }
+
+                throw new InvalidOperationException(
+                    "Manifest snapshot is unavailable: the store is unreachable and no "
+                    + "recent-enough snapshot exists to serve (failing closed).");
             }
             else
             {
@@ -142,13 +169,30 @@ public sealed class ManifestSnapshotCache
             lock (_gate)
             {
                 _inFlight = null;
-                _nextRefreshAt = _clock.GetUtcNow() + _retryBackoff;
+                var now = _clock.GetUtcNow();
+                _nextRefreshAt = now + _retryBackoff;
                 var stale = _snapshot;
+
+                // Bounded serve-stale (review finding): beyond the max-stale age — or
+                // before the first successful load — fail closed rather than letting
+                // rotated tokens / deleted services / removed origins keep working on
+                // dead state, or serving the empty seed as authoritative.
+                if (!IsServableStale(stale, now))
+                {
+                    _logger?.LogError(
+                        ex,
+                        "Manifest snapshot refresh failed and no servable snapshot exists "
+                        + "(never loaded, or older than {MaxStaleAge}); failing closed.",
+                        _maxStaleAge);
+                    throw;
+                }
+
                 _logger?.LogWarning(
                     ex,
-                    "Manifest snapshot refresh failed; serving {Count} cached service(s) (stale) "
-                    + "until the next probe after {Backoff}.",
+                    "Manifest snapshot refresh failed; serving {Count} cached service(s) (stale, "
+                    + "age-capped at {MaxStaleAge}) until the next probe after {Backoff}.",
                     stale.Services.Count,
+                    _maxStaleAge,
                     _retryBackoff);
                 return stale;
             }

@@ -231,6 +231,32 @@ public class ChannelAuthDecisionCacheTests
         Assert.Null(cache.TryGet("conn-1", "svc-a:room"));
     }
 
+    [Fact]
+    public void AuthAttemptRateFloor_CapsWithinWindow_ResetsAfter()
+    {
+        // Review finding: denies are keyed per-credential, so a varying-credential
+        // brute-force loop always misses the deny cache — the attempt window is what
+        // stops it reaching the owner's auth endpoint once per round-trip.
+        var clock = new TestClock();
+        var cache = new ChannelAuthDecisionCache(clock, attemptWindow: TimeSpan.FromSeconds(10));
+
+        for (var i = 0; i < ChannelAuthDecisionCache.MaxAuthAttemptsPerWindow; i++)
+        {
+            Assert.True(cache.TryRecordAuthAttempt("conn-1", "svc-a:room"));
+        }
+
+        // Over budget inside the window: refused without any callback.
+        Assert.False(cache.TryRecordAuthAttempt("conn-1", "svc-a:room"));
+
+        // A different channel (and a different connection) each have their own budget.
+        Assert.True(cache.TryRecordAuthAttempt("conn-1", "svc-a:other"));
+        Assert.True(cache.TryRecordAuthAttempt("conn-2", "svc-a:room"));
+
+        // The window lapses: attempts are allowed again.
+        clock.Now += TimeSpan.FromSeconds(11);
+        Assert.True(cache.TryRecordAuthAttempt("conn-1", "svc-a:room"));
+    }
+
     // ---- minimal stubs (this project carries no Moq) ----
 
     private sealed class StubContext : HubCallerContext

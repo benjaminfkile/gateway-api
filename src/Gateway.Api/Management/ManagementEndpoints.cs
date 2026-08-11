@@ -36,7 +36,7 @@ public sealed record UpsertServiceRequest(
     int Port,
     string? DesiredStatus,
     string? EnvSecretRef,
-    bool IncludeInHealth,
+    bool? IncludeInHealth = null,
     string? RealtimeAuthPath = null,
     string? RealtimeAllowedOrigins = null);
 
@@ -409,11 +409,20 @@ public static partial class ManagementEndpoints
             // digest only while image+tag are unchanged (see above).
             Digest = imageOrTagChanged ? null : existing?.Digest,
             Port = request.Port,
-            DesiredStatus = string.IsNullOrWhiteSpace(request.DesiredStatus) ? "running" : request.DesiredStatus,
-            EnvSecretRef = request.EnvSecretRef,
+            // The same merge policy as the realtime fields (review finding: the
+            // tri-state fix was applied per-field, not as an upsert-wide rule): a
+            // minimal {image, tag, port} re-upsert must never silently restart a
+            // stopped service, strip its secret ref, or flip health inclusion.
+            DesiredStatus = string.IsNullOrWhiteSpace(request.DesiredStatus)
+                ? existing?.DesiredStatus ?? "running"
+                : request.DesiredStatus,
+            // Tri-state: absent preserves, empty string clears, non-empty sets.
+            EnvSecretRef = request.EnvSecretRef is null
+                ? existing?.EnvSecretRef
+                : (request.EnvSecretRef.Trim().Length == 0 ? null : request.EnvSecretRef.Trim()),
             RealtimeAuthPath = authPath,
             RealtimeAllowedOrigins = allowedOrigins,
-            IncludeInHealth = request.IncludeInHealth,
+            IncludeInHealth = request.IncludeInHealth ?? existing?.IncludeInHealth ?? true,
             UpdatedBy = ManagementAuth.ResolveUsername(user),
             UpdatedAt = DateTimeOffset.UtcNow,
         };

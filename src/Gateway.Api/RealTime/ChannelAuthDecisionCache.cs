@@ -46,8 +46,12 @@ public sealed class ChannelAuthDecisionCache
     public static readonly TimeSpan DefaultDenialTtl = TimeSpan.FromSeconds(10);
 
     /// <summary>
-    /// How long an allow is honoured before a re-auth is forced. Finite so a revoked
-    /// credential cannot ride a long-lived connection forever (documented in REALTIME.md).
+    /// How long an allow is honoured before a RE-JOIN forces re-authorization. This bounds
+    /// auth-callback load and makes voluntary re-joins re-check the credential — it does
+    /// NOT revoke access mid-connection: SignalR group membership granted at join time
+    /// keeps delivering until the socket closes (review finding; REALTIME.md documents
+    /// this honestly). Mid-connection revocation needs membership tracking +
+    /// RemoveFromGroupAsync, which arrives with the phase 3 presence registry.
     /// </summary>
     public static readonly TimeSpan DefaultAllowTtl = TimeSpan.FromMinutes(15);
 
@@ -60,6 +64,18 @@ public sealed class ChannelAuthDecisionCache
 
     /// <summary>Max distinct decisions cached per connection; the oldest is evicted past this.</summary>
     public const int MaxEntriesPerConnection = 64;
+
+    /// <summary>
+    /// Max delegated-auth callback attempts per <c>(connection, channel)</c> per
+    /// <see cref="DefaultAttemptWindow"/>. Keying denies on the credential (task #608
+    /// finding 1) means a varying-credential loop is always a deny-cache miss, so this
+    /// rate floor — not the deny TTL — is what keeps a brute-force loop from reaching
+    /// the owner's auth endpoint once per round-trip (review finding).
+    /// </summary>
+    public const int MaxAuthAttemptsPerWindow = 5;
+
+    /// <summary>Window over which delegated-auth callback attempts are counted.</summary>
+    public static readonly TimeSpan DefaultAttemptWindow = TimeSpan.FromSeconds(10);
 
     private readonly TimeProvider _clock;
     private readonly TimeSpan _denialTtl;
@@ -82,6 +98,10 @@ public sealed class ChannelAuthDecisionCache
     // connection cannot hold multiple 2s downstream slots at once.
     private readonly ConcurrentDictionary<string, int> _inFlight = new(StringComparer.Ordinal);
 
+    // (connectionId NUL channel) -> sliding attempt window for the callback rate floor.
+    // Entries self-expire after the window and are also cleared by the sweep.
+    private readonly ConcurrentDictionary<string, AttemptWindow> _attempts = new(StringComparer.Ordinal);
+
     // Next time an amortized sweep is due; claimed with CompareExchange so at most one
     // caller sweeps per interval (no dedicated timer — piggybacks on access).
     private long _nextSweepTicks;
@@ -90,13 +110,63 @@ public sealed class ChannelAuthDecisionCache
         TimeProvider? clock = null,
         TimeSpan? denialTtl = null,
         TimeSpan? allowTtl = null,
-        TimeSpan? tombstoneTtl = null)
+        TimeSpan? tombstoneTtl = null,
+        TimeSpan? attemptWindow = null)
     {
         _clock = clock ?? TimeProvider.System;
         _denialTtl = denialTtl ?? DefaultDenialTtl;
         _allowTtl = allowTtl ?? DefaultAllowTtl;
         _tombstoneTtl = tombstoneTtl ?? DefaultTombstoneTtl;
+        _attemptWindow = attemptWindow ?? DefaultAttemptWindow;
         _nextSweepTicks = (_clock.GetUtcNow() + _sweepInterval).UtcTicks;
+    }
+
+    private readonly TimeSpan _attemptWindow;
+
+    /// <summary>
+    /// Record one delegated-auth callback attempt for this pair and report whether it is
+    /// within budget. Returns <c>false</c> once <see cref="MaxAuthAttemptsPerWindow"/>
+    /// attempts have landed inside the current window — the caller must then deny WITHOUT
+    /// consulting the owning service. This is the brute-force floor the per-credential
+    /// deny key cannot provide (a varying credential always misses the deny cache).
+    /// </summary>
+    public bool TryRecordAuthAttempt(string connectionId, string channel)
+    {
+        var key = connectionId + "\0" + channel;
+        var now = _clock.GetUtcNow();
+        while (true)
+        {
+            if (!_attempts.TryGetValue(key, out var window))
+            {
+                if (_attempts.TryAdd(key, new AttemptWindow(now, 1)))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (now - window.StartedAt >= _attemptWindow)
+            {
+                // Window lapsed; start a fresh one.
+                if (_attempts.TryUpdate(key, new AttemptWindow(now, 1), window))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (window.Count >= MaxAuthAttemptsPerWindow)
+            {
+                return false;
+            }
+
+            if (_attempts.TryUpdate(key, window with { Count = window.Count + 1 }, window))
+            {
+                return true;
+            }
+        }
     }
 
     /// <summary>
@@ -178,7 +248,8 @@ public sealed class ChannelAuthDecisionCache
         if (updated > 1)
         {
             // Someone already holds the slot; roll back our increment and refuse.
-            _inFlight.AddOrUpdate(connectionId, 0, (_, current) => current > 0 ? current - 1 : 0);
+            // (Same remove-at-zero rule as EndAuthCallback — never store a 0.)
+            DecrementInFlight(connectionId);
             return false;
         }
 
@@ -186,8 +257,32 @@ public sealed class ChannelAuthDecisionCache
     }
 
     /// <summary>Release the in-flight auth-callback slot claimed by <see cref="TryBeginAuthCallback"/>.</summary>
-    public void EndAuthCallback(string connectionId) =>
-        _inFlight.AddOrUpdate(connectionId, 0, (_, current) => current > 0 ? current - 1 : 0);
+    public void EndAuthCallback(string connectionId) => DecrementInFlight(connectionId);
+
+    /// <summary>
+    /// Decrement a connection's in-flight count, REMOVING the entry at zero instead of
+    /// storing 0. AddOrUpdate here would re-insert an entry that <see cref="Drop"/> already
+    /// removed (disconnect racing an in-flight callback) — connection ids are never reused,
+    /// so that zero-valued entry would live for the process lifetime (review finding).
+    /// </summary>
+    private void DecrementInFlight(string connectionId)
+    {
+        while (_inFlight.TryGetValue(connectionId, out var current))
+        {
+            var next = current > 1 ? current - 1 : 0;
+            if (next == 0)
+            {
+                if (_inFlight.TryRemove(new KeyValuePair<string, int>(connectionId, current)))
+                {
+                    return;
+                }
+            }
+            else if (_inFlight.TryUpdate(connectionId, next, current))
+            {
+                return;
+            }
+        }
+    }
 
     private void Store(string connectionId, string key, Entry entry)
     {
@@ -302,6 +397,24 @@ public sealed class ChannelAuthDecisionCache
                 _tombstones.TryRemove(connId, out _);
             }
         }
+
+        // Expired attempt windows (rate floor) and any zero-valued in-flight stragglers:
+        // belt-and-braces so neither map can grow for the process lifetime.
+        foreach (var (key, window) in _attempts)
+        {
+            if (now - window.StartedAt >= _attemptWindow)
+            {
+                _attempts.TryRemove(new KeyValuePair<string, AttemptWindow>(key, window));
+            }
+        }
+
+        foreach (var (connId, count) in _inFlight)
+        {
+            if (count <= 0)
+            {
+                _inFlight.TryRemove(new KeyValuePair<string, int>(connId, count));
+            }
+        }
     }
 
     /// <summary>Inner key for a credential-independent allow.</summary>
@@ -327,4 +440,6 @@ public sealed class ChannelAuthDecisionCache
     }
 
     private readonly record struct Entry(ChannelAuthDecision Decision, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt);
+
+    private readonly record struct AttemptWindow(DateTimeOffset StartedAt, int Count);
 }

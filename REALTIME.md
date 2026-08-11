@@ -248,10 +248,15 @@ and admits the join only if you allow it. Exact contract:
   (`"Not authorized to join this channel."`) that reveals nothing about why or
   whether the channel exists.
 - **Caching.** An *allow* is cached per `(connection, channel)` for a finite window
-  (~15 minutes), then a re-join re-authorizes — so a credential you later revoke cannot
-  ride a long-lived connection indefinitely, and your callback must work idempotently and
+  (~15 minutes), then a re-join re-authorizes. Your callback must work idempotently and
   expect to be called again (after that window, on any reconnect, or when a client presents
   a new credential). A reconnect gets a new connection id and re-authorizes from scratch.
+  **Honest limitation:** the window bounds *re-join* authorization, not access duration —
+  a client already admitted to a channel keeps receiving its events until its connection
+  closes, even if you revoke the credential mid-connection. If you must cut off an admitted
+  client immediately, revoke on your side AND force the disconnect (the gateway closes
+  connections when the Cognito-level token expires, but your app-level credential is opaque
+  to it). Mid-connection channel eviction is planned alongside presence (phase 3).
   A *deny* is cached only briefly (~10s) and is keyed to the exact credential that was
   rejected: a client that immediately retries with a **different, now-valid** credential
   (the normal token-refresh flow) reaches your callback again rather than being blocked for
@@ -362,9 +367,12 @@ never to "the UI is permanently wrong."
   message size (32,768 bytes). Keep published payloads small — remember payloads
   are hints, so prefer sending an id the client re-fetches over embedding a large
   object.
-- **No rate limiting yet.** There is currently no throttle on publishes or joins
-  (planned for phase 3). Do not assume the gateway will protect you from your own
-  publish volume — self-limit chatty event sources.
+- **Rate limiting is minimal.** Private-channel join *auth callbacks* are capped per
+  connection+channel (a handful of attempts per ~10s window, plus at most one in-flight
+  callback per connection), so a credential-guessing loop cannot hammer your auth
+  endpoint through the gateway. There is no throttle on *publishes* (planned for
+  phase 3) — do not assume the gateway will protect you from your own publish
+  volume; self-limit chatty event sources.
 - **No presence yet.** The hub does not tell you who is connected or subscribed,
   and there are no join/leave notifications to other clients (planned for phase
   3). Do not build presence/"who's online" features on the hub today.
