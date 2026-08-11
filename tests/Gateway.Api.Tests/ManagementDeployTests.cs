@@ -369,6 +369,133 @@ public class ManagementDeployTests
     }
 
     [Fact]
+    public async Task Put_SetsRealtimeMessagePath_PersistsAndReturned()
+    {
+        // task #611: realtime_message_path is a first-class manifest field — settable on
+        // upsert and, like the auth path, returned by GET /mgmt/services (not a secret;
+        // null = full-duplex off, non-null = client SendToChannel is forwarded to this path).
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            realtimeMessagePath = "/realtime/message",
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("/realtime/message", created.GetProperty("realtimeMessagePath").GetString());
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Equal("/realtime/message", m.RealtimeMessagePath);
+        });
+
+        var list = await client.GetFromJsonAsync<JsonElement>("/mgmt/services");
+        var svc = list.EnumerateArray().Single(s => s.GetProperty("name").GetString() == "svc-new");
+        Assert.Equal("/realtime/message", svc.GetProperty("realtimeMessagePath").GetString());
+    }
+
+    [Fact]
+    public async Task Put_NoRealtimeMessagePath_DefaultsNull_FullDuplexOff()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(JsonValueKind.Null, created.GetProperty("realtimeMessagePath").ValueKind);
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Null(m.RealtimeMessagePath);
+        });
+    }
+
+    [Fact]
+    public async Task Put_RealtimeMessagePath_NotRooted_Returns400()
+    {
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            realtimeMessagePath = "https://evil.example/message",
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Put_OmitsRealtimeMessagePath_PreservesExisting()
+    {
+        // task #611: the same tri-state as the auth path — a minimal re-upsert must not
+        // silently disable full-duplex messaging.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest(
+            "svc-a", port: 8080, realtimeMessagePath: "/realtime/message"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 9090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("/realtime/message", m.RealtimeMessagePath);
+        });
+    }
+
+    [Fact]
+    public async Task Put_EmptyRealtimeMessagePath_ClearsIt()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest(
+            "svc-a", realtimeMessagePath: "/realtime/message"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+            realtimeMessagePath = "",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Null(m.RealtimeMessagePath);
+        });
+    }
+
+    [Fact]
     public async Task Put_SetsRealtimeAllowedOrigins_NormalizesPersistsAndReturned()
     {
         // task #595: realtime_allowed_origins is settable on upsert and, like the auth

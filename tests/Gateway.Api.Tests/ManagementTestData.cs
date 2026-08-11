@@ -15,6 +15,7 @@ public static class ManagementTestData
         string desiredStatus = "running",
         string tag = "latest",
         string? realtimeAuthPath = null,
+        string? realtimeMessagePath = null,
         string? realtimeAllowedOrigins = null,
         string? realtimePublishToken = null) => new()
     {
@@ -26,6 +27,7 @@ public static class ManagementTestData
         DesiredStatus = desiredStatus,
         IncludeInHealth = includeInHealth,
         RealtimeAuthPath = realtimeAuthPath,
+        RealtimeMessagePath = realtimeMessagePath,
         RealtimeAllowedOrigins = realtimeAllowedOrigins,
         RealtimePublishToken = realtimePublishToken,
         UpdatedBy = "seed",

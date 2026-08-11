@@ -58,18 +58,28 @@ public sealed class InternalPublishTests
         UpdatedAt = DateTimeOffset.UnixEpoch,
     };
 
-    private static async Task<Gateway> StartGatewayAsync()
+    private static async Task<Gateway> StartGatewayAsync(
+        IDictionary<string, string?>? extraConfig = null)
     {
         var publicPort = GetFreePort();
         var internalPort = GetFreePort();
 
-        var builder = WebApplication.CreateBuilder();
-        builder.Logging.ClearProviders();
-        builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        var config = new Dictionary<string, string?>
         {
             ["urls"] = $"http://127.0.0.1:{publicPort}",
             [InternalListenerOptions.BindEnvVar] = $"127.0.0.1:{internalPort}",
-        });
+        };
+        if (extraConfig is not null)
+        {
+            foreach (var (k, v) in extraConfig)
+            {
+                config[k] = v;
+            }
+        }
+
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.Configuration.AddInMemoryCollection(config);
 
         builder.AddGatewayInternalListener();
         builder.Services.AddGatewayRealtime(builder.Configuration);
@@ -217,6 +227,34 @@ public sealed class InternalPublishTests
         var response = await PublishAsync(gateway, "svc-b:events", new { id = "b-1" }, TokenB);
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task InternalPublish_OverBudget_429_WithRetryAfter()
+    {
+        // Task #611 item 4: a per-service publish throttle. Configure a tiny burst so a rapid
+        // run of authorized publishes trips it, returning 429 with a Retry-After header.
+        await using var gateway = await StartGatewayAsync(new Dictionary<string, string?>
+        {
+            [RealtimeRateLimitOptions.PublishRateEnvVar] = "1",
+            [RealtimeRateLimitOptions.PublishBurstEnvVar] = "3",
+        });
+
+        // The burst of 3 succeeds; the 4th within the same instant is over budget.
+        for (var i = 0; i < 3; i++)
+        {
+            var ok = await PublishAsync(gateway, "svc-a:orders", new { i }, TokenA);
+            Assert.Equal(HttpStatusCode.Accepted, ok.StatusCode);
+        }
+
+        var throttled = await PublishAsync(gateway, "svc-a:orders", new { i = 3 }, TokenA);
+        Assert.Equal(HttpStatusCode.TooManyRequests, throttled.StatusCode);
+        Assert.True(throttled.Headers.TryGetValues("Retry-After", out var values));
+        Assert.False(string.IsNullOrWhiteSpace(values!.First()));
+
+        // The throttle is per service: svc-b has its own untouched budget.
+        var other = await PublishAsync(gateway, "svc-b:events", new { i = 0 }, TokenB);
+        Assert.Equal(HttpStatusCode.Accepted, other.StatusCode);
     }
 
     [Fact]

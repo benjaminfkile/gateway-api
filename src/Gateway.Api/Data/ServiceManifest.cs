@@ -60,6 +60,22 @@ public class ServiceManifest
     public string? RealtimeAuthPath { get; set; }
 
     /// <summary>
+    /// Optional path on the service that receives messages sent FROM its connected
+    /// clients through the hub (tech-spec §4.2, task #611 — the full-duplex companion to
+    /// <see cref="RealtimeAuthPath"/>). Null means this feature is <b>off</b> for the
+    /// service: a client's <c>SendToChannel</c> to any <c>{Name}:{topic}</c> channel is
+    /// rejected. Non-null opts the service in — every <c>SendToChannel</c> the gateway
+    /// accepts is POSTed as <c>{ channel, event, data, connectionId, identity }</c> to
+    /// this path on the service (resolved through the same host-loopback + learned-host-port
+    /// mechanism the auth callback and health prober use). The gateway never broadcasts the
+    /// message itself: if the owner wants fan-out it publishes via <c>/internal/publish</c>.
+    /// Like the auth path this is not a secret, so it is returned by
+    /// <c>GET /mgmt/services</c> and settable via the upsert endpoint (same tri-state
+    /// semantics: absent preserves, empty string clears, non-empty sets a rooted path).
+    /// </summary>
+    public string? RealtimeMessagePath { get; set; }
+
+    /// <summary>
     /// Optional comma-separated list of exact browser origins (e.g.
     /// <c>https://chat.example.com,https://app.example.com</c>) that this service's
     /// frontend negotiates its SignalR connection from (tech-spec §4.2, task #595).

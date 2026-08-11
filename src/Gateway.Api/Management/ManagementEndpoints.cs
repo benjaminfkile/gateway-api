@@ -18,8 +18,8 @@ public sealed record DeployRequest(string? Tag);
 /// <summary>
 /// Body of <c>PUT /mgmt/services/{name}</c> (create/update a manifest entry).
 /// <para>
-/// The two realtime security fields — <see cref="RealtimeAuthPath"/> and
-/// <see cref="RealtimeAllowedOrigins"/> — are tri-state on an edit so a minimal
+/// The realtime fields — <see cref="RealtimeAuthPath"/>, <see cref="RealtimeMessagePath"/>,
+/// and <see cref="RealtimeAllowedOrigins"/> — are tri-state on an edit so a minimal
 /// re-upsert (e.g. a pre-phase-2 CI workflow re-pushing only <c>image/tag/port</c>)
 /// can never silently strip them:
 /// <list type="bullet">
@@ -38,6 +38,7 @@ public sealed record UpsertServiceRequest(
     string? EnvSecretRef,
     bool? IncludeInHealth = null,
     string? RealtimeAuthPath = null,
+    string? RealtimeMessagePath = null,
     string? RealtimeAllowedOrigins = null);
 
 /// <summary>
@@ -370,6 +371,30 @@ public static partial class ManagementEndpoints
             }
         }
 
+        // realtime_message_path (task #611) is a path on the service that receives messages
+        // sent FROM its clients via the hub's SendToChannel. Same tri-state + rooted-path
+        // validation as the auth path: null/absent PRESERVES the stored value (a minimal
+        // re-upsert never silently disables full-duplex messaging), empty string CLEARS it,
+        // a non-empty value must be a rooted path (so it can never smuggle an absolute URL
+        // into the forward) and is set.
+        string? messagePath;
+        if (request.RealtimeMessagePath is null)
+        {
+            messagePath = existing?.RealtimeMessagePath;
+        }
+        else
+        {
+            messagePath = request.RealtimeMessagePath.Trim();
+            if (messagePath.Length == 0)
+            {
+                messagePath = null;
+            }
+            else if (!messagePath.StartsWith('/'))
+            {
+                return Results.BadRequest(new { error = "realtimeMessagePath must be a rooted path beginning with '/'." });
+            }
+        }
+
         // realtime_allowed_origins (task #595) is the comma-separated set of exact
         // browser origins whose frontends may negotiate /hub for this service. Same
         // tri-state as the auth path: null/absent PRESERVES the stored origins (so a
@@ -421,6 +446,7 @@ public static partial class ManagementEndpoints
                 ? existing?.EnvSecretRef
                 : (request.EnvSecretRef.Trim().Length == 0 ? null : request.EnvSecretRef.Trim()),
             RealtimeAuthPath = authPath,
+            RealtimeMessagePath = messagePath,
             RealtimeAllowedOrigins = allowedOrigins,
             IncludeInHealth = request.IncludeInHealth ?? existing?.IncludeInHealth ?? true,
             UpdatedBy = ManagementAuth.ResolveUsername(user),
@@ -704,6 +730,9 @@ public static partial class ManagementEndpoints
             // Non-secret (unlike the publish token): null = public channels, non-null =
             // every JoinChannel for this service triggers its auth callback (task #594).
             realtimeAuthPath = m.RealtimeAuthPath,
+            // Non-secret (task #611): null = full-duplex SendToChannel off for this service,
+            // non-null = client messages are forwarded to this path on the service.
+            realtimeMessagePath = m.RealtimeMessagePath,
             // Non-secret consumer-origin allowlist for /hub CORS (task #595); null when
             // the service contributes no origins.
             realtimeAllowedOrigins = m.RealtimeAllowedOrigins,
