@@ -84,6 +84,31 @@ public class InMemoryPresenceRegistryTests
     }
 
     [Fact]
+    public async Task LocalMemberships_EnumeratesEveryChannelConnectionPair()
+    {
+        // Single instance: every membership is local, so the eviction sweep (task #613) sees
+        // every (channel, connectionId) pair it holds — one row per membership.
+        var registry = new InMemoryPresenceRegistry();
+        await registry.AddAsync("svc-a:one", "conn-1", "id");
+        await registry.AddAsync("svc-a:two", "conn-1", "id");
+        await registry.AddAsync("svc-a:one", "conn-2", null);
+
+        var memberships = await registry.LocalMembershipsAsync();
+
+        Assert.Equal(3, memberships.Count);
+        Assert.Contains(new ChannelMembership("svc-a:one", "conn-1"), memberships);
+        Assert.Contains(new ChannelMembership("svc-a:two", "conn-1"), memberships);
+        Assert.Contains(new ChannelMembership("svc-a:one", "conn-2"), memberships);
+    }
+
+    [Fact]
+    public async Task LocalMemberships_Empty_WhenNothingJoined()
+    {
+        var registry = new InMemoryPresenceRegistry();
+        Assert.Empty(await registry.LocalMembershipsAsync());
+    }
+
+    [Fact]
     public async Task ReAdd_KeepsFirstJoinedAt_RefreshesIdentity()
     {
         var clock = new ManualTimeProvider { Now = DateTimeOffset.UnixEpoch };

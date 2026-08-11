@@ -46,12 +46,14 @@ public sealed class ChannelAuthDecisionCache
     public static readonly TimeSpan DefaultDenialTtl = TimeSpan.FromSeconds(10);
 
     /// <summary>
-    /// How long an allow is honoured before a RE-JOIN forces re-authorization. This bounds
-    /// auth-callback load and makes voluntary re-joins re-check the credential — it does
-    /// NOT revoke access mid-connection: SignalR group membership granted at join time
-    /// keeps delivering until the socket closes (review finding; REALTIME.md documents
-    /// this honestly). Mid-connection revocation needs membership tracking +
-    /// RemoveFromGroupAsync, which arrives with the phase 3 presence registry.
+    /// How long an allow is honoured before re-authorization is forced. This bounds
+    /// auth-callback load, makes voluntary re-joins re-check the credential AND — since
+    /// task #613 — is the lifetime of mid-connection access: the periodic eviction sweep
+    /// (<see cref="ChannelEvictionSweep"/>) removes an admitted private-channel member from
+    /// its SignalR group once its allow lapses (<see cref="HasValidAllow"/> reports it), then
+    /// signals <c>channelEvicted</c> so a well-behaved client re-joins with a fresh
+    /// credential. So an allow that is not renewed cuts off delivery within roughly this TTL
+    /// plus one sweep interval, rather than lasting the whole connection (REALTIME.md §3).
     /// </summary>
     public static readonly TimeSpan DefaultAllowTtl = TimeSpan.FromMinutes(15);
 
@@ -212,6 +214,24 @@ public sealed class ChannelAuthDecisionCache
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Whether a still-valid (non-expired) allow is currently cached for this
+    /// <c>(connection, channel)</c> pair. Read-only — it neither evicts nor sweeps — so the
+    /// eviction sweep (task #613) can ask "does this admitted private-channel member still
+    /// hold a live allow?" without perturbing the cache: a <c>false</c> means the allow has
+    /// lapsed (or was never present) and the member must be evicted. Ignores denies entirely
+    /// — only a positive allow keeps a member in the group.
+    /// </summary>
+    public bool HasValidAllow(string connectionId, string channel)
+    {
+        if (!_byConnection.TryGetValue(connectionId, out var channels))
+        {
+            return false;
+        }
+
+        return channels.TryGetValue(AllowKey(channel), out var allow) && _clock.GetUtcNow() < allow.ExpiresAt;
     }
 
     /// <summary>Cache an admit for the finite allow TTL (credential-independent).</summary>

@@ -109,4 +109,20 @@ public sealed class InMemoryPresenceRegistry : IPresenceRegistry
 
     public Task<int> CountAsync(string channel, CancellationToken ct = default) =>
         Task.FromResult(_byChannel.TryGetValue(channel, out var connections) ? connections.Count : 0);
+
+    public Task<IReadOnlyList<ChannelMembership>> LocalMembershipsAsync(CancellationToken ct = default)
+    {
+        // Single instance: every membership it holds is local. Snapshot under enumeration —
+        // both maps are moving views — so the eviction sweep iterates a stable list.
+        var memberships = new List<ChannelMembership>();
+        foreach (var (channel, connections) in _byChannel)
+        {
+            foreach (var connectionId in connections.Keys)
+            {
+                memberships.Add(new ChannelMembership(channel, connectionId));
+            }
+        }
+
+        return Task.FromResult<IReadOnlyList<ChannelMembership>>(memberships);
+    }
 }
