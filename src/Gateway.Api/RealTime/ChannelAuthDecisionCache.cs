@@ -328,31 +328,45 @@ public sealed class ChannelAuthDecisionCache
         MaybeSweep();
     }
 
-    /// <summary>Cap per-connection entries, evicting the oldest-created past the limit.</summary>
-    private static void EnforceCap(ConcurrentDictionary<string, Entry> channels)
+    /// <summary>
+    /// Cap per-connection entries. Eviction preference matters (review finding): since
+    /// #613, losing a still-valid ALLOW gets that member force-evicted from its channel
+    /// within one sweep — so a deny-flood must never push out live allows. Evict in
+    /// order: (1) expired entries of any kind, (2) denies (short-lived by design,
+    /// keyed per credential so they are the entries an attacker can mint), and only
+    /// then (3) the oldest allows.
+    /// </summary>
+    private void EnforceCap(ConcurrentDictionary<string, Entry> channels)
     {
         if (channels.Count <= MaxEntriesPerConnection)
         {
             return;
         }
 
-        // Serialize the compound "find oldest + remove" so two stores cannot both under-evict.
+        var now = _clock.GetUtcNow();
+
+        // Serialize the compound "rank + remove" so two stores cannot both under-evict.
         lock (channels)
         {
             while (channels.Count > MaxEntriesPerConnection)
             {
-                string? oldestKey = null;
-                var oldest = DateTimeOffset.MaxValue;
+                string? victim = null;
+                var victimRank = int.MaxValue;
+                var victimAge = DateTimeOffset.MaxValue;
                 foreach (var kv in channels)
                 {
-                    if (kv.Value.CreatedAt < oldest)
+                    var rank = now >= kv.Value.ExpiresAt ? 0 // expired: free to drop
+                        : kv.Key.StartsWith("d\0", StringComparison.Ordinal) ? 1 // live deny
+                        : 2; // live allow — last resort
+                    if (rank < victimRank || (rank == victimRank && kv.Value.CreatedAt < victimAge))
                     {
-                        oldest = kv.Value.CreatedAt;
-                        oldestKey = kv.Key;
+                        victimRank = rank;
+                        victimAge = kv.Value.CreatedAt;
+                        victim = kv.Key;
                     }
                 }
 
-                if (oldestKey is null || !channels.TryRemove(oldestKey, out _))
+                if (victim is null || !channels.TryRemove(victim, out _))
                 {
                     break;
                 }

@@ -16,31 +16,72 @@ namespace Gateway.Api.RealTime;
 /// the owner knows <i>who</i> sent it without the gateway understanding the credential.
 /// </para>
 /// <para>
+/// This registry — not the best-effort presence view — is the AUTHORITATIVE record of
+/// this instance's memberships (review finding): the security-critical eviction sweep
+/// enumerates it via <see cref="Snapshot"/>, so a failed presence write can never exempt
+/// a connection from eviction.
+/// </para>
+/// <para>
 /// Singleton and thread-safe (the hub is per-invocation). Membership is inherently
 /// instance-local — a connection lives on exactly one gateway instance — so no backplane
 /// is involved. A whole connection's memberships drop in one call on disconnect
 /// (<see cref="Drop"/>, from <c>GatewayHub.OnDisconnectedAsync</c>); a channel-scoped
-/// <c>LeaveChannel</c> removes just that entry (<see cref="Leave"/>).
+/// <c>LeaveChannel</c> removes just that entry (<see cref="Leave"/>). Dropped connection
+/// ids are tombstoned briefly so a join suspended across the disconnect (awaiting the
+/// group add or the ~2s auth callback) cannot resurrect a membership for a dead
+/// connection (review finding — the same race the decision cache tombstones).
 /// </para>
 /// </summary>
 public sealed class HubChannelMembership
 {
+    /// <summary>How long a dropped connection id refuses late joins.</summary>
+    public static readonly TimeSpan DefaultTombstoneTtl = TimeSpan.FromSeconds(30);
+
+    private readonly TimeProvider _clock;
+    private readonly TimeSpan _tombstoneTtl;
+
     // connectionId -> (channel -> identity-or-null). Nested so a whole connection's
-    // memberships drop in one operation on disconnect. A sentinel is used because a
-    // ConcurrentDictionary value cannot be null; TryGetIdentity unwraps it.
+    // memberships drop in one operation on disconnect.
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string?>> _byConnection =
         new(StringComparer.Ordinal);
+
+    // Recently-dropped connection ids -> tombstone expiry.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _tombstones = new(StringComparer.Ordinal);
+
+    public HubChannelMembership(TimeProvider? clock = null, TimeSpan? tombstoneTtl = null)
+    {
+        _clock = clock ?? TimeProvider.System;
+        _tombstoneTtl = tombstoneTtl ?? DefaultTombstoneTtl;
+    }
 
     /// <summary>
     /// Record that <paramref name="connectionId"/> joined <paramref name="channel"/>,
     /// carrying <paramref name="identity"/> (null for public/ops channels). Idempotent:
-    /// a re-join overwrites the stored identity with the latest decision.
+    /// a re-join overwrites the stored identity with the latest decision. Returns
+    /// <c>false</c> — and records nothing — when the connection was recently dropped
+    /// (a join resumed after its disconnect); callers must then skip the dependent
+    /// presence writes too.
     /// </summary>
-    public void Join(string connectionId, string channel, string? identity)
+    public bool Join(string connectionId, string channel, string? identity)
     {
+        if (IsTombstoned(connectionId))
+        {
+            return false;
+        }
+
         var channels = _byConnection.GetOrAdd(
             connectionId, _ => new ConcurrentDictionary<string, string?>(StringComparer.Ordinal));
         channels[channel] = identity;
+
+        // Drop may have raced between the tombstone check and the write, re-creating the
+        // map here; undo so a late join cannot leak a membership for a dead connection.
+        if (IsTombstoned(connectionId))
+        {
+            _byConnection.TryRemove(connectionId, out _);
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>Remove a single channel membership (called from <c>LeaveChannel</c>).</summary>
@@ -69,6 +110,55 @@ public sealed class HubChannelMembership
         return false;
     }
 
+    /// <summary>
+    /// A point-in-time snapshot of every (channel, connectionId) membership on this
+    /// instance — the authoritative worklist for the eviction sweep.
+    /// </summary>
+    public IReadOnlyList<(string Channel, string ConnectionId)> Snapshot()
+    {
+        var result = new List<(string, string)>();
+        foreach (var (connectionId, channels) in _byConnection)
+        {
+            foreach (var channel in channels.Keys)
+            {
+                result.Add((channel, connectionId));
+            }
+        }
+
+        return result;
+    }
+
     /// <summary>Forget every membership for a connection (called on disconnect).</summary>
-    public void Drop(string connectionId) => _byConnection.TryRemove(connectionId, out _);
+    public void Drop(string connectionId)
+    {
+        // Tombstone BEFORE removing so a join racing this disconnect observes it.
+        _tombstones[connectionId] = _clock.GetUtcNow() + _tombstoneTtl;
+        _byConnection.TryRemove(connectionId, out _);
+
+        // Amortized tombstone cleanup — connection ids are never reused, so expired
+        // tombstones are pure garbage.
+        var now = _clock.GetUtcNow();
+        foreach (var (id, until) in _tombstones)
+        {
+            if (now >= until)
+            {
+                _tombstones.TryRemove(id, out _);
+            }
+        }
+    }
+
+    private bool IsTombstoned(string connectionId)
+    {
+        if (_tombstones.TryGetValue(connectionId, out var until))
+        {
+            if (_clock.GetUtcNow() < until)
+            {
+                return true;
+            }
+
+            _tombstones.TryRemove(connectionId, out _);
+        }
+
+        return false;
+    }
 }

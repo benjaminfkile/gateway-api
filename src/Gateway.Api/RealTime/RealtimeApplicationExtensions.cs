@@ -118,53 +118,11 @@ public static class RealtimeApplicationExtensions
                 return Results.BadRequest(new { error = "channel is required." });
             }
 
-            // Reject a malformed channel with the SAME shape rule joins enforce (task #608
-            // finding 3): a name like "svc-a" or "svc-a:" would pass ownership + token
-            // checks and 202, then broadcast into a group ValidateChannel guarantees is
-            // permanently empty — silent event loss. 400 before it can be published.
-            if (!GatewayHub.IsValidChannel(request.Channel))
+            var (owner, failure) = await AuthorizeOwnerAsync(
+                request.Channel, "publishing to", context, ownership, ct);
+            if (failure is not null)
             {
-                return Results.BadRequest(new
-                {
-                    error = $"Channel '{request.Channel}' must be in '{{service}}:{{topic}}' form.",
-                });
-            }
-
-            // ops:* is gateway-owned and never publishable through the HTTP passthrough,
-            // regardless of any token presented. Gateway-internal ops events ride
-            // IChannelEventPublisher directly, bypassing this endpoint entirely.
-            if (GatewayHub.IsOpsChannel(request.Channel))
-            {
-                return Results.Json(
-                    new { error = $"Channel '{request.Channel}' is gateway-owned and cannot be published via /internal/publish." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            var prefix = GatewayHub.PrefixOf(request.Channel);
-            var owner = await ownership.ResolveAsync(prefix, ct);
-            if (owner is null)
-            {
-                return Results.Json(
-                    new { error = $"Channel '{request.Channel}' has no owning service; '{prefix}' is not a known service." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            if (string.IsNullOrEmpty(owner.PublishToken))
-            {
-                // Pre-migration row (or a service upserted before this column existed):
-                // no token has been minted yet, so no publish can be authorized. The
-                // next upsert of the service generates one (tech-spec §4.2, task #593).
-                return Results.Json(
-                    new { error = $"Service '{prefix}' has no realtime publish token yet; re-upsert the service to generate one before publishing." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
-            if (!RealtimePublishToken.Matches(presented, owner.PublishToken))
-            {
-                return Results.Json(
-                    new { error = $"The {RealtimePublishToken.Header} header does not authorize publishing to '{request.Channel}'." },
-                    statusCode: StatusCodes.Status403Forbidden);
+                return failure;
             }
 
             // Per-service publish throttle (task #611, item 4): a token bucket keyed on the
@@ -172,7 +130,7 @@ public static class RealtimeApplicationExtensions
             // hub for everyone. Checked only after the token authorizes the caller, so an
             // unauthorized request (already 403'd above) never consumes the service's budget.
             // Over budget → 429 with Retry-After (whole seconds, floored at 1).
-            if (!throttle.TryTake(owner.Service, out var retryAfter))
+            if (!throttle.TryTake(owner!.Service, out var retryAfter))
             {
                 var seconds = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
                 context.Response.Headers.RetryAfter = seconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -209,44 +167,16 @@ public static class RealtimeApplicationExtensions
             IPresenceRegistry presence,
             CancellationToken ct) =>
         {
-            if (string.IsNullOrWhiteSpace(channel) || !GatewayHub.IsValidChannel(channel))
+            if (string.IsNullOrWhiteSpace(channel))
             {
-                return Results.BadRequest(new
-                {
-                    error = $"Channel '{channel}' must be in '{{service}}:{{topic}}' form.",
-                });
+                return Results.BadRequest(new { error = "channel is required." });
             }
 
-            // ops:* is gateway-owned; its presence is not exposed to any service token.
-            if (GatewayHub.IsOpsChannel(channel))
+            var (_, failure) = await AuthorizeOwnerAsync(
+                channel, "reading presence for", context, ownership, ct);
+            if (failure is not null)
             {
-                return Results.Json(
-                    new { error = $"Channel '{channel}' is gateway-owned and has no owner presence view." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            var prefix = GatewayHub.PrefixOf(channel);
-            var owner = await ownership.ResolveAsync(prefix, ct);
-            if (owner is null)
-            {
-                return Results.Json(
-                    new { error = $"Channel '{channel}' has no owning service; '{prefix}' is not a known service." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            if (string.IsNullOrEmpty(owner.PublishToken))
-            {
-                return Results.Json(
-                    new { error = $"Service '{prefix}' has no realtime token yet; re-upsert the service to generate one." },
-                    statusCode: StatusCodes.Status403Forbidden);
-            }
-
-            var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
-            if (!RealtimePublishToken.Matches(presented, owner.PublishToken))
-            {
-                return Results.Json(
-                    new { error = $"The {RealtimePublishToken.Header} header does not authorize reading presence for '{channel}'." },
-                    statusCode: StatusCodes.Status403Forbidden);
+                return failure;
             }
 
             var members = await presence.ListAsync(channel, ct);
@@ -260,5 +190,70 @@ public static class RealtimeApplicationExtensions
             });
         });
         return endpoints;
+    }
+
+    /// <summary>
+    /// The ONE owner-token authorization sequence every internal owner-scoped endpoint
+    /// shares (review finding: /internal/publish and /internal/presence each carried a
+    /// byte-for-byte copy; a third endpoint would have made a third). Validates the
+    /// channel's shape (the same rule joins enforce — a name like <c>svc-a:</c> would
+    /// otherwise pass ownership and token checks yet name a group that can never have
+    /// members), refuses gateway-owned <c>ops:*</c>, resolves the owning service, and
+    /// constant-time-matches the presented <c>X-Gateway-Realtime-Token</c>.
+    /// Returns either the authorized owner or the failure <see cref="IResult"/> to
+    /// short-circuit with; <paramref name="action"/> phrases the 403 (e.g. "publishing
+    /// to", "reading presence for").
+    /// </summary>
+    private static async Task<(ChannelOwner? Owner, IResult? Failure)> AuthorizeOwnerAsync(
+        string channel,
+        string action,
+        HttpContext context,
+        IChannelOwnershipResolver ownership,
+        CancellationToken ct)
+    {
+        if (!GatewayHub.IsValidChannel(channel))
+        {
+            return (null, Results.BadRequest(new
+            {
+                error = $"Channel '{channel}' must be in '{{service}}:{{topic}}' form.",
+            }));
+        }
+
+        // ops:* is gateway-owned and never exposed to any service token, on any surface.
+        if (GatewayHub.IsOpsChannel(channel))
+        {
+            return (null, Results.Json(
+                new { error = $"Channel '{channel}' is gateway-owned and does not allow {action} it via the internal API." },
+                statusCode: StatusCodes.Status403Forbidden));
+        }
+
+        var prefix = GatewayHub.PrefixOf(channel);
+        var owner = await ownership.ResolveAsync(prefix, ct);
+        if (owner is null)
+        {
+            return (null, Results.Json(
+                new { error = $"Channel '{channel}' has no owning service; '{prefix}' is not a known service." },
+                statusCode: StatusCodes.Status403Forbidden));
+        }
+
+        if (string.IsNullOrEmpty(owner.PublishToken))
+        {
+            // Pre-migration row (or a service upserted before this column existed): no
+            // token has been minted yet, so nothing can be authorized. The next upsert
+            // of the service generates one (tech-spec §4.2, task #593).
+            return (null, Results.Json(
+                new { error = $"Service '{prefix}' has no realtime token yet; re-upsert the service to generate one." },
+                statusCode: StatusCodes.Status403Forbidden));
+        }
+
+        var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
+        if (!RealtimePublishToken.Matches(presented, owner.PublishToken))
+        {
+            return (null, Results.Json(
+                new { error = $"The {RealtimePublishToken.Header} header does not authorize {action} '{channel}'." },
+                statusCode: StatusCodes.Status403Forbidden));
+        }
+
+        return (owner, null);
     }
 }

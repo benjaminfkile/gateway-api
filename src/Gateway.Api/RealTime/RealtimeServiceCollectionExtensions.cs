@@ -1,4 +1,5 @@
 using Gateway.Api.Proxy;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
@@ -40,7 +41,12 @@ public static class RealtimeServiceCollectionExtensions
             options.KeepAliveInterval = TimeSpan.FromSeconds(15);
             options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
             options.HandshakeTimeout = TimeSpan.FromSeconds(15);
+            // Coarse per-connection invocation budget over EVERY hub method (review
+            // finding): without it, only SendToChannel was limited and a join/leave
+            // spam loop could drive unbounded backend load.
+            options.AddFilter<HubInvocationRateLimitFilter>();
         });
+        services.TryAddSingleton<HubInvocationRateLimitFilter>();
 
         // Backplane only when GATEWAY_REDIS_ENDPOINT is set (§4.2). Otherwise the
         // hub runs single-node with no Redis dependency — correct for one

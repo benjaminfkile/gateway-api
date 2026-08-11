@@ -205,8 +205,13 @@ public class DelegatedChannelAuthTests
     }
 
     [Fact]
-    public async Task PrivateChannel_AllowCached_SecondJoin_DoesNotReCallback()
+    public async Task PrivateChannel_CredentialedRejoin_ReAuthorizes_CredentiallessRidesCache()
     {
+        // Review finding (supersedes the old second-join-cached assertion): an EXPLICIT
+        // credential is the documented RENEWAL path — it must reach the owner's callback
+        // and refresh the allow's TTL, or every continuously-subscribed private member
+        // gets force-evicted on a 15-minute metronome with no way to prevent it. Only a
+        // credential-LESS join rides the cached allow.
         var callback = new AuthCallback((_, ctx) => WriteAllowAsync(ctx));
         await using var downstream = await DownstreamTestServer.StartAsync(callback.HandleAsync);
         await using var factory = NewFactory(downstream);
@@ -214,11 +219,12 @@ public class DelegatedChannelAuthTests
 
         await connection.StartAsync();
         await connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, "cred");
-        await connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, "cred");
+        await connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, "cred-refreshed");
+        Assert.Equal(2, callback.Count);
 
-        // The allow is cached per (connection, channel) for the connection's lifetime,
-        // so the second join re-adds the group without re-hitting the app (#594 req 4).
-        Assert.Equal(1, callback.Count);
+        // A join presenting NO credential (the group re-add path) uses the cached allow.
+        await connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, null);
+        Assert.Equal(2, callback.Count);
     }
 
     [Fact]

@@ -37,13 +37,20 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
     private readonly string _instanceId;
     private readonly TimeSpan _staleAfter;
 
-    // This instance's own (channel -> connectionId -> identity), so the reaper can
-    // re-stamp exactly the rows it owns without re-reading them, and a disconnect sweep
-    // is O(the connection's channels) rather than a scan of every channel key.
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string?>> _localByChannel =
+    // This instance's own (channel -> connectionId -> (identity, joinedAt)), so the reaper
+    // can re-stamp exactly the rows it owns without re-reading them, and a disconnect sweep
+    // is O(the connection's channels) rather than a scan of every channel key. The mirror
+    // keeps the ORIGINAL JoinedAt (review finding): the heartbeat rewrites the whole row,
+    // and stamping JoinedAt = now on every tick made the owner presence API report every
+    // member as ~30s old forever. Buckets are pruned via PrunableBuckets so the
+    // empty-check/insert race cannot unlink a live mirror entry.
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, LocalRow>> _localByChannel =
         new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _localByConnection =
         new(StringComparer.Ordinal);
+
+    /// <summary>The mirror row: what the heartbeat needs to faithfully rewrite a Redis row.</summary>
+    private readonly record struct LocalRow(string? Identity, DateTimeOffset JoinedAt);
 
     public RedisPresenceRegistry(
         IConnectionMultiplexer redis,
@@ -84,7 +91,7 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
         // GC'd by Redis even if no surviving instance ever reaps it.
         await db.KeyExpireAsync(key, _staleAfter + _staleAfter).ConfigureAwait(false);
 
-        TrackLocal(channel, connectionId, identity);
+        TrackLocal(channel, connectionId, identity, joinedAt);
     }
 
     public async Task RemoveAsync(string channel, string connectionId, CancellationToken ct = default)
@@ -105,15 +112,7 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
         foreach (var channel in channels.Keys)
         {
             await db.HashDeleteAsync(KeyFor(channel), connectionId).ConfigureAwait(false);
-            if (_localByChannel.TryGetValue(channel, out var conns))
-            {
-                conns.TryRemove(connectionId, out _);
-                if (conns.IsEmpty)
-                {
-                    _localByChannel.TryRemove(channel, out _);
-                }
-            }
-
+            PrunableBuckets.Remove(_localByChannel, channel, connectionId);
             removed.Add(channel);
         }
 
@@ -177,12 +176,15 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
         var now = _clock.GetUtcNow();
 
         // 1. Heartbeat this instance's own rows so surviving peers keep seeing them.
+        // The mirror carries the ORIGINAL JoinedAt, so only RefreshedAt advances —
+        // rewriting JoinedAt = now here made every member perpetually ~30s old in the
+        // owner presence API (review finding).
         foreach (var (channel, conns) in _localByChannel)
         {
             var key = KeyFor(channel);
-            foreach (var (connectionId, identity) in conns)
+            foreach (var (connectionId, local) in conns)
             {
-                var row = new PresenceRow(identity, now, _instanceId, now);
+                var row = new PresenceRow(local.Identity, local.JoinedAt, _instanceId, now);
                 await db.HashSetAsync(key, connectionId, Serialize(row)).ConfigureAwait(false);
             }
 
@@ -220,36 +222,17 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
         }
     }
 
-    private void TrackLocal(string channel, string connectionId, string? identity)
+    private void TrackLocal(string channel, string connectionId, string? identity, DateTimeOffset joinedAt)
     {
-        var conns = _localByChannel.GetOrAdd(
-            channel, _ => new ConcurrentDictionary<string, string?>(StringComparer.Ordinal));
-        conns[connectionId] = identity;
-
-        var chans = _localByConnection.GetOrAdd(
-            connectionId, _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-        chans[channel] = 0;
+        PrunableBuckets.Insert(_localByChannel, channel, bucket =>
+            bucket[connectionId] = new LocalRow(identity, joinedAt));
+        PrunableBuckets.Insert(_localByConnection, connectionId, bucket => bucket[channel] = 0);
     }
 
     private void UntrackLocal(string channel, string connectionId)
     {
-        if (_localByChannel.TryGetValue(channel, out var conns))
-        {
-            conns.TryRemove(connectionId, out _);
-            if (conns.IsEmpty)
-            {
-                _localByChannel.TryRemove(channel, out _);
-            }
-        }
-
-        if (_localByConnection.TryGetValue(connectionId, out var chans))
-        {
-            chans.TryRemove(channel, out _);
-            if (chans.IsEmpty)
-            {
-                _localByConnection.TryRemove(connectionId, out _);
-            }
-        }
+        PrunableBuckets.Remove(_localByChannel, channel, connectionId);
+        PrunableBuckets.Remove(_localByConnection, connectionId, channel);
     }
 
     private static string Serialize(PresenceRow row) => JsonSerializer.Serialize(row);

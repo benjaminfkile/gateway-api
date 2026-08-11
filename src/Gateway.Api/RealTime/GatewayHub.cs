@@ -202,8 +202,14 @@ public sealed class GatewayHub : Hub
         // Record the membership (and the auth-callback identity, null for public/ops) so
         // SendToChannel can enforce "must be a member" locally and stamp the forward with
         // who sent it (task #611). Record AFTER the group add so a failed add never leaves
-        // a phantom membership.
-        _membership.Join(Context.ConnectionId, channel, identity);
+        // a phantom membership. Join() returns false when this connection disconnected
+        // while we were suspended above (review finding): the disconnect cleanup already
+        // ran, so recording membership/presence now would resurrect rows for a dead
+        // connection — SignalR cleans the group itself, so just stop.
+        if (!_membership.Join(Context.ConnectionId, channel, identity))
+        {
+            return;
+        }
 
         // Presence (task #612): add to the workload-agnostic registry and buffer a join
         // delta for a coalesced presence event. Best-effort — presence never fails a join.
@@ -395,17 +401,23 @@ public sealed class GatewayHub : Hub
     {
         var connectionId = Context.ConnectionId;
 
-        // A cached decision short-circuits: an allow admits any credential; a deny only
-        // short-circuits a retry of the SAME credential, so a retry with a different,
-        // now-valid credential still reaches the owning service (task #608 finding 1).
+        // A cached decision short-circuits — EXCEPT that an explicit credential always
+        // re-authorizes (review finding): a client re-joining with a fresh credential is
+        // the documented RENEWAL path, so it must reach the owner's callback and re-store
+        // the allow (refreshing its TTL) rather than bounce off the old allow while its
+        // expiry keeps ticking toward a guaranteed eviction. Credential-less joins still
+        // ride the cached allow; a cached deny still blocks retries of the SAME credential.
         if (_decisions.TryGet(connectionId, channel, credential) is { } cached)
         {
-            if (cached.Allowed)
+            if (cached.Allowed && credential is null)
             {
                 return cached.Identity;
             }
 
-            throw new HubException(AuthDeniedMessage);
+            if (!cached.Allowed)
+            {
+                throw new HubException(AuthDeniedMessage);
+            }
         }
 
         // Rate floor (review finding): denies are keyed per-credential, so a loop over

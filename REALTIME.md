@@ -627,6 +627,11 @@ event as proof a user is still present; reconcile against the API.
   connection+channel (a handful of attempts per ~10s window, plus at most one
   in-flight callback per connection), so a credential-guessing loop cannot hammer
   your auth endpoint through the gateway.
+- **Every hub invocation** (joins, leaves, sends — any method) also draws from a
+  coarse per-connection budget (default **20/s, burst 40**, tunable via
+  `GATEWAY_REALTIME_INVOKE_RATE` / `GATEWAY_REALTIME_INVOKE_BURST`); over budget
+  the invoke rejects with a throttled error. Sized far above legitimate use — a
+  reconnecting client re-joining its channels is a burst of single digits.
 - **Rate limits are per gateway instance.** A connection lives on exactly one
   instance and a publish is limited by whichever instance served it, so the
   buckets above are instance-local (not fleet-wide) — sized generously so a

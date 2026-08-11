@@ -13,10 +13,17 @@ namespace Gateway.Api.RealTime;
 /// connection was in) instead of a scan of every channel. <see cref="PresenceEntry.JoinedAt"/>
 /// is stamped from an injectable <see cref="TimeProvider"/> so tests are deterministic.
 /// </para>
+/// <para>
+/// Empty buckets are pruned so churned channel names never pin memory, but pruning and
+/// insertion coordinate through a per-bucket lock with a re-check against the outer map
+/// (review finding): a bare "IsEmpty → TryRemove(key)" raced a concurrent add that had
+/// just repopulated the same bucket instance, unlinking a live member — invisible to the
+/// owner presence API and events for the connection's lifetime.
+/// </para>
 /// </summary>
 public sealed class InMemoryPresenceRegistry : IPresenceRegistry
 {
-    // channel -> (connectionId -> entry). The authoritative membership.
+    // channel -> (connectionId -> entry).
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, PresenceEntry>> _byChannel =
         new(StringComparer.Ordinal);
 
@@ -31,44 +38,23 @@ public sealed class InMemoryPresenceRegistry : IPresenceRegistry
     public Task AddAsync(string channel, string connectionId, string? identity, CancellationToken ct = default)
     {
         var now = _clock.GetUtcNow();
-        var connections = _byChannel.GetOrAdd(
-            channel, _ => new ConcurrentDictionary<string, PresenceEntry>(StringComparer.Ordinal));
 
         // Idempotent: a re-add (e.g. a re-join after a cached auth allow) keeps the first
         // JoinedAt and only refreshes the identity to the latest decision.
-        connections.AddOrUpdate(
+        PrunableBuckets.Insert(_byChannel, channel, bucket => bucket.AddOrUpdate(
             connectionId,
             _ => new PresenceEntry(connectionId, identity, now),
-            (_, existing) => existing with { Identity = identity });
+            (_, existing) => existing with { Identity = identity }));
 
-        var channels = _byConnection.GetOrAdd(
-            connectionId, _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-        channels[channel] = 0;
+        PrunableBuckets.Insert(_byConnection, connectionId, bucket => bucket[channel] = 0);
 
         return Task.CompletedTask;
     }
 
     public Task RemoveAsync(string channel, string connectionId, CancellationToken ct = default)
     {
-        if (_byChannel.TryGetValue(channel, out var connections))
-        {
-            connections.TryRemove(connectionId, out _);
-            // Drop the now-empty channel bucket so a churned channel never pins memory.
-            if (connections.IsEmpty)
-            {
-                _byChannel.TryRemove(channel, out _);
-            }
-        }
-
-        if (_byConnection.TryGetValue(connectionId, out var channels))
-        {
-            channels.TryRemove(channel, out _);
-            if (channels.IsEmpty)
-            {
-                _byConnection.TryRemove(connectionId, out _);
-            }
-        }
-
+        PrunableBuckets.Remove(_byChannel, channel, connectionId);
+        PrunableBuckets.Remove(_byConnection, connectionId, channel);
         return Task.CompletedTask;
     }
 
@@ -82,13 +68,9 @@ public sealed class InMemoryPresenceRegistry : IPresenceRegistry
         var removed = new List<string>(channels.Count);
         foreach (var channel in channels.Keys)
         {
-            if (_byChannel.TryGetValue(channel, out var connections) && connections.TryRemove(connectionId, out _))
+            if (PrunableBuckets.Remove(_byChannel, channel, connectionId))
             {
                 removed.Add(channel);
-                if (connections.IsEmpty)
-                {
-                    _byChannel.TryRemove(channel, out _);
-                }
             }
         }
 
@@ -113,7 +95,7 @@ public sealed class InMemoryPresenceRegistry : IPresenceRegistry
     public Task<IReadOnlyList<ChannelMembership>> LocalMembershipsAsync(CancellationToken ct = default)
     {
         // Single instance: every membership it holds is local. Snapshot under enumeration —
-        // both maps are moving views — so the eviction sweep iterates a stable list.
+        // both maps are moving views — so callers iterate a stable list.
         var memberships = new List<ChannelMembership>();
         foreach (var (channel, connections) in _byChannel)
         {

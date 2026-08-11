@@ -71,7 +71,11 @@ public sealed class ChannelEvictionSweep
     /// <summary>Run one eviction pass over this instance's memberships. Never throws.</summary>
     public async Task RunAsync(CancellationToken ct = default)
     {
-        var memberships = await _presence.LocalMembershipsAsync(ct).ConfigureAwait(false);
+        // Enumerate the AUTHORITATIVE in-process membership registry, not the best-effort
+        // presence view (review finding): a presence write that failed at join time —
+        // e.g. a transient Redis blip — must not exempt that member from eviction for the
+        // connection's lifetime. Presence is advisory; HubChannelMembership is truth.
+        var memberships = _membership.Snapshot();
         if (memberships.Count == 0)
         {
             return;
@@ -152,9 +156,16 @@ public sealed class ChannelEvictionSweep
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // ABORT the eviction, keeping the membership row intact (review finding): the
+            // group removal is the step that actually stops delivery. Deleting the
+            // membership/presence state after a FAILED removal would erase the only thing
+            // that makes the next sweep retry — turning a transient hub error into a
+            // permanent grant of delivery to a member with a lapsed allow.
             _logger.LogWarning(
-                ex, "Failed to remove connection {ConnectionId} from group '{Channel}' during eviction.",
+                ex, "Failed to remove connection {ConnectionId} from group '{Channel}' during eviction; "
+                + "membership kept so the next sweep retries.",
                 connectionId, channel);
+            return;
         }
 
         try
