@@ -41,6 +41,7 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.RealtimeAuthPath).HasColumnName("realtime_auth_path");
             e.Property(x => x.RealtimeMessagePath).HasColumnName("realtime_message_path");
             e.Property(x => x.RealtimeAllowedOrigins).HasColumnName("realtime_allowed_origins");
+            e.Property(x => x.RealtimePresence).HasColumnName("realtime_presence");
             e.Property(x => x.IncludeInHealth).HasColumnName("include_in_health");
             e.Property(x => x.UpdatedBy).HasColumnName("updated_by").IsRequired();
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");

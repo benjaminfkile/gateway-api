@@ -119,6 +119,45 @@ public static class RealtimeServiceCollectionExtensions
         });
         services.TryAddSingleton<IChannelMessageClient, HttpChannelMessageClient>();
 
+        // Presence registry (task #612): "who is in this channel" as a workload-agnostic
+        // capability. Selection MIRRORS the SignalR backplane gate above — Redis endpoint
+        // set → the fleet-unioning RedisPresenceRegistry (plus its heartbeat/reaper hosted
+        // service), else the in-memory registry that is correct and complete for a single
+        // instance and is the one unit tests target. The coalescer buffers per-channel
+        // membership deltas into a single ~1s presence event; its flush loop is always
+        // registered (a no-op when nothing opted in).
+        if (redis.Enabled)
+        {
+            // A dedicated multiplexer for presence (the SignalR backplane owns its own),
+            // connected lazily so nothing touches Redis until the registry is first used.
+            // AbortOnConnectFail=false so a Redis blip degrades presence, never crashes boot.
+            services.TryAddSingleton<StackExchange.Redis.IConnectionMultiplexer>(_ =>
+            {
+                var config = new StackExchange.Redis.ConfigurationOptions
+                {
+                    Ssl = redis.UseSsl,
+                    AbortOnConnectFail = false,
+                };
+                config.EndPoints.Add(redis.Endpoint!);
+                return StackExchange.Redis.ConnectionMultiplexer.Connect(config);
+            });
+
+            services.TryAddSingleton(sp => new RedisPresenceRegistry(
+                sp.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>(),
+                instanceId: Guid.NewGuid().ToString("n"),
+                clock: null,
+                logger: sp.GetRequiredService<ILoggerFactory>().CreateLogger<RedisPresenceRegistry>()));
+            services.TryAddSingleton<IPresenceRegistry>(sp => sp.GetRequiredService<RedisPresenceRegistry>());
+            services.AddHostedService<PresenceReaperService>();
+        }
+        else
+        {
+            services.TryAddSingleton<IPresenceRegistry, InMemoryPresenceRegistry>();
+        }
+
+        services.TryAddSingleton<PresenceEventCoalescer>();
+        services.AddHostedService<PresenceCoalescerService>();
+
         return services;
     }
 }

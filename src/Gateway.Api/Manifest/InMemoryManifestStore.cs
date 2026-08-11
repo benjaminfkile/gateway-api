@@ -96,6 +96,7 @@ public sealed class InMemoryManifestStore : IManifestStore
         RealtimeAuthPath = m.RealtimeAuthPath,
         RealtimeMessagePath = m.RealtimeMessagePath,
         RealtimeAllowedOrigins = m.RealtimeAllowedOrigins,
+        RealtimePresence = m.RealtimePresence,
         IncludeInHealth = m.IncludeInHealth,
         UpdatedBy = m.UpdatedBy,
         UpdatedAt = m.UpdatedAt,

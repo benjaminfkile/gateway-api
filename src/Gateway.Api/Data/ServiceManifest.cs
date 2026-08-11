@@ -89,6 +89,21 @@ public class ServiceManifest
     /// </summary>
     public string? RealtimeAllowedOrigins { get; set; }
 
+    /// <summary>
+    /// Whether this service has opted in to real-time <b>presence events</b> on its
+    /// channels (tech-spec §4.2, task #612). Nullable/tri-state on an upsert: null means
+    /// "not set" and is treated as <b>false</b> everywhere (the default), so a minimal
+    /// re-upsert never flips it and a pre-migration row reads as off. When true, every
+    /// membership change on a <c>{Name}:{topic}</c> channel emits a coalesced
+    /// <c>presence</c> event ({ channel, count, joined, left }) to that channel's
+    /// subscribers. Off by default because a presence event on a public channel leaks
+    /// connection ids (and any owner-supplied identity) to every subscriber, so the owner
+    /// must consciously choose it. The <c>GET /internal/presence/{channel}</c> owner API
+    /// works regardless of this flag — it is the owner's own token-gated read, not a
+    /// broadcast. Not a secret: returned by <c>GET /mgmt/services</c> and settable via upsert.
+    /// </summary>
+    public bool? RealtimePresence { get; set; }
+
     /// <summary>Whether this service participates in the aggregated health check.</summary>
     public bool IncludeInHealth { get; set; }
 
