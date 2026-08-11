@@ -10,6 +10,16 @@ namespace Gateway.Api.RealTime;
 public sealed record PresenceEntry(string ConnectionId, string? Identity, DateTimeOffset JoinedAt);
 
 /// <summary>
+/// One <c>(channel, connectionId)</c> membership <b>owned by this instance</b>, enumerated by
+/// <see cref="IPresenceRegistry.LocalMembershipsAsync"/> to drive the eviction sweep (task
+/// #613). Deliberately instance-local, not the fleet union <see cref="IPresenceRegistry.ListAsync"/>
+/// returns: eviction removes a SignalR group membership and consults the delegated-auth
+/// decision cache, both of which live on the instance the connection is pinned to, so each
+/// instance evicts only its own connections.
+/// </summary>
+public sealed record ChannelMembership(string Channel, string ConnectionId);
+
+/// <summary>
 /// "Who is in this channel" as a first-class, workload-agnostic capability (tech-spec
 /// §4.2, task #612). The hub records a membership on every join and drops it on
 /// leave/disconnect; the owner presence API and the coalesced <c>presence</c> events read
@@ -48,4 +58,12 @@ public interface IPresenceRegistry
 
     /// <summary>How many connections are currently present in <paramref name="channel"/>.</summary>
     Task<int> CountAsync(string channel, CancellationToken ct = default);
+
+    /// <summary>
+    /// Every <c>(channel, connectionId)</c> membership this instance owns — the input to the
+    /// eviction sweep (task #613). Instance-local by design (see <see cref="ChannelMembership"/>):
+    /// the in-memory registry owns every connection it sees, and the Redis one returns only the
+    /// rows written by this instance, never the fleet union.
+    /// </summary>
+    Task<IReadOnlyList<ChannelMembership>> LocalMembershipsAsync(CancellationToken ct = default);
 }

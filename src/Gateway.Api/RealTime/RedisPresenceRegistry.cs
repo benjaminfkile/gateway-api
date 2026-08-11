@@ -148,6 +148,23 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
     public async Task<int> CountAsync(string channel, CancellationToken ct = default) =>
         (await ListAsync(channel, ct).ConfigureAwait(false)).Count;
 
+    public Task<IReadOnlyList<ChannelMembership>> LocalMembershipsAsync(CancellationToken ct = default)
+    {
+        // Only THIS instance's own rows: eviction removes group membership and reads the
+        // instance-local auth-decision cache, so each instance evicts only its own
+        // connections (the fleet union in ListAsync would wrongly pull in peers' rows).
+        var memberships = new List<ChannelMembership>();
+        foreach (var (channel, conns) in _localByChannel)
+        {
+            foreach (var connectionId in conns.Keys)
+            {
+                memberships.Add(new ChannelMembership(channel, connectionId));
+            }
+        }
+
+        return Task.FromResult<IReadOnlyList<ChannelMembership>>(memberships);
+    }
+
     /// <summary>
     /// Re-stamp every row this instance owns (its heartbeat) and delete rows whose heartbeat
     /// has gone stale — a crashed instance's connections. Driven periodically by

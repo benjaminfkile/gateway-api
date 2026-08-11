@@ -158,6 +158,16 @@ public static class RealtimeServiceCollectionExtensions
         services.TryAddSingleton<PresenceEventCoalescer>();
         services.AddHostedService<PresenceCoalescerService>();
 
+        // Mid-connection channel eviction (task #613): a ~1 min sweep removes an admitted
+        // private-channel member from its group once its delegated-auth allow lapses (or its
+        // owning service is deleted) and signals `channelEvicted` so a well-behaved client
+        // re-joins with a fresh credential. Always registered and instance-local — it reads
+        // the presence registry's own memberships and the per-connection auth-decision cache,
+        // both of which live on the instance a connection is pinned to — so it is exercised
+        // fully offline in single-instance mode with no Redis.
+        services.TryAddSingleton<ChannelEvictionSweep>();
+        services.AddHostedService<ChannelEvictionService>();
+
         return services;
     }
 }

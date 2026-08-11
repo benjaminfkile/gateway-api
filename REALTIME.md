@@ -160,6 +160,11 @@ await connection.start();
 await joinAll();                    // and once for the initial connection
 ```
 
+The gateway can also drop you from a **single** private channel mid-connection, without the
+transport reconnecting, when your delegated-auth allow lapses — it sends a `channelEvicted`
+event on that channel (see §3). Handle it the same way: re-join that channel with a fresh
+credential and re-fetch its state over HTTP.
+
 ### CORS prerequisite
 
 A browser will only be allowed to open the WebSocket to `/hub` if its page origin
@@ -247,20 +252,39 @@ and admits the join only if you allow it. Exact contract:
 - **A denied join throws** a single generic error on the client
   (`"Not authorized to join this channel."`) that reveals nothing about why or
   whether the channel exists.
-- **Caching.** An *allow* is cached per `(connection, channel)` for a finite window
-  (~15 minutes), then a re-join re-authorizes. Your callback must work idempotently and
-  expect to be called again (after that window, on any reconnect, or when a client presents
-  a new credential). A reconnect gets a new connection id and re-authorizes from scratch.
-  **Honest limitation:** the window bounds *re-join* authorization, not access duration —
-  a client already admitted to a channel keeps receiving its events until its connection
-  closes, even if you revoke the credential mid-connection. If you must cut off an admitted
-  client immediately, revoke on your side AND force the disconnect (the gateway closes
-  connections when the Cognito-level token expires, but your app-level credential is opaque
-  to it). Mid-connection channel eviction is planned alongside presence (phase 3).
-  A *deny* is cached only briefly (~10s) and is keyed to the exact credential that was
-  rejected: a client that immediately retries with a **different, now-valid** credential
-  (the normal token-refresh flow) reaches your callback again rather than being blocked for
-  the deny window.
+- **Caching and eviction.** An *allow* is cached per `(connection, channel)` for a finite
+  window (~15 minutes). That window is now the **lifetime of access**, not just of re-join
+  authorization: once an allow lapses, the gateway's periodic sweep (about once a minute)
+  **removes that connection from the channel** and sends it a `channelEvicted` event (see
+  below) so a well-behaved client re-joins with a fresh credential. So an admitted client
+  whose allow is not renewed stops receiving a private channel's events within roughly the
+  allow window plus one sweep interval — you no longer have to force a disconnect to cut off
+  access. Your callback must work idempotently and expect to be called again (after an
+  eviction, on any reconnect, or when a client presents a new credential); a reconnect gets a
+  new connection id and re-authorizes from scratch. If you must cut a client off *faster*
+  than the sweep, revoke on your side AND force the disconnect (the gateway also closes a
+  connection when its Cognito-level token expires, but your app-level credential is opaque to
+  it). A *deny* is cached only briefly (~10s) and is keyed to the exact credential that was
+  rejected: a client that immediately retries with a **different, now-valid** credential (the
+  normal token-refresh flow) reaches your callback again rather than being blocked for the
+  deny window.
+- **The `channelEvicted` event.** When the gateway evicts your connection from a channel it
+  sends a normal `ChannelEvent` envelope on that channel with `event: "channelEvicted"` and
+  `data: { channel, reason }`:
+
+  ```json
+  { "channel": "chat-api:room-42", "event": "channelEvicted",
+    "data": { "channel": "chat-api:room-42", "reason": "auth_expired" } }
+  ```
+
+  `reason` is `"auth_expired"` (your allow lapsed — re-join with a fresh credential) or
+  `"service_removed"` (the channel's owning service was removed from the manifest — re-joining
+  will fail until it returns). The resilient client's rejoin machinery handles the common
+  `auth_expired` case automatically; if you route the envelope yourself, treat `channelEvicted`
+  as "you are no longer subscribed" and re-join (with a fresh credential) rather than assuming
+  you still receive the channel. Public channels are never evicted (they have no auth to
+  expire), and the dashboard's `ops:*` channels are unaffected (they are Cognito-gated, not
+  delegated-auth).
 
 ### Worked example: a minimal Express auth endpoint
 
