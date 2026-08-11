@@ -61,3 +61,78 @@ jobs:
           TARBALL=$(ls artifacts/gateway-api-*.tar.gz)
           aws s3 cp "$TARBALL" "s3://${ARTIFACT_BUCKET}/$(basename "$TARBALL")"
           aws s3 cp "$TARBALL" "s3://${ARTIFACT_BUCKET}/gateway-api-latest.tar.gz"
+
+  # Roll the fleet onto the artifact just published: instances install the
+  # gateway from S3 at boot, so publishing alone deploys nothing — a rolling
+  # instance refresh is the last mile (every app service deploys itself through
+  # the gateway's management API; the gateway is the one thing that cannot
+  # blue-green itself). Launch-before-terminate: max size is temporarily bumped
+  # by one so a fresh instance is healthy before each old one is terminated,
+  # and restored afterwards even on failure. Skipped entirely when the ASG_NAME
+  # secret or AWS credentials are not configured, so forks stay green.
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fleet-roll
+      cancel-in-progress: false
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ASG_NAME: ${{ secrets.ASG_NAME }}
+    steps:
+      - name: Rolling instance refresh
+        if: env.ASG_NAME != '' && env.AWS_ACCESS_KEY_ID != ''
+        run: |
+          set -euo pipefail
+
+          asg() { aws autoscaling "$@"; }
+          describe_refresh() {
+            asg describe-instance-refreshes --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$1" \
+              --query "InstanceRefreshes[0].[Status,PercentageComplete]" --output text
+          }
+
+          # A newer artifact supersedes any refresh already in flight.
+          active=$(asg describe-instance-refreshes --auto-scaling-group-name "$ASG_NAME" \
+            --query "InstanceRefreshes[?Status=='InProgress' || Status=='Pending'].InstanceRefreshId | [0]" \
+            --output text)
+          if [ -n "$active" ] && [ "$active" != "None" ]; then
+            echo "Cancelling in-flight refresh $active (superseded by this artifact)"
+            asg cancel-instance-refresh --auto-scaling-group-name "$ASG_NAME" || true
+            for i in $(seq 1 30); do
+              s=$(describe_refresh "$active" | cut -f1)
+              case "$s" in Cancelled|Failed|Successful|RollbackSuccessful|RollbackFailed) break;; esac
+              sleep 10
+            done
+          fi
+
+          # Bump max by one for full launch-before-terminate overlap; restore it
+          # on every exit path.
+          read -r MIN MAX DESIRED <<< "$(asg describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].[MinSize,MaxSize,DesiredCapacity]" --output text)"
+          echo "ASG min=$MIN max=$MAX desired=$DESIRED; raising max to $((DESIRED + 1))"
+          restore_max() { asg update-auto-scaling-group --auto-scaling-group-name "$ASG_NAME" --max-size "$MAX" || true; }
+          trap restore_max EXIT
+          asg update-auto-scaling-group --auto-scaling-group-name "$ASG_NAME" --max-size "$((DESIRED + 1))"
+
+          id=$(asg start-instance-refresh --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":150,"InstanceWarmup":300}' \
+            --query "InstanceRefreshId" --output text)
+          echo "Started instance refresh $id"
+
+          # A two-node roll lands in ~20 min; give it 40 before declaring failure.
+          for i in $(seq 1 80); do
+            read -r status pct <<< "$(describe_refresh "$id")"
+            echo "$status ${pct}%"
+            case "$status" in
+              Successful) echo "Fleet is on the new artifact."; exit 0;;
+              Failed|Cancelled|RollbackSuccessful|RollbackFailed)
+                echo "Instance refresh ended: $status"; exit 1;;
+            esac
+            sleep 30
+          done
+          echo "Timed out waiting for the instance refresh"; exit 1
