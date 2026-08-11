@@ -13,7 +13,10 @@ public static class ManagementTestData
         bool includeInHealth = true,
         string? digest = "sha256:v1",
         string desiredStatus = "running",
-        string tag = "latest") => new()
+        string tag = "latest",
+        string? realtimeAuthPath = null,
+        string? realtimeAllowedOrigins = null,
+        string? realtimePublishToken = null) => new()
     {
         Name = name,
         Image = $"registry/{name}",
@@ -22,6 +25,9 @@ public static class ManagementTestData
         Port = port,
         DesiredStatus = desiredStatus,
         IncludeInHealth = includeInHealth,
+        RealtimeAuthPath = realtimeAuthPath,
+        RealtimeAllowedOrigins = realtimeAllowedOrigins,
+        RealtimePublishToken = realtimePublishToken,
         UpdatedBy = "seed",
         UpdatedAt = DateTimeOffset.UnixEpoch,
     };

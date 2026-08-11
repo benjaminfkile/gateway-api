@@ -1,3 +1,4 @@
+using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -80,6 +81,16 @@ public sealed class HubCorsOriginCache
             var set = new HashSet<string>(_staticOrigins, StringComparer.OrdinalIgnoreCase);
             foreach (var m in all)
             {
+                // A reserved / gateway-owned name (gateway, hub, internal, ops) must never
+                // widen /hub CORS: its channels are gateway-owned (publishes 403, joins
+                // demand the operator policy), so folding its origins in would grant
+                // credentialed hub access for realtime that can never work. Skip it even if
+                // a pre-reservation row still carries origins.
+                if (ManagementEndpoints.IsReservedName(m.Name))
+                {
+                    continue;
+                }
+
                 foreach (var origin in RealtimeAllowedOrigins.Parse(m.RealtimeAllowedOrigins))
                 {
                     set.Add(origin);

@@ -524,10 +524,108 @@ public class ManagementDeployTests
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    [Fact]
+    public async Task Put_OmitsRealtimeFields_PreservesExisting_PrivateChannelStaysPrivate()
+    {
+        // FINDING 1: a pre-phase-2 CI workflow re-upserting only {image, tag, port} must
+        // NOT silently null realtime_auth_path / realtime_allowed_origins — that would flip
+        // every private channel of the service to public and wipe its hub CORS origins.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest(
+            "svc-a",
+            port: 8080,
+            realtimeAuthPath: "/realtime/auth",
+            realtimeAllowedOrigins: "https://chat.example.com"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        // The CI-shaped minimal upsert: image + tag + port + health only, realtime fields absent.
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 9090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal(9090, m.Port);
+            // Both security-relevant fields survive the minimal re-upsert: the channel
+            // stays private and the CORS allow-list is intact.
+            Assert.Equal("/realtime/auth", m.RealtimeAuthPath);
+            Assert.Equal("https://chat.example.com", m.RealtimeAllowedOrigins);
+        });
+    }
+
+    [Fact]
+    public async Task Put_EmptyRealtimeFields_ClearsThem()
+    {
+        // FINDING 1: an EXPLICIT empty string is the clear signal — distinct from an
+        // absent/null field, which preserves.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest(
+            "svc-a",
+            realtimeAuthPath: "/realtime/auth",
+            realtimeAllowedOrigins: "https://chat.example.com"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+            realtimeAuthPath = "",
+            realtimeAllowedOrigins = "",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Null(m.RealtimeAuthPath);
+            Assert.Null(m.RealtimeAllowedOrigins);
+        });
+    }
+
+    [Fact]
+    public async Task Put_SetRealtimeFields_ReplacesExisting()
+    {
+        // FINDING 1: a non-empty value replaces the stored one (validated/normalized).
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest(
+            "svc-a",
+            realtimeAuthPath: "/old/auth",
+            realtimeAllowedOrigins: "https://old.example.com"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 8080,
+            includeInHealth = false,
+            realtimeAuthPath = "/new/auth",
+            realtimeAllowedOrigins = "https://new.example.com:443/",
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.Equal("/new/auth", m.RealtimeAuthPath);
+            // Normalized: default port + trailing slash stripped.
+            Assert.Equal("https://new.example.com", m.RealtimeAllowedOrigins);
+        });
+    }
+
     [Theory]
     [InlineData("gateway")]   // the gateway is never a managed service
     [InlineData("hub")]        // would shadow the SignalR /hub endpoint
     [InlineData("internal")]   // would shadow the internal publish listener
+    [InlineData("ops")]        // ops:* realtime namespace is gateway-owned
     public async Task Put_ReservedName_Returns400(string name)
     {
         await using var factory = new ManagementApiFactory();

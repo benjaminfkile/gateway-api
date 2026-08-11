@@ -181,6 +181,11 @@ Rules the gateway enforces on this list:
   forbids `*`).
 - A manifest CORS change takes effect within a short cache window — no gateway
   restart needed.
+- **Upsert is tri-state on this field.** Omitting `realtimeAllowedOrigins` from a
+  `PUT` **preserves** the stored allow-list — a minimal re-upsert of only
+  `{image, tag, port}` (e.g. from a pre-phase-2 CI pipeline) never silently wipes
+  it. Send an **empty string** to explicitly clear it; send a non-empty value to
+  replace it.
 
 If your origin is not listed, the browser's preflight/negotiate fails before any
 hub method runs (see the FAQ).
@@ -198,6 +203,12 @@ your manifest entry (API field `realtimeAuthPath` on `PUT /mgmt/services/{name}`
 to a rooted path on your own service, e.g. `/realtime/authorize`. Opting in flips
 every `chat-api:*` channel to delegated auth: each join is authorized by **your**
 service, not the gateway.
+
+Like `realtimeAllowedOrigins`, this field is **tri-state on upsert**: omitting
+`realtimeAuthPath` from a `PUT` **preserves** the stored path (so a minimal
+`{image, tag, port}` re-upsert can never silently flip your private channels back
+to public), an **empty string** clears it (channels become public again), and a
+non-empty rooted path replaces it.
 
 ### The delegated-auth callback contract
 
