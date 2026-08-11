@@ -186,4 +186,79 @@ public static class RealtimeApplicationExtensions
         });
         return endpoints;
     }
+
+    /// <summary>
+    /// Map the owner presence API (tech-spec §4.2, task #612):
+    /// <c>GET /internal/presence/{channel}</c>. Returns who is currently present in the
+    /// channel plus a count, so a chat/collaboration backend can render "who is online"
+    /// without keeping its own connection bookkeeping. Guarded by the <b>same</b>
+    /// owner-token check as <c>/internal/publish</c>: the request must carry
+    /// <c>X-Gateway-Realtime-Token</c> matching the publish token of the manifest service
+    /// that owns the channel's prefix (constant-time compared). Unlike the coalesced
+    /// presence <i>event</i>, this read is available regardless of the service's
+    /// <c>realtime_presence</c> opt-in — it is the owner's own token-gated data, not a
+    /// broadcast to every subscriber. <c>ops:*</c> is gateway-owned and never queryable
+    /// here. The isolation middleware keeps this reachable only on the internal listener.
+    /// </summary>
+    public static IEndpointRouteBuilder MapInternalPresence(this IEndpointRouteBuilder endpoints)
+    {
+        endpoints.MapGet("/internal/presence/{channel}", async (
+            string channel,
+            HttpContext context,
+            IChannelOwnershipResolver ownership,
+            IPresenceRegistry presence,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(channel) || !GatewayHub.IsValidChannel(channel))
+            {
+                return Results.BadRequest(new
+                {
+                    error = $"Channel '{channel}' must be in '{{service}}:{{topic}}' form.",
+                });
+            }
+
+            // ops:* is gateway-owned; its presence is not exposed to any service token.
+            if (GatewayHub.IsOpsChannel(channel))
+            {
+                return Results.Json(
+                    new { error = $"Channel '{channel}' is gateway-owned and has no owner presence view." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var prefix = GatewayHub.PrefixOf(channel);
+            var owner = await ownership.ResolveAsync(prefix, ct);
+            if (owner is null)
+            {
+                return Results.Json(
+                    new { error = $"Channel '{channel}' has no owning service; '{prefix}' is not a known service." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            if (string.IsNullOrEmpty(owner.PublishToken))
+            {
+                return Results.Json(
+                    new { error = $"Service '{prefix}' has no realtime token yet; re-upsert the service to generate one." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
+            if (!RealtimePublishToken.Matches(presented, owner.PublishToken))
+            {
+                return Results.Json(
+                    new { error = $"The {RealtimePublishToken.Header} header does not authorize reading presence for '{channel}'." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var members = await presence.ListAsync(channel, ct);
+            return Results.Json(new
+            {
+                channel,
+                count = members.Count,
+                members = members
+                    .Select(m => new { connectionId = m.ConnectionId, identity = m.Identity, joinedAt = m.JoinedAt })
+                    .ToArray(),
+            });
+        });
+        return endpoints;
+    }
 }

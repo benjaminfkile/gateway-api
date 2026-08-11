@@ -496,6 +496,85 @@ public class ManagementDeployTests
     }
 
     [Fact]
+    public async Task Put_SetsRealtimePresence_PersistsAndReturned()
+    {
+        // task #612: realtime_presence is a first-class tri-state manifest flag. Setting it
+        // true opts the service into coalesced presence events and is echoed by the API.
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+            realtimePresence = true,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.True(created.GetProperty("realtimePresence").GetBoolean());
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.True(m.RealtimePresence);
+        });
+    }
+
+    [Fact]
+    public async Task Put_NoRealtimePresence_DefaultsFalse()
+    {
+        // Absent → null stored, surfaced as false (the default: presence events off).
+        await using var factory = new ManagementApiFactory();
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-new", new
+        {
+            image = "registry/svc-new",
+            tag = "latest",
+            port = 8090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.False(created.GetProperty("realtimePresence").GetBoolean());
+
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-new");
+            Assert.Null(m.RealtimePresence);
+        });
+    }
+
+    [Fact]
+    public async Task Put_OmitsRealtimePresence_PreservesExisting()
+    {
+        // Tri-state: a minimal re-upsert must not silently flip the presence opt-in.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest(
+            "svc-a", port: 8080, realtimePresence: true));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PutAsJsonAsync("/mgmt/services/svc-a", new
+        {
+            image = "registry/svc-a",
+            tag = "latest",
+            port = 9090,
+            includeInHealth = false,
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "svc-a");
+            Assert.True(m.RealtimePresence);
+        });
+    }
+
+    [Fact]
     public async Task Put_SetsRealtimeAllowedOrigins_NormalizesPersistsAndReturned()
     {
         // task #595: realtime_allowed_origins is settable on upsert and, like the auth

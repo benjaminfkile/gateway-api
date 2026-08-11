@@ -305,6 +305,7 @@ app.MapGet("/api/health", async (HealthAggregator aggregator, CancellationToken 
 // internal listener.
 app.MapGatewayHub();
 app.MapInternalPublish();
+app.MapInternalPresence();
 
 // Management plane (tech-spec §5): the authenticated /mgmt surface. Each endpoint
 // requires a valid Cognito access token; unauthenticated calls get 401 (or 503

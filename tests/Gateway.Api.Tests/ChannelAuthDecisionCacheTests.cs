@@ -216,14 +216,18 @@ public class ChannelAuthDecisionCacheTests
         var cache = new ChannelAuthDecisionCache();
         cache.StoreAllow("conn-1", "svc-a:room", "id");
 
+        var ownership = new StubOwnership();
+        var presence = new InMemoryPresenceRegistry();
         var hub = new GatewayHub(
             new StubAuthorization(),
-            new StubOwnership(),
+            ownership,
             new StubAuthClient(),
             cache,
             new HubChannelMembership(),
             new MessageRateLimiter(new RealtimeRateLimitOptions()),
             new StubMessageClient(),
+            presence,
+            new PresenceEventCoalescer(presence, ownership, new NoopPublisher()),
             NullLogger<GatewayHub>.Instance)
         {
             Context = new StubContext("conn-1"),
@@ -303,5 +307,15 @@ public class ChannelAuthDecisionCacheTests
             ChannelOwner owner, string channel, string @event, object? data,
             string connectionId, string? identity, CancellationToken ct = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class NoopPublisher : IChannelEventPublisher
+    {
+        public Task PublishAsync(string channel, string @event, object data, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public void TryPublish(string channel, string @event, object data)
+        {
+        }
     }
 }

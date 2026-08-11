@@ -17,6 +17,7 @@ public static class ManagementTestData
         string? realtimeAuthPath = null,
         string? realtimeMessagePath = null,
         string? realtimeAllowedOrigins = null,
+        bool? realtimePresence = null,
         string? realtimePublishToken = null) => new()
     {
         Name = name,
@@ -29,6 +30,7 @@ public static class ManagementTestData
         RealtimeAuthPath = realtimeAuthPath,
         RealtimeMessagePath = realtimeMessagePath,
         RealtimeAllowedOrigins = realtimeAllowedOrigins,
+        RealtimePresence = realtimePresence,
         RealtimePublishToken = realtimePublishToken,
         UpdatedBy = "seed",
         UpdatedAt = DateTimeOffset.UnixEpoch,

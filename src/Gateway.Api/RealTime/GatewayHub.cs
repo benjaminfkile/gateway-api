@@ -67,6 +67,8 @@ public sealed class GatewayHub : Hub
     private readonly HubChannelMembership _membership;
     private readonly MessageRateLimiter _messageRateLimiter;
     private readonly IChannelMessageClient _messageClient;
+    private readonly IPresenceRegistry _presence;
+    private readonly PresenceEventCoalescer _presenceEvents;
     private readonly ILogger<GatewayHub> _logger;
 
     public GatewayHub(
@@ -77,6 +79,8 @@ public sealed class GatewayHub : Hub
         HubChannelMembership membership,
         MessageRateLimiter messageRateLimiter,
         IChannelMessageClient messageClient,
+        IPresenceRegistry presence,
+        PresenceEventCoalescer presenceEvents,
         ILogger<GatewayHub> logger)
     {
         _authorization = authorization;
@@ -86,6 +90,8 @@ public sealed class GatewayHub : Hub
         _membership = membership;
         _messageRateLimiter = messageRateLimiter;
         _messageClient = messageClient;
+        _presence = presence;
+        _presenceEvents = presenceEvents;
         _logger = logger;
     }
 
@@ -132,6 +138,11 @@ public sealed class GatewayHub : Hub
         _decisions.Drop(Context.ConnectionId);
         _membership.Drop(Context.ConnectionId);
         _messageRateLimiter.Drop(Context.ConnectionId);
+
+        // Presence disconnect sweep (task #612): remove the connection from every channel it
+        // was present in and record a leave delta on each so a coalesced presence event
+        // reflects the departure. Best-effort — a registry failure must never fail teardown.
+        await SweepPresenceAsync(Context.ConnectionId);
 
         await base.OnDisconnectedAsync(exception);
     }
@@ -193,6 +204,10 @@ public sealed class GatewayHub : Hub
         // who sent it (task #611). Record AFTER the group add so a failed add never leaves
         // a phantom membership.
         _membership.Join(Context.ConnectionId, channel, identity);
+
+        // Presence (task #612): add to the workload-agnostic registry and buffer a join
+        // delta for a coalesced presence event. Best-effort — presence never fails a join.
+        await AddPresenceAsync(channel, identity);
     }
 
     /// <summary>Unsubscribe the caller from a channel.</summary>
@@ -201,6 +216,9 @@ public sealed class GatewayHub : Hub
         ValidateChannel(channel);
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, channel);
         _membership.Leave(Context.ConnectionId, channel);
+
+        // Presence (task #612): drop the registry row and buffer a leave delta. Best-effort.
+        await RemovePresenceAsync(channel);
     }
 
     /// <summary>
@@ -256,6 +274,69 @@ public sealed class GatewayHub : Hub
         if (!delivered)
         {
             throw new HubException(DeliveryFailedMessage);
+        }
+    }
+
+    /// <summary>
+    /// Add the connection to the presence registry and buffer a coalesced join event
+    /// (task #612). Best-effort: a registry failure is logged and swallowed so presence,
+    /// which is advisory, can never fail an already-authorized join.
+    /// </summary>
+    private async Task AddPresenceAsync(string channel, string? identity)
+    {
+        try
+        {
+            await _presence.AddAsync(channel, Context.ConnectionId, identity, Context.ConnectionAborted);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Presence add failed for connection {ConnectionId} on channel '{Channel}'; continuing.",
+                Context.ConnectionId, channel);
+        }
+
+        // The coalescer buffer is in-memory and never throws; record after the registry
+        // attempt so a departed connection is reflected even if the registry write faulted.
+        _presenceEvents.RecordJoin(channel, Context.ConnectionId, identity);
+    }
+
+    /// <summary>Remove one channel membership from the registry and buffer a leave event (best-effort).</summary>
+    private async Task RemovePresenceAsync(string channel)
+    {
+        try
+        {
+            await _presence.RemoveAsync(channel, Context.ConnectionId, Context.ConnectionAborted);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Presence remove failed for connection {ConnectionId} on channel '{Channel}'; continuing.",
+                Context.ConnectionId, channel);
+        }
+
+        _presenceEvents.RecordLeave(channel, Context.ConnectionId);
+    }
+
+    /// <summary>
+    /// The disconnect sweep: remove the connection from every channel it was present in and
+    /// buffer a leave event on each (task #612). Best-effort — never throws from teardown.
+    /// </summary>
+    private async Task SweepPresenceAsync(string connectionId)
+    {
+        try
+        {
+            // CancellationToken.None: the connection is already gone, so this cleanup must
+            // run to completion rather than be abandoned by the aborted request token.
+            var channels = await _presence.RemoveConnectionAsync(connectionId, CancellationToken.None);
+            foreach (var channel in channels)
+            {
+                _presenceEvents.RecordLeave(channel, connectionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Presence disconnect sweep failed for connection {ConnectionId}; continuing.", connectionId);
         }
     }
 

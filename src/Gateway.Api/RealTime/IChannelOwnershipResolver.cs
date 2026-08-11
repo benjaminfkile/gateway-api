@@ -22,8 +22,10 @@ public interface IChannelOwnershipResolver
 /// publish token (null on a pre-migration row that has no token yet), the optional
 /// delegated-auth path (task #594 — null means the service's channels are public), the
 /// optional message path (task #611 — null means the full-duplex <c>SendToChannel</c>
-/// feature is off for the service), and the manifest (container-internal) port used as
-/// the address-resolution fallback when no host port has been learned yet.
+/// feature is off for the service), whether the service opted in to presence events
+/// (task #612 — <c>false</c> by default; gates the coalesced <c>presence</c> broadcast,
+/// not the owner presence API), and the manifest (container-internal) port used as the
+/// address-resolution fallback when no host port has been learned yet.
 /// </summary>
 public sealed record ChannelOwner(
-    string Service, string? PublishToken, string? AuthPath, string? MessagePath, int Port);
+    string Service, string? PublishToken, string? AuthPath, string? MessagePath, bool PresenceEnabled, int Port);

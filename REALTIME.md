@@ -403,7 +403,7 @@ message. The gateway checks, **in order**:
 3. **Rate limit.** Each connection has a token-bucket budget (default **10
    messages/second, burst 20**, shared across *all* its channels). Over budget is
    rejected with a throttled error — back off and retry.
-4. **Size.** The payload rides SignalR's 32 KB receive cap (§6). Keep it small.
+4. **Size.** The payload rides SignalR's 32 KB receive cap (§7). Keep it small.
 
 If all four pass, the gateway POSTs the message to your `realtime_message_path`.
 
@@ -480,7 +480,108 @@ gateway never short-circuits them into a direct client-to-client broadcast.
 
 ---
 
-## 6. Limits and operational notes
+## 6. Presence: who is in a channel
+
+Presence answers "who is currently in this channel" without your service keeping
+its own connection bookkeeping. It has two independent surfaces: an **owner API**
+you pull on demand, and optional **presence events** the gateway broadcasts to a
+channel's subscribers on every membership change. The registry underneath is
+workload-agnostic — the gateway tracks it for every channel; you choose how to
+consume it.
+
+### The identity string comes from your auth callback
+
+Each presence row is `{ connectionId, identity, joinedAt }`. `identity` is exactly
+the opaque string your **delegated-auth callback** returned when it admitted the
+join (§3 — the `identity` field of `{ "allow": true, "identity": "..." }`). For a
+**public** channel (no `realtime_auth_path`) or an `ops:*` channel there is no
+callback, so `identity` is `null`. The gateway never invents or parses it — it is
+your value, echoed back to you.
+
+### Owner API: `GET /internal/presence/{channel}`
+
+Pull the current members of one of your channels from the internal listener:
+
+```
+GET http://gateway:8080/internal/presence/chat-api:room-42
+X-Gateway-Realtime-Token: <your token>
+```
+
+Guarded by the **same** owner-token check as `/internal/publish` (§4): the
+`X-Gateway-Realtime-Token` header must match the publish token of the service that
+owns the channel's prefix. `ops:*` channels are gateway-owned and never queryable.
+A `200` returns:
+
+```json
+{
+  "channel": "chat-api:room-42",
+  "count": 2,
+  "members": [
+    { "connectionId": "abc123", "identity": "user-7", "joinedAt": "2026-08-11T12:00:00Z" },
+    { "connectionId": "def456", "identity": "user-9", "joinedAt": "2026-08-11T12:00:03Z" }
+  ]
+}
+```
+
+This read is available **regardless** of the presence-event opt-in below — it is
+your own token-gated data, not a broadcast. Use it to render "who's online" on
+first load and to **reconcile** whenever you need ground truth.
+
+### Presence events (opt-in): `event: "presence"`
+
+When your service opts in, the gateway broadcasts a `presence` event **on the same
+channel** every time membership changes:
+
+```jsonc
+// inside the standard ChannelEvent envelope: { channel, event: "presence", data }
+{
+  "channel": "chat-api:room-42",
+  "count": 3,
+  "joined": [ { "connectionId": "def456", "identity": "user-9" } ],
+  "left":   [ "abc123" ]
+}
+```
+
+`count` is the channel's current member count; `joined` lists the connections that
+arrived (with their identity) and `left` the connection ids that departed, since
+the last event.
+
+**Opt-in per service.** Off by default. A presence event on a channel is delivered
+to **every subscriber**, so it exposes connection ids and any identity you attached
+to the whole channel audience. You must consciously enable it by setting the
+`realtime_presence` flag on your manifest entry (tri-state on upsert, like the
+other realtime fields: absent preserves, `true`/`false` sets). Leave it off unless
+your channel's subscribers are entitled to see each other. The owner API is
+unaffected either way.
+
+**Coalescing.** Membership changes are collapsed per channel behind a short (~1s)
+window: a burst of joins/leaves emits **one** `presence` event carrying all the
+deltas, not one event per change. A connection that joins and leaves inside the
+same window nets out and is never announced.
+
+### Single-instance vs Redis
+
+- **Single instance (default, `GATEWAY_REDIS_ENDPOINT` unset).** Presence is an
+  in-process map — one instance sees every connection, so its view is complete.
+  Rows are removed the moment a connection disconnects.
+- **Multi-instance (Redis backplane configured).** Presence is unioned across the
+  fleet in Redis, so the owner API and the count span every instance. Because a
+  connection is pinned to one instance, a crashed instance's rows are aged out by a
+  background reaper within a short staleness window (they may briefly linger before
+  the sweep).
+
+### Presence is best-effort
+
+Presence events are **at-most-once**, exactly like every other hub event (§1): a
+degraded backplane, a reconnect, or a lost frame can drop one, and there is no
+replay. Treat the events as fast hints and **the owner API as the truth** — render
+who's-online from `GET /internal/presence/{channel}` on load and after any gap, and
+let `presence` events drive live updates in between. Never treat a missed `left`
+event as proof a user is still present; reconcile against the API.
+
+---
+
+## 7. Limits and operational notes
 
 ### Current limits
 
@@ -506,9 +607,11 @@ gateway never short-circuits them into a direct client-to-client broadcast.
   instance and a publish is limited by whichever instance served it, so the
   buckets above are instance-local (not fleet-wide) — sized generously so a
   well-behaved app never notices.
-- **No presence yet.** The hub does not tell you who is connected or subscribed,
-  and there are no join/leave notifications to other clients (planned for phase
-  3). Do not build presence/"who's online" features on the hub today.
+- **Presence is opt-in and best-effort.** "Who's online" is a first-class
+  capability now (§6): pull the owner API `GET /internal/presence/{channel}` any
+  time, and optionally enable coalesced `presence` events with the
+  `realtime_presence` manifest flag. Events are at-most-once — reconcile against
+  the API, never treat a missed `left` as ground truth.
 
 ### Recommended polling-floor pattern for critical UI
 

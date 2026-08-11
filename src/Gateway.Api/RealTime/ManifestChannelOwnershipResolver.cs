@@ -53,7 +53,8 @@ public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
             }
 
             map[m.Name] = new ChannelOwner(
-                m.Name, m.RealtimePublishToken, m.RealtimeAuthPath, m.RealtimeMessagePath, m.Port);
+                m.Name, m.RealtimePublishToken, m.RealtimeAuthPath, m.RealtimeMessagePath,
+                m.RealtimePresence ?? false, m.Port);
         }
 
         return map;

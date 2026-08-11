@@ -39,7 +39,8 @@ public sealed record UpsertServiceRequest(
     bool? IncludeInHealth = null,
     string? RealtimeAuthPath = null,
     string? RealtimeMessagePath = null,
-    string? RealtimeAllowedOrigins = null);
+    string? RealtimeAllowedOrigins = null,
+    bool? RealtimePresence = null);
 
 /// <summary>
 /// The fleet-aware Management API (tech-spec §4.5). Every endpoint reads/writes the
@@ -448,6 +449,11 @@ public static partial class ManagementEndpoints
             RealtimeAuthPath = authPath,
             RealtimeMessagePath = messagePath,
             RealtimeAllowedOrigins = allowedOrigins,
+            // realtime_presence (task #612) is a tri-state opt-in: absent/null PRESERVES the
+            // stored flag so a minimal re-upsert never flips presence on or off, while an
+            // explicit true/false sets it. Null is treated as false everywhere (the default),
+            // so a service that never set it reads as opted-out.
+            RealtimePresence = request.RealtimePresence ?? existing?.RealtimePresence,
             IncludeInHealth = request.IncludeInHealth ?? existing?.IncludeInHealth ?? true,
             UpdatedBy = ManagementAuth.ResolveUsername(user),
             UpdatedAt = DateTimeOffset.UtcNow,
@@ -736,6 +742,9 @@ public static partial class ManagementEndpoints
             // Non-secret consumer-origin allowlist for /hub CORS (task #595); null when
             // the service contributes no origins.
             realtimeAllowedOrigins = m.RealtimeAllowedOrigins,
+            // Non-secret presence opt-in (task #612): true = membership changes emit a
+            // coalesced presence event to subscribers; null/false = off (the default).
+            realtimePresence = m.RealtimePresence ?? false,
             includeInHealth = m.IncludeInHealth,
             updatedBy = m.UpdatedBy,
             updatedAt = m.UpdatedAt,
