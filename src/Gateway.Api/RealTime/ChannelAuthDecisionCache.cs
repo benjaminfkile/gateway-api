@@ -305,11 +305,11 @@ public sealed class ChannelAuthDecisionCache
     }
 
     /// <summary>Inner key for a credential-independent allow.</summary>
-    private static string AllowKey(string channel) => "a " + channel;
+    private static string AllowKey(string channel) => "a\0" + channel;
 
     /// <summary>Inner key for a deny, namespaced by channel and a hash of the credential.</summary>
     private static string DenyKey(string channel, string? credential) =>
-        "d " + channel + " " + HashCredential(credential);
+        "d\0" + channel + "\0" + HashCredential(credential);
 
     /// <summary>
     /// A stable, non-reversible fingerprint of the credential for the deny key. The raw
@@ -320,7 +320,7 @@ public sealed class ChannelAuthDecisionCache
     {
         if (credential is null)
         {
-            return " null";
+            return "\0null";
         }
 
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(credential)));
