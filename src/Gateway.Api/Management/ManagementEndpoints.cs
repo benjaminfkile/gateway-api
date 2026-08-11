@@ -15,7 +15,21 @@ namespace Gateway.Api.Management;
 /// <summary>Body of <c>POST /mgmt/services/{name}/deploy</c>.</summary>
 public sealed record DeployRequest(string? Tag);
 
-/// <summary>Body of <c>PUT /mgmt/services/{name}</c> (create/update a manifest entry).</summary>
+/// <summary>
+/// Body of <c>PUT /mgmt/services/{name}</c> (create/update a manifest entry).
+/// <para>
+/// The two realtime security fields — <see cref="RealtimeAuthPath"/> and
+/// <see cref="RealtimeAllowedOrigins"/> — are tri-state on an edit so a minimal
+/// re-upsert (e.g. a pre-phase-2 CI workflow re-pushing only <c>image/tag/port</c>)
+/// can never silently strip them:
+/// <list type="bullet">
+/// <item><b>Absent / null</b> — preserve the value already stored on the row.</item>
+/// <item><b>Empty string</b> — explicitly clear the value to null.</item>
+/// <item><b>Non-empty</b> — validate and set the new value.</item>
+/// </list>
+/// (A create has no existing row, so absent/null simply lands as null.)
+/// </para>
+/// </summary>
 public sealed record UpsertServiceRequest(
     string? Image,
     string? Tag,
@@ -54,14 +68,26 @@ public static partial class ManagementEndpoints
     /// <c>hub</c> and <c>internal</c> are reserved because a manifest service by
     /// either name would generate a YARP route (<c>/hub/{**catch-all}</c>,
     /// <c>/internal/{**catch-all}</c>) that shadows the SignalR hub endpoint and the
-    /// internal publish listener respectively.
+    /// internal publish listener respectively. <c>ops</c> is reserved because its
+    /// realtime namespace is gateway-owned (<c>ops:*</c> channels: publishes 403 and
+    /// joins demand the operator policy), so a service by that name would have silently
+    /// dead realtime yet its <c>realtime_allowed_origins</c> would still widen /hub CORS.
     /// </summary>
     private static readonly string[] ReservedServiceNames =
     {
         ReservedGatewayName,
         "hub",
         "internal",
+        "ops",
     };
+
+    /// <summary>
+    /// True when <paramref name="name"/> is a reserved / gateway-owned service name
+    /// (case-insensitive). Used both to gate the mutating endpoints and to exclude such
+    /// names when folding <c>realtime_allowed_origins</c> into the /hub CORS set.
+    /// </summary>
+    public static bool IsReservedName(string name) =>
+        ReservedServiceNames.Contains(name, StringComparer.OrdinalIgnoreCase);
 
     [GeneratedRegex("^[a-z0-9-]+$")]
     private static partial Regex ServiceNameRegex();
@@ -202,16 +228,18 @@ public static partial class ManagementEndpoints
         CancellationToken ct,
         bool force = false)
     {
-        if (IsReserved(name, out var reserved))
-        {
-            return reserved;
-        }
-
         var manifest = await manifests.GetAsync(name, ct);
         if (manifest is null)
         {
-            return NotFoundService(name);
+            // No row to tear down: a reserved name is still blocked (it never had a
+            // legitimate row), everything else is a plain 404.
+            return IsReserved(name, out var reserved) ? reserved : NotFoundService(name);
         }
+
+        // Stop is a teardown path, so a PRE-EXISTING reserved-named row (legal before the
+        // reservation was added — the very row the reservation defends against) may be
+        // stopped so its shadowing route can be retired. Reservation blocks creation, not
+        // teardown of an already-present row.
 
         // Guardrail (tech-spec §4.5): stopping a health-check dependency requires an
         // explicit confirm flag, else 409.
@@ -316,21 +344,45 @@ public static partial class ManagementEndpoints
             return Results.BadRequest(new { error = "port must be in the range 1..65535." });
         }
 
+        var existing = await manifests.GetAsync(name, ct);
+
         // realtime_auth_path (task #594) is a path on the service, appended to the
-        // gateway-resolved base address for the auth callback. Reject anything that is
-        // not a rooted path so it can never smuggle an absolute URL into the callback.
-        var authPath = string.IsNullOrWhiteSpace(request.RealtimeAuthPath) ? null : request.RealtimeAuthPath.Trim();
-        if (authPath is not null && !authPath.StartsWith('/'))
+        // gateway-resolved base address for the auth callback. Tri-state on an edit
+        // (see UpsertServiceRequest): a null/absent field PRESERVES the stored value so a
+        // minimal re-upsert can never silently flip private channels to public; an empty
+        // string CLEARS it; a non-empty value is validated (must be a rooted path so it
+        // can never smuggle an absolute URL into the callback) and set.
+        string? authPath;
+        if (request.RealtimeAuthPath is null)
         {
-            return Results.BadRequest(new { error = "realtimeAuthPath must be a rooted path beginning with '/'." });
+            authPath = existing?.RealtimeAuthPath;
+        }
+        else
+        {
+            authPath = request.RealtimeAuthPath.Trim();
+            if (authPath.Length == 0)
+            {
+                authPath = null;
+            }
+            else if (!authPath.StartsWith('/'))
+            {
+                return Results.BadRequest(new { error = "realtimeAuthPath must be a rooted path beginning with '/'." });
+            }
         }
 
         // realtime_allowed_origins (task #595) is the comma-separated set of exact
-        // browser origins whose frontends may negotiate /hub for this service. Validate
-        // and canonicalize here so the dynamic hub CORS policy only ever stores absolute
-        // http(s) origins with no path/wildcard (a wildcard would break the credentialed
-        // exact-match the policy relies on).
-        if (!RealtimeAllowedOrigins.TryNormalize(request.RealtimeAllowedOrigins, out var allowedOrigins, out var badOrigin))
+        // browser origins whose frontends may negotiate /hub for this service. Same
+        // tri-state as the auth path: null/absent PRESERVES the stored origins (so a
+        // minimal re-upsert can never silently wipe the hub CORS allow-list), empty
+        // string CLEARS them, and a non-empty value is validated and canonicalized so the
+        // dynamic hub CORS policy only ever stores absolute http(s) origins with no
+        // path/wildcard (a wildcard would break the credentialed exact-match it relies on).
+        string? allowedOrigins;
+        if (request.RealtimeAllowedOrigins is null)
+        {
+            allowedOrigins = existing?.RealtimeAllowedOrigins;
+        }
+        else if (!RealtimeAllowedOrigins.TryNormalize(request.RealtimeAllowedOrigins, out allowedOrigins, out var badOrigin))
         {
             return Results.BadRequest(new
             {
@@ -338,7 +390,6 @@ public static partial class ManagementEndpoints
             });
         }
 
-        var existing = await manifests.GetAsync(name, ct);
         // A pinned digest is only valid for the exact image:tag it was resolved from.
         // If the edit changes the image or tag, the old digest is stale — clear it so
         // the next reconcile re-resolves the digest from the new tag (production bug
@@ -391,16 +442,16 @@ public static partial class ManagementEndpoints
         CancellationToken ct,
         bool force = false)
     {
-        if (IsReserved(name, out var reserved))
-        {
-            return reserved;
-        }
-
         var manifest = await manifests.GetAsync(name, ct);
         if (manifest is null)
         {
-            return NotFoundService(name);
+            // No row to tear down: a reserved name is still blocked, everything else 404s.
+            return IsReserved(name, out var reserved) ? reserved : NotFoundService(name);
         }
+
+        // Delete is a teardown path (see StopAsync): a pre-existing reserved-named row may
+        // be removed so its shadowing YARP route stops being generated. Reservation blocks
+        // creation, not the teardown of a row that already exists.
 
         // Guardrail mirroring stop (tech-spec §4.5): removing a health-check
         // dependency requires an explicit confirm flag, else 409.

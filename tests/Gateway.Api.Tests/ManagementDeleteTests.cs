@@ -131,6 +131,27 @@ public class ManagementDeleteTests
     }
 
     [Fact]
+    public async Task Delete_PreExistingReservedRow_RemovesRow()
+    {
+        // FINDING 2b: reservation blocks CREATION, not teardown. A pre-existing row named
+        // "internal" (legal before the reservation) must remain deletable so its shadowing
+        // route stops being generated — without hand-editing the DB.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("internal", includeInHealth: false, digest: "sha256:v1"));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.DeleteAsync("/mgmt/services/internal");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            Assert.False(await db.ServiceManifests.AnyAsync(x => x.Name == "internal"));
+            var audit = await db.DeployHistory.SingleAsync();
+            Assert.Equal(DeployAction.Delete, audit.Action);
+        });
+    }
+
+    [Fact]
     public async Task Delete_DeployToken_Forbidden_NotAdmin()
     {
         await using var factory = new ManagementApiFactory();

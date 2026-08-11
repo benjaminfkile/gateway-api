@@ -110,6 +110,22 @@ public class HubCorsTests
     }
 
     [Fact]
+    public async Task ReservedNameOrigins_NotFoldedIntoHubCors()
+    {
+        // FINDING 2b: a reserved / gateway-owned name (here "ops") must never widen /hub
+        // CORS. Such a row can exist only if it predates the reservation (the API blocks
+        // creating it), but its realtime_allowed_origins still must not grant credentialed
+        // hub access for realtime that can never work.
+        await using var factory = new HubCorsFactory();
+        await factory.AddServiceAsync("ops", ChatOrigin);
+        using var client = factory.CreateClient();
+
+        var response = await client.SendAsync(Preflight("/hub/negotiate", ChatOrigin));
+
+        Assert.False(response.Headers.Contains("Access-Control-Allow-Origin"));
+    }
+
+    [Fact]
     public async Task ServiceOrigin_RejectedOnManagementPlane()
     {
         // The widened set applies to /hub only; /mgmt keeps the strict static ops policy,

@@ -169,6 +169,41 @@ public class ManagementLifecycleTests
     }
 
     [Fact]
+    public async Task Stop_PreExistingReservedRow_Succeeds()
+    {
+        // FINDING 2b: reservation blocks CREATION, not teardown. A row named "hub" was
+        // legal before the reservation and keeps generating a shadowing YARP route — it
+        // must remain stoppable via the API so an operator can retire it without editing
+        // the DB by hand.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("hub", includeInHealth: false));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PostAsync("/mgmt/services/hub/stop", null);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        await factory.WithDbAsync(async db =>
+        {
+            var m = await db.ServiceManifests.SingleAsync(x => x.Name == "hub");
+            Assert.Equal("stopped", m.DesiredStatus);
+        });
+    }
+
+    [Fact]
+    public async Task Start_PreExistingReservedRow_StillRejected()
+    {
+        // FINDING 2b: start is NOT a teardown path — it re-asserts running and keeps the
+        // shadowing route alive — so it stays blocked even when a reserved-named row exists.
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("hub", desiredStatus: "stopped", includeInHealth: false));
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var response = await client.PostAsync("/mgmt/services/hub/start", null);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task Lifecycle_DeployToken_Forbidden_NotAdmin()
     {
         await using var factory = new ManagementApiFactory();
