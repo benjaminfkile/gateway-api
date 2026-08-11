@@ -37,14 +37,19 @@ public class HubCorsTests
                 services.RemoveAll<IManifestStore>();
                 services.AddSingleton<IManifestStore>(Manifest);
 
-                // Swap the cache for one on a controllable clock, keeping the same static
-                // origins the host would have derived from GATEWAY_CORS_ORIGINS.
+                // Swap the shared manifest snapshot cache for one on a controllable clock
+                // (the TTL lives there now), then rebuild the /hub origin cache off it,
+                // keeping the same static origins the host would have derived from
+                // GATEWAY_CORS_ORIGINS.
+                services.RemoveAll<ManifestSnapshotCache>();
+                services.AddSingleton(sp => new ManifestSnapshotCache(
+                    sp.GetRequiredService<IServiceScopeFactory>(),
+                    ManifestSnapshotCache.DefaultTtl,
+                    Clock));
                 services.RemoveAll<HubCorsOriginCache>();
                 services.AddSingleton(sp => new HubCorsOriginCache(
-                    sp.GetRequiredService<IServiceScopeFactory>(),
-                    new[] { OpsOrigin },
-                    HubCorsOriginCache.DefaultTtl,
-                    Clock));
+                    sp.GetRequiredService<ManifestSnapshotCache>(),
+                    new[] { OpsOrigin }));
             });
         }
 

@@ -1,6 +1,7 @@
 using Gateway.Api.Proxy;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace Gateway.Api.RealTime;
 
@@ -58,12 +59,22 @@ public static class RealtimeServiceCollectionExtensions
         // context and a logger, both singletons.
         services.TryAddSingleton<IChannelEventPublisher, ChannelEventPublisher>();
 
+        // The one short-TTL manifest snapshot shared by every realtime consumer that
+        // would otherwise read the manifest per request (task #607): channel ownership
+        // below and the /hub CORS origin cache both project off it, so the instance runs
+        // at most one full-manifest read per TTL — serve-stale and single-flight, so a
+        // transient DB blip never 500s a join, publish, or preflight.
+        services.TryAddSingleton(sp => new ManifestSnapshotCache(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            ttl: null,
+            clock: null,
+            logger: sp.GetRequiredService<ILoggerFactory>().CreateLogger<ManifestSnapshotCache>()));
+
         // Channel-ownership resolver (task #593): the hub's JoinChannel and the
         // internal publish endpoint both consult it to map a channel prefix onto the
-        // owning manifest service. Singleton with a short-TTL cache over the manifest
-        // store, reached through a scope factory like the reconciler.
+        // owning manifest service. Projects the ownership map off the shared snapshot.
         services.TryAddSingleton<IChannelOwnershipResolver>(sp =>
-            new ManifestChannelOwnershipResolver(sp.GetRequiredService<IServiceScopeFactory>()));
+            new ManifestChannelOwnershipResolver(sp.GetRequiredService<ManifestSnapshotCache>()));
 
         // Delegated channel auth (task #594): a private channel's join is authorized by
         // the owning service's own callback, not the gateway. A dedicated HttpClient
