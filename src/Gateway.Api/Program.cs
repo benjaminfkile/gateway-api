@@ -111,17 +111,28 @@ builder.Services.AddManagementServices();
 // allowed, with credentials for SignalR; unset → no CORS and the management
 // plane stays same-origin-only. Proxied application traffic is never touched —
 // downstream apps own their CORS end-to-end (design invariant, §1).
-var corsOrigins = (Environment.GetEnvironmentVariable("GATEWAY_CORS_ORIGINS")
-        ?? builder.Configuration["GATEWAY_CORS_ORIGINS"])
-    ?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-    ?? Array.Empty<string>();
+// The raw GATEWAY_CORS_ORIGINS value flows through ONE canonicalization
+// (RealtimeAllowedOrigins) before feeding BOTH surfaces (task #607, origin parity):
+// the static "ops" /mgmt policy and the dynamic /hub policy. Previously /mgmt used the
+// verbatim Split() while /hub canonicalized, so the same env value — e.g. a trailing
+// slash or an explicit :443 — could pass one surface and silently fail the other, and a
+// malformed entry vanished from /hub with no diagnostic. Canonicalizing once removes
+// that skew; the normalized/dropped entries are logged at Warning after the host builds.
+var canonicalCors = RealtimeAllowedOrigins.CanonicalizeConfigured(
+    Environment.GetEnvironmentVariable("GATEWAY_CORS_ORIGINS")
+    ?? builder.Configuration["GATEWAY_CORS_ORIGINS"]);
+var corsOrigins = canonicalCors
+    .Where(o => !o.WasDropped)
+    .Select(o => o.Canonical!)
+    .Distinct(StringComparer.OrdinalIgnoreCase)
+    .ToArray();
 // The static "ops" policy (dashboard origins) is registered only when configured and
-// stays exactly as before — it is what /mgmt uses. CORS services are always added,
-// though, because /hub now carries a second, dynamic policy (task #595): the manifest-
-// driven "hub" policy resolved by HubCorsPolicyProvider from HubCorsOriginCache. That
-// policy's origin set is the static ops origins ∪ every service's realtime_allowed_
-// origins, refreshed on a short TTL so a manifest CORS change needs no gateway restart
-// and never runs a DB query per preflight.
+// matches /mgmt exactly as before, save that its origins are now canonicalized. CORS
+// services are always added, though, because /hub now carries a second, dynamic policy
+// (task #595): the manifest-driven "hub" policy resolved by HubCorsPolicyProvider from
+// HubCorsOriginCache. That policy's origin set is the static ops origins ∪ every
+// service's realtime_allowed_origins, refreshed on a short TTL so a manifest CORS change
+// needs no gateway restart and never runs a DB query per preflight.
 builder.Services.AddCors(options =>
 {
     if (corsOrigins.Length > 0)
@@ -134,7 +145,7 @@ builder.Services.AddCors(options =>
     }
 });
 builder.Services.AddSingleton(sp => new HubCorsOriginCache(
-    sp.GetRequiredService<IServiceScopeFactory>(), corsOrigins));
+    sp.GetRequiredService<ManifestSnapshotCache>(), corsOrigins));
 builder.Services.AddSingleton<ICorsPolicyProvider, HubCorsPolicyProvider>();
 
 // Node bootstrap (tech-spec §4.3, §2): the idempotent pipeline that provisions the
@@ -149,6 +160,28 @@ builder.Services.AddNodeBootstrap(builder.Configuration);
 builder.Services.AddSystemdWatchdog();
 
 var app = builder.Build();
+
+// Surface every GATEWAY_CORS_ORIGINS entry the canonicalization above rewrote or
+// dropped (task #607, origin parity): a normalized entry (before -> after) and a
+// dropped entry (with the reason it failed) both used to be silent, so an operator
+// could not tell why an origin that "looked right" never matched.
+foreach (var entry in canonicalCors)
+{
+    if (entry.WasDropped)
+    {
+        app.Logger.LogWarning(
+            "GATEWAY_CORS_ORIGINS entry '{Entry}' was dropped from both /mgmt and /hub CORS: {Reason}.",
+            entry.Original,
+            entry.DropReason);
+    }
+    else if (entry.WasNormalized)
+    {
+        app.Logger.LogWarning(
+            "GATEWAY_CORS_ORIGINS entry '{Entry}' was normalized to '{Canonical}' for both /mgmt and /hub CORS.",
+            entry.Original,
+            entry.Canonical);
+    }
+}
 
 // Keep the public and internal listeners' surfaces disjoint before any endpoint
 // runs (tech-spec §8): /internal/* only on the internal port, nothing else there.

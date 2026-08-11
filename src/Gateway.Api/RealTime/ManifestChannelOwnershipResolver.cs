@@ -1,15 +1,16 @@
-using Gateway.Api.Manifest;
-using Microsoft.Extensions.DependencyInjection;
-
 namespace Gateway.Api.RealTime;
 
 /// <summary>
 /// <see cref="IChannelOwnershipResolver"/> over the manifest store (tech-spec §4.2,
 /// task #593). Resolves ownership the same way the reconciler reads desired state —
-/// through <see cref="IManifestStore"/> — but caches a whole-manifest snapshot for a
-/// short TTL (~30s) so a burst of hub joins or publishes does not query the DB per
-/// call. A singleton (it outlives the scoped store), so it reaches the store through
-/// an <see cref="IServiceScopeFactory"/> exactly as the reconciler does.
+/// from the manifest — but reads it through the shared <see cref="ManifestSnapshotCache"/>
+/// (the one short-TTL, serve-stale, single-flight manifest read that <c>/hub</c> CORS
+/// also projects off) so a burst of hub joins or publishes does not query the DB per
+/// call, and a transient DB blip past the TTL does not 500 every non-ops join
+/// (including PUBLIC channels — resolution runs before the auth-path null-check) and
+/// every <c>/internal/publish</c>. The name→owner map is projected from the snapshot and
+/// memoized against the snapshot reference so it is rebuilt only when the snapshot
+/// changes, not on every call.
 /// <para>
 /// The 30s staleness is deliberate and safe: a newly-added service becomes joinable /
 /// publishable within one TTL, and a rotated token keeps working for at most one TTL —
@@ -20,20 +21,20 @@ namespace Gateway.Api.RealTime;
 public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
 {
     /// <summary>Default cache lifetime — roughly one reconcile loop.</summary>
-    public static readonly TimeSpan DefaultTtl = TimeSpan.FromSeconds(30);
+    /// <remarks>Retained for callers/tests that referenced it; the TTL now lives on
+    /// <see cref="ManifestSnapshotCache"/>.</remarks>
+    public static readonly TimeSpan DefaultTtl = ManifestSnapshotCache.DefaultTtl;
 
-    private readonly IServiceScopeFactory _scopeFactory;
-    private readonly TimeSpan _ttl;
-    private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private readonly ManifestSnapshotCache _snapshots;
+    private readonly object _projectionGate = new();
 
-    // Snapshot of service name -> publish token, and when it was taken. Replaced
-    // wholesale on refresh so readers always see a consistent map.
-    private volatile Snapshot? _snapshot;
+    // The ownership map last projected, keyed off the snapshot it was projected from.
+    private ManifestSnapshotCache.Snapshot? _projectedFrom;
+    private IReadOnlyDictionary<string, ChannelOwner>? _projected;
 
-    public ManifestChannelOwnershipResolver(IServiceScopeFactory scopeFactory, TimeSpan? ttl = null)
+    public ManifestChannelOwnershipResolver(ManifestSnapshotCache snapshots)
     {
-        _scopeFactory = scopeFactory;
-        _ttl = ttl ?? DefaultTtl;
+        _snapshots = snapshots;
     }
 
     public async Task<ChannelOwner?> ResolveAsync(string prefix, CancellationToken ct = default)
@@ -44,40 +45,28 @@ public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
 
     private async Task<IReadOnlyDictionary<string, ChannelOwner>> GetServicesAsync(CancellationToken ct)
     {
-        var current = _snapshot;
-        if (current is not null && DateTimeOffset.UtcNow - current.TakenAt < _ttl)
-        {
-            return current.Services;
-        }
+        var snapshot = await _snapshots.GetAsync(ct);
 
-        await _refreshLock.WaitAsync(ct);
-        try
+        lock (_projectionGate)
         {
-            // Re-check: another caller may have refreshed while we waited on the lock.
-            current = _snapshot;
-            if (current is not null && DateTimeOffset.UtcNow - current.TakenAt < _ttl)
+            if (ReferenceEquals(snapshot, _projectedFrom) && _projected is not null)
             {
-                return current.Services;
+                return _projected;
             }
-
-            using var scope = _scopeFactory.CreateScope();
-            var store = scope.ServiceProvider.GetRequiredService<IManifestStore>();
-            var all = await store.GetAllAsync(ct);
-
-            var map = new Dictionary<string, ChannelOwner>(StringComparer.Ordinal);
-            foreach (var m in all)
-            {
-                map[m.Name] = new ChannelOwner(m.Name, m.RealtimePublishToken, m.RealtimeAuthPath, m.Port);
-            }
-
-            _snapshot = new Snapshot(map, DateTimeOffset.UtcNow);
-            return map;
         }
-        finally
+
+        var map = new Dictionary<string, ChannelOwner>(StringComparer.Ordinal);
+        foreach (var m in snapshot.Services)
         {
-            _refreshLock.Release();
+            map[m.Name] = new ChannelOwner(m.Name, m.RealtimePublishToken, m.RealtimeAuthPath, m.Port);
         }
+
+        lock (_projectionGate)
+        {
+            _projectedFrom = snapshot;
+            _projected = map;
+        }
+
+        return map;
     }
-
-    private sealed record Snapshot(IReadOnlyDictionary<string, ChannelOwner> Services, DateTimeOffset TakenAt);
 }

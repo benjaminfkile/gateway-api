@@ -74,24 +74,74 @@ public static class RealtimeAllowedOrigins
         }
     }
 
-    private static bool TryNormalizeOrigin(string entry, out string origin)
+    /// <summary>
+    /// The outcome of canonicalizing one configured origin entry: the original text, its
+    /// canonical origin form (null when the entry is malformed and was dropped), and, on a
+    /// drop, a human-readable reason. Used to give the <b>same</b> canonicalization to
+    /// both CORS surfaces (the static <c>ops</c> /mgmt policy and the dynamic /hub policy)
+    /// from a single <c>GATEWAY_CORS_ORIGINS</c> value, and to log every entry that was
+    /// normalized or dropped at startup (task #607, origin parity).
+    /// </summary>
+    public readonly record struct CanonicalOrigin(string Original, string? Canonical, string? DropReason)
+    {
+        /// <summary>The entry was malformed and excluded from both CORS surfaces.</summary>
+        public bool WasDropped => Canonical is null;
+
+        /// <summary>The entry was valid but rewritten (e.g. a trailing slash or default port removed).</summary>
+        public bool WasNormalized => Canonical is not null && !string.Equals(Original, Canonical, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Canonicalize a raw comma-separated <c>GATEWAY_CORS_ORIGINS</c> value into one
+    /// per-entry result each, preserving input order and reporting drops with a reason.
+    /// Callers feed the surviving <see cref="CanonicalOrigin.Canonical"/> values to both
+    /// the /mgmt and /hub CORS surfaces so a single env value can never pass one and fail
+    /// the other, and log the normalized/dropped entries.
+    /// </summary>
+    public static IReadOnlyList<CanonicalOrigin> CanonicalizeConfigured(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return Array.Empty<CanonicalOrigin>();
+        }
+
+        var parts = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var results = new List<CanonicalOrigin>(parts.Length);
+        foreach (var part in parts)
+        {
+            results.Add(TryNormalizeOrigin(part, out var origin, out var reason)
+                ? new CanonicalOrigin(part, origin, null)
+                : new CanonicalOrigin(part, null, reason));
+        }
+
+        return results;
+    }
+
+    private static bool TryNormalizeOrigin(string entry, out string origin) =>
+        TryNormalizeOrigin(entry, out origin, out _);
+
+    private static bool TryNormalizeOrigin(string entry, out string origin, out string? reason)
     {
         origin = string.Empty;
+        reason = null;
 
         // A wildcard anywhere would defeat the exact-match requirement of a
         // credentialed CORS policy, so reject it outright.
         if (entry.Contains('*'))
         {
+            reason = "wildcards are not allowed in a credentialed CORS origin";
             return false;
         }
 
         if (!Uri.TryCreate(entry, UriKind.Absolute, out var uri))
         {
+            reason = "not an absolute URI";
             return false;
         }
 
         if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
         {
+            reason = $"scheme '{uri.Scheme}' is not http or https";
             return false;
         }
 
@@ -101,6 +151,7 @@ public static class RealtimeAllowedOrigins
             || !string.IsNullOrEmpty(uri.Fragment)
             || (uri.AbsolutePath != "/" && uri.AbsolutePath.Length > 0))
         {
+            reason = "an origin must be scheme://host[:port] with no userinfo, path, query, or fragment";
             return false;
         }
 

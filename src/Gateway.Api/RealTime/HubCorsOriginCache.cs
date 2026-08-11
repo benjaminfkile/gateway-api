@@ -1,5 +1,4 @@
 using Gateway.Api.Management;
-using Gateway.Api.Manifest;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Gateway.Api.RealTime;
@@ -10,101 +9,89 @@ namespace Gateway.Api.RealTime;
 /// <c>GATEWAY_CORS_ORIGINS</c> ops-dashboard origins, plus the union of every manifest
 /// service's <c>realtime_allowed_origins</c>.
 /// <para>
-/// The manifest half is read through <see cref="IManifestStore"/> and cached whole for
-/// a short TTL (~30s) so a burst of <c>/hub/negotiate</c> preflights never runs a DB
+/// The manifest half comes from the shared <see cref="ManifestSnapshotCache"/> — the one
+/// short-TTL, serve-stale, single-flight read of the manifest that channel ownership
+/// also projects off — so a burst of <c>/hub/negotiate</c> preflights never runs a DB
 /// query per request, yet a newly-upserted origin becomes effective within one TTL with
-/// no gateway restart. A singleton (it outlives the scoped store), reaching the store
-/// through an <see cref="IServiceScopeFactory"/> exactly as the reconciler and the
-/// channel-ownership resolver do. The clock is injectable so the TTL is deterministic in
-/// tests.
+/// no gateway restart. The origin set is projected from the snapshot and memoized
+/// against the snapshot reference so the union is recomputed only when the snapshot
+/// actually changes, not on every preflight.
+/// </para>
+/// <para>
+/// The static origins are always merged in, even while the manifest half is stale or a
+/// refresh is failing: a transient DB blip must never 500 a preflight from a statically
+/// configured ops origin that needed no DB in the first place.
 /// </para>
 /// </summary>
 public sealed class HubCorsOriginCache
 {
     /// <summary>Default cache lifetime — roughly one reconcile loop.</summary>
-    public static readonly TimeSpan DefaultTtl = TimeSpan.FromSeconds(30);
+    /// <remarks>Retained for callers/tests that referenced it; the TTL now lives on
+    /// <see cref="ManifestSnapshotCache"/>.</remarks>
+    public static readonly TimeSpan DefaultTtl = ManifestSnapshotCache.DefaultTtl;
 
-    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ManifestSnapshotCache _snapshots;
     private readonly IReadOnlyList<string> _staticOrigins;
-    private readonly TimeSpan _ttl;
-    private readonly TimeProvider _clock;
-    private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private readonly object _projectionGate = new();
 
-    // The most recent union (static ∪ manifest) and when it was built. Replaced
-    // wholesale on refresh so a reader always sees a consistent, complete set.
-    private volatile Snapshot? _snapshot;
+    // The origin union last projected, keyed off the snapshot it was projected from.
+    private ManifestSnapshotCache.Snapshot? _projectedFrom;
+    private IReadOnlySet<string>? _projected;
 
-    public HubCorsOriginCache(
-        IServiceScopeFactory scopeFactory,
-        IEnumerable<string> staticOrigins,
-        TimeSpan? ttl = null,
-        TimeProvider? clock = null)
+    public HubCorsOriginCache(ManifestSnapshotCache snapshots, IEnumerable<string> staticOrigins)
     {
-        _scopeFactory = scopeFactory;
+        _snapshots = snapshots;
         // Normalize the static origins too so a dashboard origin compares byte-for-byte
         // against the browser Origin header just like the manifest ones.
         _staticOrigins = staticOrigins
             .SelectMany(o => RealtimeAllowedOrigins.Parse(o))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        _ttl = ttl ?? DefaultTtl;
-        _clock = clock ?? TimeProvider.System;
     }
 
     /// <summary>
     /// The current set of allowed origins (static ∪ manifest), refreshing the manifest
-    /// half when the cached snapshot has aged past the TTL. Case-insensitive membership
-    /// so it matches the browser's lowercase <c>Origin</c> header.
+    /// half when the shared snapshot has aged past the TTL (serving the last good set if
+    /// that refresh fails). Case-insensitive membership so it matches the browser's
+    /// lowercase <c>Origin</c> header.
     /// </summary>
     public async Task<IReadOnlySet<string>> GetAllowedOriginsAsync(CancellationToken ct = default)
     {
-        var current = _snapshot;
-        if (current is not null && _clock.GetUtcNow() - current.TakenAt < _ttl)
+        var snapshot = await _snapshots.GetAsync(ct);
+
+        lock (_projectionGate)
         {
-            return current.Origins;
+            if (ReferenceEquals(snapshot, _projectedFrom) && _projected is not null)
+            {
+                return _projected;
+            }
         }
 
-        await _refreshLock.WaitAsync(ct);
-        try
+        var set = new HashSet<string>(_staticOrigins, StringComparer.OrdinalIgnoreCase);
+        foreach (var m in snapshot.Services)
         {
-            // Re-check: another caller may have refreshed while we waited on the lock.
-            current = _snapshot;
-            if (current is not null && _clock.GetUtcNow() - current.TakenAt < _ttl)
+            // A reserved / gateway-owned name (gateway, hub, internal, ops) must never
+            // widen /hub CORS: its channels are gateway-owned (publishes 403, joins
+            // demand the operator policy), so folding its origins in would grant
+            // credentialed hub access for realtime that can never work. Skip it even if
+            // a pre-reservation row still carries origins.
+            if (ManagementEndpoints.IsReservedName(m.Name))
             {
-                return current.Origins;
+                continue;
             }
 
-            using var scope = _scopeFactory.CreateScope();
-            var store = scope.ServiceProvider.GetRequiredService<IManifestStore>();
-            var all = await store.GetAllAsync(ct);
-
-            var set = new HashSet<string>(_staticOrigins, StringComparer.OrdinalIgnoreCase);
-            foreach (var m in all)
+            foreach (var origin in RealtimeAllowedOrigins.Parse(m.RealtimeAllowedOrigins))
             {
-                // A reserved / gateway-owned name (gateway, hub, internal, ops) must never
-                // widen /hub CORS: its channels are gateway-owned (publishes 403, joins
-                // demand the operator policy), so folding its origins in would grant
-                // credentialed hub access for realtime that can never work. Skip it even if
-                // a pre-reservation row still carries origins.
-                if (ManagementEndpoints.IsReservedName(m.Name))
-                {
-                    continue;
-                }
-
-                foreach (var origin in RealtimeAllowedOrigins.Parse(m.RealtimeAllowedOrigins))
-                {
-                    set.Add(origin);
-                }
+                set.Add(origin);
             }
+        }
 
-            _snapshot = new Snapshot(set, _clock.GetUtcNow());
-            return set;
-        }
-        finally
+        lock (_projectionGate)
         {
-            _refreshLock.Release();
+            _projectedFrom = snapshot;
+            _projected = set;
         }
+
+        return set;
     }
-
-    private sealed record Snapshot(IReadOnlySet<string> Origins, DateTimeOffset TakenAt);
 }
