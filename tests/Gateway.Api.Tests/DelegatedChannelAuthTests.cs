@@ -123,8 +123,15 @@ public class DelegatedChannelAuthTests
         await using var factory = NewFactory(downstream);
         await using var connection = BuildConnection(factory);
 
+        // Route past the immediate caller-only "joined" ack to the broadcast under test.
         var received = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        connection.On<JsonElement>(IChannelEventPublisher.ChannelEventMethod, env => received.TrySetResult(env));
+        connection.On<JsonElement>(IChannelEventPublisher.ChannelEventMethod, env =>
+        {
+            if (env.GetProperty("event").GetString() != GatewayHub.JoinedAckEvent)
+            {
+                received.TrySetResult(env);
+            }
+        });
 
         await connection.StartAsync();
         await connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, "opaque-credential");

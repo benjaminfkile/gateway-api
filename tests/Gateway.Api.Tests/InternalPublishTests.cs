@@ -121,6 +121,39 @@ public sealed class InternalPublishTests
     }
 
     [Fact]
+    public async Task JoinChannel_SendsImmediateJoinedAck()
+    {
+        // A fresh subscriber must get its first provable delivery IMMEDIATELY (the
+        // caller-only "joined" ack), not whenever the next broadcast fires — for the
+        // dashboard's ops:fleet that gap was up to a full ~30s heartbeat interval of
+        // grey dot on an entirely healthy connection.
+        await using var gateway = await StartGatewayAsync();
+
+        await using var connection = new HubConnectionBuilder()
+            .WithUrl($"http://127.0.0.1:{gateway.PublicPort}/hub")
+            .Build();
+
+        var acked = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        connection.On<JsonElement>("ChannelEvent", envelope =>
+        {
+            if (envelope.GetProperty("event").GetString() == GatewayHub.JoinedAckEvent)
+            {
+                acked.TrySetResult(envelope);
+            }
+        });
+
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinChannel", "svc-a:orders");
+
+        var completed = await Task.WhenAny(acked.Task, Task.Delay(TimeSpan.FromSeconds(10)));
+        Assert.True(completed == acked.Task, "join did not produce an immediate joined ack");
+
+        var ack = await acked.Task;
+        Assert.Equal("svc-a:orders", ack.GetProperty("channel").GetString());
+        Assert.Equal("svc-a:orders", ack.GetProperty("data").GetProperty("channel").GetString());
+    }
+
+    [Fact]
     public async Task InternalPublish_ReachesJoinedClient()
     {
         await using var gateway = await StartGatewayAsync();
@@ -130,9 +163,17 @@ public sealed class InternalPublishTests
             .Build();
 
         // Clients register ONE handler on the ChannelEvent method and route on the
-        // envelope's channel/event fields (§4.2 wire contract).
+        // envelope's channel/event fields (§4.2 wire contract). Joins now emit an
+        // immediate caller-only "joined" ack (instant liveness), so route past it to
+        // the broadcast this test is about.
         var received = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
-        connection.On<JsonElement>("ChannelEvent", envelope => received.TrySetResult(envelope));
+        connection.On<JsonElement>("ChannelEvent", envelope =>
+        {
+            if (envelope.GetProperty("event").GetString() != GatewayHub.JoinedAckEvent)
+            {
+                received.TrySetResult(envelope);
+            }
+        });
 
         await connection.StartAsync();
         await connection.InvokeAsync("JoinChannel", "svc-a:orders");

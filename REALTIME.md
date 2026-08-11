@@ -155,6 +155,13 @@ malformed, if the prefix is not a known service, or if the channel is private an
 authorization is denied (see §3). Catch it and surface a sensible UI state rather
 than letting it go unhandled.
 
+Every successful join is immediately followed by a **caller-only ack event** on
+the channel: `{ channel, event: "joined", data: { channel } }`. It is not
+broadcast to other members — it exists so a freshly-joined client has instant
+proof of end-to-end delivery (useful for a "live" indicator) instead of waiting
+for the channel's next real event. Ignore it if you don't need it, and don't
+treat it as an application event.
+
 ### Re-join after every reconnect
 
 **Channel membership lives on the connection id and dies with it.** When the

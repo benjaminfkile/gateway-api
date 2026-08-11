@@ -214,7 +214,28 @@ public sealed class GatewayHub : Hub
         // Presence (task #612): add to the workload-agnostic registry and buffer a join
         // delta for a coalesced presence event. Best-effort — presence never fails a join.
         await AddPresenceAsync(channel, identity);
+
+        // Targeted join ack: the FIRST provable delivery on this channel arrives
+        // immediately instead of whenever the next broadcast happens to fire (for
+        // ops:fleet that was the ~30s leader heartbeat — a fresh dashboard sat grey for
+        // up to a heartbeat interval despite a healthy connection). Riding the normal
+        // ChannelEvent envelope means every liveness tap stamps it with no client
+        // changes. Caller-only — never broadcast — and best-effort: a dying socket must
+        // not fail a join that already succeeded.
+        try
+        {
+            await Clients.Caller.SendAsync(
+                IChannelEventPublisher.ChannelEventMethod,
+                new { channel, @event = JoinedAckEvent, data = new { channel } });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Join ack send failed for {Channel} (connection likely closing).", channel);
+        }
     }
+
+    /// <summary>The envelope <c>event</c> name of the caller-only join acknowledgement.</summary>
+    public const string JoinedAckEvent = "joined";
 
     /// <summary>Unsubscribe the caller from a channel.</summary>
     public async Task LeaveChannel(string channel)
