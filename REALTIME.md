@@ -87,7 +87,17 @@ The gateway hosts one SignalR hub at `/hub`. Use the official
 import * as signalR from "@microsoft/signalr";
 
 const connection = new signalR.HubConnectionBuilder()
-  .withUrl("https://gateway.example.com/hub")
+  .withUrl("https://gateway.example.com/hub", {
+    // REQUIRED for reliable connects: the gateway is a multi-instance fleet
+    // behind a load balancer WITHOUT sticky sessions. SignalR's default
+    // negotiate handshake issues a connection id valid only on the instance
+    // that answered it, so the follow-up WebSocket open 404s whenever the LB
+    // routes it to a different instance. Skipping negotiation makes the
+    // WebSocket the one and only request — whichever instance accepts it owns
+    // the connection, and the backplane still fans events out fleet-wide.
+    skipNegotiation: true,
+    transport: signalR.HttpTransportType.WebSockets,
+  })
   .withAutomaticReconnect()
   .build();
 ```
@@ -95,6 +105,13 @@ const connection = new signalR.HubConnectionBuilder()
 Public channels require **no** credential at connect time — the hub performs no
 end-user authentication for downstream channels (private channels are authorized
 per-join, see §3).
+
+> **Why WebSockets-only?** The negotiate/404 issue above means the fallback
+> transports (Server-Sent Events, long polling) — which *require* the negotiate
+> handshake and per-request instance affinity — do not work reliably against the
+> fleet. Every current browser supports WebSockets; if you must support a
+> WebSocket-hostile network path, ask the gateway operator about enabling
+> load-balancer sticky sessions before relying on fallback transports.
 
 ### One client method: `ChannelEvent`
 
