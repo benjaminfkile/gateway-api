@@ -22,19 +22,139 @@ public class ChannelAuthDecisionCacheTests
     }
 
     [Fact]
-    public void StoreAllow_Cached_ForConnectionLifetime_WithIdentity()
+    public void StoreAllow_Cached_WithinAllowTtl_WithIdentity()
     {
         var clock = new TestClock();
-        var cache = new ChannelAuthDecisionCache(clock, TimeSpan.FromSeconds(10));
+        var cache = new ChannelAuthDecisionCache(
+            clock, denialTtl: TimeSpan.FromSeconds(10), allowTtl: TimeSpan.FromMinutes(15));
 
         cache.StoreAllow("conn-1", "svc-a:room", identity: "user-42");
 
-        // Well past any denial TTL: an allow never expires while the connection lives.
-        clock.Now += TimeSpan.FromHours(1);
+        // Well past the denial TTL but within the allow window: still admitted, identity kept.
+        clock.Now += TimeSpan.FromMinutes(10);
         var decision = cache.TryGet("conn-1", "svc-a:room");
         Assert.NotNull(decision);
         Assert.True(decision!.Value.Allowed);
         Assert.Equal("user-42", decision.Value.Identity);
+    }
+
+    [Fact]
+    public void StoreAllow_ExpiresAfterAllowTtl_ForcingReAuth()
+    {
+        // Task #608 finding 2: an allow now has a finite TTL so a revoked credential cannot
+        // ride a long-lived connection forever — past the window the next join re-authorizes.
+        var clock = new TestClock();
+        var cache = new ChannelAuthDecisionCache(
+            clock, denialTtl: TimeSpan.FromSeconds(10), allowTtl: TimeSpan.FromMinutes(15));
+
+        cache.StoreAllow("conn-1", "svc-a:room", identity: "user-42");
+
+        // Within the window: cached.
+        clock.Now += TimeSpan.FromMinutes(14);
+        Assert.NotNull(cache.TryGet("conn-1", "svc-a:room"));
+
+        // Past the window: a miss, so the next join re-consults the owning service.
+        clock.Now += TimeSpan.FromMinutes(2);
+        Assert.Null(cache.TryGet("conn-1", "svc-a:room"));
+    }
+
+    [Fact]
+    public void StoreDeny_ThenDifferentCredential_IsMiss_SameCredentialCached()
+    {
+        // Task #608 finding 1: the deny is keyed on the credential, so a retry with a
+        // DIFFERENT (now-valid) credential is not short-circuited by the stale deny, while
+        // a retry with the SAME rejected credential still is (within the TTL).
+        var clock = new TestClock();
+        var cache = new ChannelAuthDecisionCache(clock, TimeSpan.FromSeconds(10));
+
+        cache.StoreDeny("conn-1", "svc-a:room", credential: "stale-token");
+
+        // Same credential: served from the deny cache.
+        var same = cache.TryGet("conn-1", "svc-a:room", "stale-token");
+        Assert.NotNull(same);
+        Assert.False(same!.Value.Allowed);
+
+        // A different, now-valid credential: a miss, so the join reaches the owning service.
+        Assert.Null(cache.TryGet("conn-1", "svc-a:room", "fresh-token"));
+    }
+
+    [Fact]
+    public void StoreDeny_ThenAllow_SameChannel_AllowWins()
+    {
+        // A deny (per-credential) and a later allow (credential-independent) coexist under
+        // one channel; the allow admits any credential regardless of the earlier deny.
+        var cache = new ChannelAuthDecisionCache();
+
+        cache.StoreDeny("conn-1", "svc-a:room", credential: "bad");
+        cache.StoreAllow("conn-1", "svc-a:room", identity: "user-1");
+
+        var decision = cache.TryGet("conn-1", "svc-a:room", "anything");
+        Assert.NotNull(decision);
+        Assert.True(decision!.Value.Allowed);
+    }
+
+    [Fact]
+    public void Store_AfterDrop_Discarded_WhileTombstoned()
+    {
+        // Task #608 finding 2a: a late in-flight callback that stores under a dropped
+        // connection id (tombstoned) must NOT resurrect the connection's map.
+        var clock = new TestClock();
+        var cache = new ChannelAuthDecisionCache(
+            clock, tombstoneTtl: TimeSpan.FromSeconds(30));
+
+        cache.Drop("conn-1");
+
+        // A store racing in after the drop is discarded while the tombstone is live.
+        cache.StoreAllow("conn-1", "svc-a:room", identity: "user-1");
+        Assert.Null(cache.TryGet("conn-1", "svc-a:room"));
+
+        // Past the tombstone window the id is reusable again (SignalR never reuses ids, but
+        // the tombstone must not pin memory forever).
+        clock.Now += TimeSpan.FromSeconds(31);
+        cache.StoreAllow("conn-1", "svc-a:room", identity: "user-2");
+        Assert.NotNull(cache.TryGet("conn-1", "svc-a:room"));
+    }
+
+    [Fact]
+    public void PerConnection_EntryCap_EvictsOldest()
+    {
+        // Task #608 finding 2b: a client looping distinct channel names cannot grow the
+        // per-connection cache unboundedly — past the cap the oldest entry is evicted.
+        var clock = new TestClock();
+        var cache = new ChannelAuthDecisionCache(clock, allowTtl: TimeSpan.FromHours(1));
+
+        // The first (oldest) entry.
+        cache.StoreAllow("conn-1", "svc-a:room-0", identity: "id-0");
+
+        // Fill exactly to the cap with newer entries (advancing the clock so ordering is
+        // unambiguous), then one more to trip an eviction.
+        for (var i = 1; i <= ChannelAuthDecisionCache.MaxEntriesPerConnection; i++)
+        {
+            clock.Now += TimeSpan.FromSeconds(1);
+            cache.StoreAllow("conn-1", $"svc-a:room-{i}", identity: $"id-{i}");
+        }
+
+        // The oldest entry was evicted; the newest remains.
+        Assert.Null(cache.TryGet("conn-1", "svc-a:room-0"));
+        Assert.NotNull(cache.TryGet(
+            "conn-1", $"svc-a:room-{ChannelAuthDecisionCache.MaxEntriesPerConnection}"));
+    }
+
+    [Fact]
+    public void InFlightCallback_CappedAtOne_PerConnection()
+    {
+        // Task #608 finding 2: at most one in-flight auth callback per connection.
+        var cache = new ChannelAuthDecisionCache();
+
+        Assert.True(cache.TryBeginAuthCallback("conn-1"));
+        // A second concurrent begin on the same connection is refused.
+        Assert.False(cache.TryBeginAuthCallback("conn-1"));
+        // A different connection is unaffected.
+        Assert.True(cache.TryBeginAuthCallback("conn-2"));
+
+        // Releasing the slot lets the next callback proceed.
+        cache.EndAuthCallback("conn-1");
+        Assert.True(cache.TryBeginAuthCallback("conn-1"));
     }
 
     [Fact]

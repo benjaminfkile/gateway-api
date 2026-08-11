@@ -271,18 +271,18 @@ public sealed class ReconcilerService : BackgroundService
             {
                 await PublishFleetEventsAsync(store, identity.InstanceId, ct);
             }
+
+            // Remember this loop's leadership ONLY after the fleet events published, as the
+            // LAST statement in the try (task #608 finding 4). If the heartbeat body threw
+            // before this — before PublishFleetEventsAsync ran — _wasLeader is left
+            // unchanged so the leaderChange edge is NOT consumed and the next loop retries
+            // it, rather than permanently swallowing the announcement for this term.
+            _wasLeader = isLeader;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // A heartbeat failure must not crash the loop; the next tick retries.
             _logger.LogError(ex, "Failed to publish instance_status heartbeat");
-        }
-        finally
-        {
-            // Remember this loop's leadership so the next loop can detect the flip into
-            // leadership (task #588). Kept outside the try so a heartbeat error mid-loop
-            // does not wedge the leaderChange edge detection.
-            _wasLeader = isLeader;
         }
     }
 
@@ -499,6 +499,10 @@ public sealed class ReconcilerService : BackgroundService
     {
         deploy.Status = status;
         deploy.FinishedAt = DateTimeOffset.UtcNow;
+        // Persist the terminal failure reason, not just ride it on the fire-and-forget
+        // event (task #608 finding 5): events are hints, the store is truth, so GET
+        // /mgmt/deploys must return a non-null detail for a timed-out / failed deploy.
+        deploy.Detail = error;
         await store.UpdateAsync(deploy, ct);
 
         _publisher?.TryPublish(ManagementEndpoints.OpsDeploysChannel, "deploy", new

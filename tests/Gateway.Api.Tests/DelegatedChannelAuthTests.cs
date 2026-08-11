@@ -243,6 +243,48 @@ public class DelegatedChannelAuthTests
     }
 
     [Fact]
+    public async Task PrivateChannel_DenyThenDifferentValidCredential_Succeeds_AndReCallsAuth()
+    {
+        // Task #608 finding 1: the deny cache is keyed on the credential, so a client that
+        // retries with a DIFFERENT, now-valid credential (the normal token-refresh flow) is
+        // not short-circuited by the brief deny — the owning service sees the new credential.
+        var callback = new AuthCallback((root, ctx) =>
+        {
+            var credential = root.TryGetProperty("credential", out var c) && c.ValueKind == JsonValueKind.String
+                ? c.GetString()
+                : null;
+            return credential == "good-token"
+                ? WriteAllowAsync(ctx, identity: "user-7")
+                : ctx.Response.WriteAsync("{\"allow\":false}");
+        });
+        await using var downstream = await DownstreamTestServer.StartAsync(callback.HandleAsync);
+        await using var factory = NewFactory(downstream);
+        await using var connection = BuildConnection(factory);
+
+        await connection.StartAsync();
+
+        // First join presents a stale credential and is denied.
+        await Assert.ThrowsAsync<HubException>(
+            () => connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, "stale-token"));
+        Assert.Equal(1, callback.Count);
+
+        // Retrying with a fresh, valid credential re-hits the callback (the deny was keyed
+        // to the stale one) and is admitted.
+        await connection.InvokeAsync("JoinPrivateChannel", PrivateChannel, "good-token");
+        Assert.Equal(2, callback.Count);
+        Assert.Equal("good-token", callback.Last!.Value.Credential);
+
+        // Admitted → a broadcast reaches the client.
+        var received = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        connection.On<JsonElement>(IChannelEventPublisher.ChannelEventMethod, env => received.TrySetResult(env));
+        var publisher = factory.Services.GetRequiredService<IChannelEventPublisher>();
+        await publisher.PublishAsync(PrivateChannel, "changed", new { ok = true });
+
+        var completed = await Task.WhenAny(received.Task, Task.Delay(TimeSpan.FromSeconds(10)));
+        Assert.True(completed == received.Task, "admitted client did not receive the broadcast");
+    }
+
+    [Fact]
     public async Task OneArgJoin_StillBinds_ForOpsChannel()
     {
         // SignalR optional hub-method params: the dashboard's existing one-argument

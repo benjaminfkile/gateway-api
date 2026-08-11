@@ -117,6 +117,18 @@ public static class RealtimeApplicationExtensions
                 return Results.BadRequest(new { error = "channel is required." });
             }
 
+            // Reject a malformed channel with the SAME shape rule joins enforce (task #608
+            // finding 3): a name like "svc-a" or "svc-a:" would pass ownership + token
+            // checks and 202, then broadcast into a group ValidateChannel guarantees is
+            // permanently empty — silent event loss. 400 before it can be published.
+            if (!GatewayHub.IsValidChannel(request.Channel))
+            {
+                return Results.BadRequest(new
+                {
+                    error = $"Channel '{request.Channel}' must be in '{{service}}:{{topic}}' form.",
+                });
+            }
+
             // ops:* is gateway-owned and never publishable through the HTTP passthrough,
             // regardless of any token presented. Gateway-internal ops events ride
             // IChannelEventPublisher directly, bypassing this endpoint entirely.
