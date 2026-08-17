@@ -372,6 +372,12 @@ Content-Type: application/json
 - **Note the field rename on the wire.** You send `payload`; the browser receives
   it as `data`. A publish of `{ channel, event, payload }` arrives at the client
   as the envelope `{ channel, event, data }` (§2). Same bytes, different key.
+- **A missing `payload` is `400`, not `500`.** A body that omits `payload`
+  altogether (a common cause: a downstream that misnamed the field `data` to
+  match the on-the-wire client envelope) is rejected with `400` and an error
+  naming the expected fields, before any backplane work. An explicit JSON
+  `null` payload is **accepted** and delivered to subscribers as `data: null`
+  — only an *undefined* payload is a `400`.
 - **Success:** `202 Accepted`, no body.
 
 ### Owner-only rule

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -116,6 +117,21 @@ public static class RealtimeApplicationExtensions
             if (string.IsNullOrWhiteSpace(request.Channel))
             {
                 return Results.BadRequest(new { error = "channel is required." });
+            }
+
+            // A body that omits 'payload' (or any request where the bound JsonElement is
+            // ValueKind.Undefined — e.g. a downstream that misnamed the field 'data')
+            // would previously throw System.InvalidOperationException from
+            // JsonElementConverter.Write during backplane re-serialization, surfacing as
+            // an unhandled 500. Reject it up front with a message naming the expected
+            // fields so the caller can self-diagnose. An explicit JSON null payload
+            // (ValueKind.Null) is accepted and delivered to subscribers as null data.
+            if (request.Payload.ValueKind == JsonValueKind.Undefined)
+            {
+                return Results.BadRequest(new
+                {
+                    error = "payload is required. Expected body fields: channel, event, payload (payload may be an explicit null).",
+                });
             }
 
             var (owner, failure) = await AuthorizeOwnerAsync(

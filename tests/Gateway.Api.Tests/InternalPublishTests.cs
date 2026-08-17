@@ -249,6 +249,84 @@ public sealed class InternalPublishTests
     }
 
     [Fact]
+    public async Task InternalPublish_MissingPayload_IsBadRequest_NamingExpectedFields()
+    {
+        // Regression: a body that omits 'payload' (or any request where the bound
+        // JsonElement is ValueKind.Undefined — e.g. a downstream that misnamed the
+        // field 'data' to match the on-the-wire client envelope) previously threw
+        // InvalidOperationException from JsonElementConverter.Write during backplane
+        // re-serialization and surfaced as an unhandled 500. It must now be rejected
+        // 400 up front with an error naming the expected body fields.
+        await using var gateway = await StartGatewayAsync();
+
+        using var http = new HttpClient();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, $"http://127.0.0.1:{gateway.InternalPort}/internal/publish")
+        {
+            // Deliberately omit 'payload' — mirrors the observed live misnaming.
+            Content = JsonContent.Create(new { channel = "svc-a:orders", @event = "evt" }),
+        };
+        request.Headers.Add(RealtimePublishToken.Header, TokenA);
+
+        var response = await http.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        // The message must name the expected fields so a caller can self-diagnose.
+        Assert.Contains("channel", body);
+        Assert.Contains("event", body);
+        Assert.Contains("payload", body);
+    }
+
+    [Fact]
+    public async Task InternalPublish_ExplicitNullPayload_IsAccepted_DeliveredAsNullData()
+    {
+        // The documented behavior (REALTIME.md §4): an *undefined* payload is a 400,
+        // but an *explicit* JSON null payload is accepted and delivered to subscribers
+        // as the envelope's data:null. The two cases are distinguishable via
+        // JsonElement.ValueKind (Undefined vs Null); only the former would break
+        // backplane serialization.
+        await using var gateway = await StartGatewayAsync();
+
+        await using var connection = new HubConnectionBuilder()
+            .WithUrl($"http://127.0.0.1:{gateway.PublicPort}/hub")
+            .Build();
+
+        var received = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
+        connection.On<JsonElement>("ChannelEvent", envelope =>
+        {
+            if (envelope.GetProperty("event").GetString() != GatewayHub.JoinedAckEvent)
+            {
+                received.TrySetResult(envelope);
+            }
+        });
+
+        await connection.StartAsync();
+        await connection.InvokeAsync("JoinChannel", "svc-a:orders");
+
+        using var http = new HttpClient();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, $"http://127.0.0.1:{gateway.InternalPort}/internal/publish")
+        {
+            // Explicit null — serializes to "payload": null, which binds as ValueKind.Null.
+            Content = JsonContent.Create(new { channel = "svc-a:orders", @event = "evt", payload = (object?)null }),
+        };
+        request.Headers.Add(RealtimePublishToken.Header, TokenA);
+
+        var response = await http.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        var completed = await Task.WhenAny(received.Task, Task.Delay(TimeSpan.FromSeconds(10)));
+        Assert.True(completed == received.Task, "joined client did not receive the null-payload broadcast");
+
+        var envelope = await received.Task;
+        Assert.Equal("svc-a:orders", envelope.GetProperty("channel").GetString());
+        Assert.Equal("evt", envelope.GetProperty("event").GetString());
+        Assert.Equal(JsonValueKind.Null, envelope.GetProperty("data").ValueKind);
+    }
+
+    [Fact]
     public async Task InternalPublish_OpsChannel_IsForbidden_EvenWithToken()
     {
         await using var gateway = await StartGatewayAsync();
