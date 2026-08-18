@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Gateway.Api.Data;
 using Gateway.Api.Proxy;
+using Gateway.Api.Reconcile;
 
 namespace Gateway.Api.Health;
 
@@ -23,26 +24,46 @@ public sealed class HttpHealthProber : IHealthProber
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IServiceAddressResolver _addressResolver;
     private readonly ServiceHostPortMap? _hostPorts;
+    private readonly ReconcilerOptions? _reconcilerOptions;
 
     public HttpHealthProber(
         IHttpClientFactory httpClientFactory,
         IServiceAddressResolver addressResolver,
-        ServiceHostPortMap? hostPorts = null)
+        ServiceHostPortMap? hostPorts = null,
+        ReconcilerOptions? reconcilerOptions = null)
     {
         _httpClientFactory = httpClientFactory;
         _addressResolver = addressResolver;
         _hostPorts = hostPorts;
+        _reconcilerOptions = reconcilerOptions;
     }
 
     public async Task<ServiceProbeResult> ProbeAsync(ServiceManifest manifest, CancellationToken ct = default)
     {
         // Probe the port the container is actually bound to (a Docker-assigned host
-        // port; a promoted-green container keeps the port it started on), falling
-        // back to the manifest port when container-truth is unavailable.
-        var baseAddress = (_hostPorts is not null && _hostPorts.TryGet(manifest.Name, out var hostPort)
-            ? _addressResolver.Resolve(manifest.Name, hostPort)
-            : _addressResolver.Resolve(manifest)).TrimEnd('/');
-        var url = $"{baseAddress}/api/health";
+        // port; a promoted-green container keeps the port it started on). In
+        // reconciler mode we NEVER fall back to the manifest port: it is a
+        // container-internal port whose host counterpart could belong to a
+        // completely different service (incident 2026-08-17). Reporting the
+        // service down here matches what the route now serves (503) so the
+        // dashboard, the load balancer's read of /api/health, and reality agree.
+        string baseAddress;
+        if (_hostPorts is not null && _hostPorts.TryGet(manifest.Name, out var hostPort))
+        {
+            baseAddress = _addressResolver.Resolve(manifest.Name, hostPort);
+        }
+        else if (_reconcilerOptions?.Enabled == true)
+        {
+            return ServiceProbeResult.Unreachable();
+        }
+        else
+        {
+            // Proxy-only dev mode: the manifest port is the host the developer runs
+            // the app on locally (README, "Proxy-only dev mode"); preserve it.
+            baseAddress = _addressResolver.Resolve(manifest);
+        }
+
+        var url = $"{baseAddress.TrimEnd('/')}/api/health";
 
         // Bound each probe independently at 3s, still honouring caller cancellation.
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);

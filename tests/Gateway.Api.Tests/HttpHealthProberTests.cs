@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Proxy;
+using Gateway.Api.Reconcile;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -153,5 +154,103 @@ public class HttpHealthProberTests
         Assert.Equal("down", result.Status);
         Assert.Null(result.HttpStatus);
         Assert.Null(result.ResponseTimeMs);
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_NoHostPort_ReturnsUnreachable_WithoutTouchingManifestPort()
+    {
+        // task #98 / incident 2026-08-17: in reconciler mode a missing
+        // canonical-container port must SHORT-CIRCUIT — no HTTP call, no
+        // connection attempt. The manifest port is a container-internal port
+        // whose host counterpart may belong to a completely different service.
+        var services = new ServiceCollection();
+        services.AddHttpClient(HttpHealthProber.HttpClientName, c => c.Timeout = HttpHealthProber.ProbeTimeout);
+        await using var sp = services.BuildServiceProvider();
+
+        // Start a server on the "manifest port" that would answer 200 if probed —
+        // the prober must NOT hit it. Assert on the request count for confidence.
+        var hits = 0;
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.Logging.ClearProviders();
+        var stranger = builder.Build();
+        stranger.MapGet("/api/health", (HttpContext ctx) =>
+        {
+            Interlocked.Increment(ref hits);
+            ctx.Response.StatusCode = 200;
+            return Task.CompletedTask;
+        });
+        await stranger.StartAsync();
+        var strangerPort = new Uri(stranger.Services.GetRequiredService<IServer>()
+            .Features.Get<IServerAddressesFeature>()!.Addresses.First()).Port;
+
+        try
+        {
+            var prober = new HttpHealthProber(
+                sp.GetRequiredService<IHttpClientFactory>(),
+                new LoopbackAddressResolver(),
+                hostPorts: new ServiceHostPortMap(), // empty — no canonical port
+                reconcilerOptions: new ReconcilerOptions { Enabled = true });
+
+            var result = await prober.ProbeAsync(Manifest(strangerPort));
+
+            Assert.Equal("down", result.Status);
+            Assert.Null(result.HttpStatus);
+            Assert.Null(result.ResponseTimeMs);
+            Assert.Equal(0, hits); // the stranger on the manifest port was NEVER hit
+        }
+        finally
+        {
+            await stranger.StopAsync();
+            await stranger.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_HostPortRecorded_ProbesRealPort()
+    {
+        // Complement: once the reconciler records a canonical container port, the
+        // prober targets it (not the manifest port).
+        await using var server = await ProbeServer.StartAsync(200, TimeSpan.Zero);
+        var services = new ServiceCollection();
+        services.AddHttpClient(HttpHealthProber.HttpClientName, c => c.Timeout = HttpHealthProber.ProbeTimeout);
+        await using var sp = services.BuildServiceProvider();
+
+        var map = new ServiceHostPortMap();
+        map.Set("svc-a", server.Port);
+        var prober = new HttpHealthProber(
+            sp.GetRequiredService<IHttpClientFactory>(),
+            new LoopbackAddressResolver(),
+            hostPorts: map,
+            reconcilerOptions: new ReconcilerOptions { Enabled = true });
+
+        // Manifest port is intentionally garbage — the map entry must win.
+        var result = await prober.ProbeAsync(Manifest(1));
+
+        Assert.Equal("up", result.Status);
+        Assert.Equal(200, result.HttpStatus);
+    }
+
+    [Fact]
+    public async Task ProxyOnlyMode_NoHostPort_FallsBackToManifestPort()
+    {
+        // Requirement: with the reconciler DISABLED (proxy-only dev mode per the
+        // README), the manifest-port fallback is preserved — the developer's
+        // local process listens on it.
+        await using var server = await ProbeServer.StartAsync(200, TimeSpan.Zero);
+        var services = new ServiceCollection();
+        services.AddHttpClient(HttpHealthProber.HttpClientName, c => c.Timeout = HttpHealthProber.ProbeTimeout);
+        await using var sp = services.BuildServiceProvider();
+
+        var prober = new HttpHealthProber(
+            sp.GetRequiredService<IHttpClientFactory>(),
+            new LoopbackAddressResolver(),
+            hostPorts: new ServiceHostPortMap(),
+            reconcilerOptions: new ReconcilerOptions { Enabled = false });
+
+        var result = await prober.ProbeAsync(Manifest(server.Port));
+
+        Assert.Equal("up", result.Status);
+        Assert.Equal(200, result.HttpStatus);
     }
 }

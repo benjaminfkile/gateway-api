@@ -2,6 +2,7 @@ using System.Net;
 using Gateway.Api.Data;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
+using Gateway.Api.Reconcile;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -28,6 +29,13 @@ public class ProxyIntegrationTests
         // Captured so tests can mutate the manifest at runtime and refresh routes.
         public InMemoryManifestStore Store { get; } = new();
 
+        /// <summary>
+        /// When set, ProxyStateService sees a reconciler-enabled ReconcilerOptions —
+        /// so its manifest-port fallback is suppressed and a service with no
+        /// canonical container port serves 503 (task #98, incident 2026-08-17).
+        /// </summary>
+        public bool ReconcilerEnabled { get; set; }
+
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.ConfigureTestServices(services =>
@@ -37,11 +45,23 @@ public class ProxyIntegrationTests
 
                 services.RemoveAll<IServiceAddressResolver>();
                 services.AddSingleton<IServiceAddressResolver, LoopbackAddressResolver>();
+
+                if (ReconcilerEnabled)
+                {
+                    services.RemoveAll<ReconcilerOptions>();
+                    services.AddSingleton(new ReconcilerOptions { Enabled = true });
+                }
             });
         }
 
         public Task RefreshRoutesAsync() =>
             Services.GetRequiredService<ProxyStateService>().RefreshRoutesAsync();
+
+        public ServiceHostPortMap HostPorts =>
+            Services.GetRequiredService<ServiceHostPortMap>();
+
+        public ProxyStateService ProxyState =>
+            Services.GetRequiredService<ProxyStateService>();
     }
 
     private static ServiceManifest RunningManifest(string name, int port) => new()
@@ -159,6 +179,88 @@ public class ProxyIntegrationTests
         await factory.RefreshRoutesAsync();
 
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync("/svc-a/ping")).StatusCode);
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_NoContainerPort_Serves503_ForRunningManifest()
+    {
+        // task #98 / incident 2026-08-17: in reconciler mode a service desired
+        // running whose canonical container port is unknown must NOT fall back to
+        // the manifest port on the host — that host port is a Docker-assigned
+        // ephemeral that either has nothing listening or belongs to a stranger, so
+        // silently proxying to it can serve one service's traffic from another
+        // service's process (the incident: prod svc-a landing on its -dev sibling
+        // that shares the same container-side port). The route must serve 503.
+        await using var factory = new ProxyTestFactory { ReconcilerEnabled = true };
+        await factory.Store.UpsertAsync(RunningManifest("svc-a", 8080));
+
+        var client = factory.CreateClient();
+        var response = await client.GetAsync("/svc-a/orders");
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_ContainerPortRecorded_ForwardsToRealPort()
+    {
+        // Complement of the previous test: once the reconciler has recorded the
+        // canonical container's host port, the route forwards there normally — not
+        // to the manifest port. The forwarded path is preserved as usual.
+        await using var downstream = await DownstreamTestServer.StartAsync();
+        await using var factory = new ProxyTestFactory { ReconcilerEnabled = true };
+        // Manifest port is a fake container-internal port; the real host port is
+        // the downstream test server's dynamic port, published via the host-port
+        // map (what the reconciler would do on a real box).
+        await factory.Store.UpsertAsync(RunningManifest("svc-a", 8080));
+        var client = factory.CreateClient();
+
+        // Before the map has the port, the route is 503.
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await client.GetAsync("/svc-a/ping")).StatusCode);
+
+        factory.HostPorts.Set("svc-a", downstream.Port);
+        await factory.RefreshRoutesAsync();
+
+        var response = await client.GetAsync("/svc-a/orders?id=1");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("/orders?id=1", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_SwapOverride_TrumpsMissingContainerPort()
+    {
+        // Requirement #3: a blue-green destination override is unaffected by the
+        // fallback change. Even if the canonical container port is not recorded
+        // (e.g. the very first swap on a service the reconciler has not yet
+        // primed), the override still routes traffic to the green candidate.
+        await using var downstream = await DownstreamTestServer.StartAsync();
+        await using var factory = new ProxyTestFactory { ReconcilerEnabled = true };
+        await factory.Store.UpsertAsync(RunningManifest("svc-a", 8080));
+
+        // No host-port map entry → without an override this would be a 503 (asserted above).
+        await factory.ProxyState.SwapDestinationAsync("svc-a", $"http://127.0.0.1:{downstream.Port}");
+
+        var client = factory.CreateClient();
+        var response = await client.GetAsync("/svc-a/ping");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("/ping", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task ProxyOnlyMode_ManifestPortFallback_StillWorks()
+    {
+        // Requirement: with the reconciler DISABLED (proxy-only dev mode per the
+        // README), the manifest port IS the host port the developer is running the
+        // app on locally — the fallback must be preserved. This is the default
+        // factory (ReconcilerEnabled = false) forwarding to a real localhost port.
+        await using var downstream = await DownstreamTestServer.StartAsync();
+        await using var factory = new ProxyTestFactory(); // reconciler disabled
+        await factory.Store.UpsertAsync(RunningManifest("svc-a", downstream.Port));
+
+        var client = factory.CreateClient();
+        var response = await client.GetAsync("/svc-a/ping");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("/ping", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
