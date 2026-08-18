@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 namespace Gateway.Api.Tests;
 
@@ -48,12 +49,46 @@ public class HealthIntegrationTests
                 services.RemoveAll<IServiceAddressResolver>();
                 services.AddSingleton<IServiceAddressResolver, LoopbackAddressResolver>();
 
+                // Deterministic hardening (task #111): freeze the clock
+                // ProxyStateService reads for swap-start stamps (task #99). No
+                // health test asserts on the swap-age math, but the ambient
+                // TimeProvider.System stamp adds a real-clock read on every
+                // SwapDestinationAsync call and hands the reconciler background
+                // loop a moving deadline — both are race magnets under CI CPU
+                // contention. UnixEpoch keeps stamps stable and reproducible.
+                services.RemoveAll<TimeProvider>();
+                services.AddSingleton<TimeProvider>(new ManualTimeProvider());
+
+                // Deterministic hardening (task #111): the ReconcilerService
+                // background loop starts as a hosted service whenever the
+                // gateway boots and competes with the test's own assertions
+                // for the thread pool. With Enabled=true (reconciler mode) it
+                // spins into RunOnceAsync immediately, which throws on
+                // UnavailableContainerRuntime and quietly sleeps — but the
+                // Task itself still runs concurrently with the /api/health
+                // request. Nothing in this file asserts convergence — the
+                // host-port map is driven directly — so remove the loop.
+                RemoveHostedService<ReconcilerService>(services);
+
                 if (ReconcilerEnabled)
                 {
                     services.RemoveAll<ReconcilerOptions>();
                     services.AddSingleton(new ReconcilerOptions { Enabled = true });
                 }
             });
+        }
+
+        private static void RemoveHostedService<T>(IServiceCollection services)
+            where T : IHostedService
+        {
+            for (var i = services.Count - 1; i >= 0; i--)
+            {
+                var d = services[i];
+                if (d.ServiceType == typeof(IHostedService) && d.ImplementationType == typeof(T))
+                {
+                    services.RemoveAt(i);
+                }
+            }
         }
 
         public ServiceHostPortMap HostPorts =>
