@@ -60,6 +60,36 @@ public static class ManagementTestData
     }
 
     /// <summary>
+    /// An <c>instance_status</c> row whose services JSON records the service as
+    /// <c>degraded</c> — the reconciler's digest-drift circuit breaker has tripped
+    /// for it (task #99). The container is still <c>running</c> (the last
+    /// successfully started one), just not on the pinned digest.
+    /// </summary>
+    public static InstanceStatus InstanceWithDegradedService(
+        string instanceId,
+        string service,
+        string runningDigest = "sha256:pulled",
+        DateTimeOffset? heartbeatAt = null)
+    {
+        var containers = new List<ContainerInfo>
+        {
+            new(service, $"registry/{service}", runningDigest, "running", DateTimeOffset.UnixEpoch, null, HostPort: 40000),
+        };
+        var degraded = new HashSet<string>(StringComparer.Ordinal) { service };
+
+        return new InstanceStatus
+        {
+            InstanceId = instanceId,
+            PrivateIp = "10.0.0.1",
+            PublicIp = null,
+            GatewayVer = "1.2.3",
+            IsLeader = false,
+            Services = InstanceServicesJson.Build(containers, degraded: degraded),
+            HeartbeatAt = heartbeatAt ?? DateTimeOffset.UtcNow,
+        };
+    }
+
+    /// <summary>
     /// An <c>instance_status</c> row whose services JSON records a reconcile error for
     /// one service. When <paramref name="running"/> is true the service still has a
     /// running container (a failed upgrade); otherwise it is absent-but-desired (a

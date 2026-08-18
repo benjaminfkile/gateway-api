@@ -760,6 +760,10 @@ public static partial class ManagementEndpoints
                 // most recent such error fleet-wide (tech-spec §4.4).
                 errorOn = rollup.ErrorOn,
                 latestError,
+                // Instances whose reconciler has tripped the digest-drift circuit
+                // breaker for this service (task #99): the pinned digest cannot be
+                // satisfied from the tag and the reconciler has stopped replacing.
+                degradedOn = rollup.DegradedOn,
             },
         };
     }

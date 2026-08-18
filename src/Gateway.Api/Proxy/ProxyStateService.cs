@@ -34,6 +34,20 @@ public sealed class ProxyStateService
     private readonly ConcurrentDictionary<string, string> _destinationOverrides =
         new(StringComparer.Ordinal);
 
+    // When each service's destination override was first set — used to BOUND how long
+    // the reconciler will skip its container-truth host-port reconciliation for that
+    // service (task #99, incident 2026-08-17). Without a bound, a service stuck in
+    // perpetual blue-green (e.g. an unsatisfiable pinned digest looping forever) is
+    // essentially always in swap, so its map entry can freeze at a stale port that
+    // Docker later reassigns to a sibling — the prod→dev misrouting incident. The stamp
+    // is set on the transition into swap and cleared on the transition out, so a
+    // continuous swap keeps its original start time.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _swapStartedAt =
+        new(StringComparer.Ordinal);
+
+    // Injected for tests so they can advance time without waiting real seconds.
+    private readonly TimeProvider _timeProvider;
+
     // Reconciler-mode only: services currently in the no-canonical-container state.
     // Used to log Warning+ ONCE per transition into that state (and Info once on
     // recovery / when the service leaves the desired-running set), so a service
@@ -52,7 +66,8 @@ public sealed class ProxyStateService
         IServiceAddressResolver addressResolver,
         ServiceHostPortMap hostPorts,
         ReconcilerOptions? reconcilerOptions = null,
-        ILogger<ProxyStateService>? logger = null)
+        ILogger<ProxyStateService>? logger = null,
+        TimeProvider? timeProvider = null)
     {
         _provider = provider;
         _scopeFactory = scopeFactory;
@@ -60,6 +75,7 @@ public sealed class ProxyStateService
         _hostPorts = hostPorts;
         _reconcilerOptions = reconcilerOptions;
         _logger = logger ?? NullLogger<ProxyStateService>.Instance;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -72,6 +88,39 @@ public sealed class ProxyStateService
         _destinationOverrides.IsEmpty
             ? NoOverrides
             : new HashSet<string>(_destinationOverrides.Keys, StringComparer.Ordinal);
+
+    /// <summary>
+    /// The services currently pointed at a blue-green destination override whose swap
+    /// has been in progress for less than <paramref name="maxAge"/> — the reconciler's
+    /// bounded-skip set for the container-truth host-port map (task #99, incident
+    /// 2026-08-17). A service whose swap has been running longer than the bound is
+    /// deliberately EXCLUDED so container-truth reconciliation resumes and its route
+    /// follows the real canonical container's port; a perpetual swap can never freeze
+    /// the map at a port that Docker has since reassigned to a sibling.
+    /// </summary>
+    public IReadOnlySet<string> ServicesWithDestinationOverride(TimeSpan maxAge)
+    {
+        if (_destinationOverrides.IsEmpty)
+        {
+            return NoOverrides;
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        var fresh = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var service in _destinationOverrides.Keys)
+        {
+            // A swap with no recorded start-time is treated as freshly started so the
+            // pre-bound behavior is preserved (defensive: the pair is set atomically
+            // below, but a race between reader and writer is possible).
+            var startedAt = _swapStartedAt.TryGetValue(service, out var at) ? at : now;
+            if (now - startedAt <= maxAge)
+            {
+                fresh.Add(service);
+            }
+        }
+
+        return fresh;
+    }
 
     /// <summary>Rebuild the proxy routes from the current manifest state.</summary>
     public async Task RefreshRoutesAsync(CancellationToken ct = default)
@@ -237,9 +286,19 @@ public sealed class ProxyStateService
     /// Point a service's route at <paramref name="address"/> (a blue-green
     /// candidate) and apply it immediately. In-flight requests to the previous
     /// destination drain via YARP's graceful destination removal (tech-spec §7).
+    /// <para>
+    /// Also stamps when this swap started (once, on the transition into swap) so a
+    /// perpetually-swapping service does not keep its skip renewed forever — the
+    /// reconciler drops it out of the bounded-skip set once the age exceeds its bound
+    /// (task #99, incident 2026-08-17).
+    /// </para>
     /// </summary>
     public Task SwapDestinationAsync(string serviceName, string address, CancellationToken ct = default)
     {
+        // TryAdd so a re-swap on an already-swapping service keeps its ORIGINAL start
+        // stamp; the elapsed-since-swap-began measurement stays continuous, not per
+        // SwapDestinationAsync call.
+        _swapStartedAt.TryAdd(serviceName, _timeProvider.GetUtcNow());
         _destinationOverrides[serviceName] = address;
         return RefreshRoutesAsync(ct);
     }
@@ -247,11 +306,13 @@ public sealed class ProxyStateService
     /// <summary>
     /// Clear a blue-green destination override, returning the route to the
     /// service's canonical address (used after the candidate is promoted to the
-    /// canonical container name). Idempotent.
+    /// canonical container name). Idempotent. Also clears the swap-start stamp so a
+    /// future swap on this service is measured from its own start (task #99).
     /// </summary>
     public Task ClearDestinationOverrideAsync(string serviceName, CancellationToken ct = default)
     {
         _destinationOverrides.TryRemove(serviceName, out _);
+        _swapStartedAt.TryRemove(serviceName, out _);
         return RefreshRoutesAsync(ct);
     }
 }

@@ -113,6 +113,11 @@ public class ReconcilerServiceTests
         public ServiceHostPortMap HostPorts { get; }
         public ProxyStateService ProxyState { get; }
         public ManifestProxyConfigProvider ProxyConfig { get; }
+        // A hand-cranked clock that drives ProxyStateService's swap-age math (task #99).
+        // Tests can advance it to expire the bounded mid-swap skip window without
+        // waiting real seconds. Defaults to the Unix epoch so existing tests that
+        // never touch it see a stable, non-drifting now().
+        public ManualTimeProvider Clock { get; } = new() { Now = DateTimeOffset.UnixEpoch };
 
         public Harness(
             bool enabled = true,
@@ -146,6 +151,9 @@ public class ReconcilerServiceTests
             // ProxyStateService sees the reconciler-enabled flag (task #98:
             // suppresses the manifest-port fallback in reconciler mode).
             services.AddSingleton(Options);
+            // Drive ProxyStateService's swap-age math off a controllable clock so
+            // tests can expire the bounded mid-swap skip window (task #99).
+            services.AddSingleton<TimeProvider>(Clock);
             services.AddLogging(logging => logging.AddProvider(Logs));
             var provider = services.BuildServiceProvider();
 
@@ -170,7 +178,10 @@ public class ReconcilerServiceTests
                 metadata,
                 Leader,
                 Options,
-                NullLogger<ReconcilerService>.Instance,
+                // Use the captured logger (not NullLogger) so tests can assert
+                // transition logs — e.g. the once-per-trip Warning from the
+                // digest-drift circuit breaker (task #99).
+                provider.GetRequiredService<ILogger<ReconcilerService>>(),
                 migrationGate);
         }
 
@@ -1502,5 +1513,226 @@ public class ReconcilerServiceTests
         var cluster = Assert.Single(config.GetConfig().Clusters);
         Assert.NotNull(cluster.Destinations);
         Assert.Equal("http://127.0.0.1:8081", cluster.Destinations!.Values.Single().Address);
+    }
+
+    // ---------------------------------------------------------------------
+    // task #99: digest-drift circuit breaker + bounded port-map skip.
+    // Incident 2026-08-17/18: a service's pinned digest could not be satisfied
+    // from its tag (tag overwritten in the registry). The reconciler looped
+    // FOREVER, ~every 60-70s: pull → start green by pinned → image-not-found →
+    // fallback to pulled → promote → next loop sees digest drift → replace again.
+    // Each cycle Docker gave the promoted container a fresh ephemeral port; the
+    // service's mid-swap flag kept ServiceHostPortMap skipping it, so the map
+    // froze at a port from an early cycle. That port was later reassigned to a
+    // sibling service's container and the frozen route silently proxied prod to
+    // dev for hours (health returned 200 through the same frozen map).
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task DigestDriftBreaker_UnsatisfiablePin_TripsAfterThreeCycles_ThenStable()
+    {
+        // Requirement #1: after N=3 consecutive digest-drift replaces landing on a
+        // digest other than the pin, the breaker trips: no more replaces, the last
+        // successfully started container is left serving, degraded is surfaced, and
+        // exactly ONE Warning is logged for the trip transition.
+        var harness = new Harness();
+        harness.Runtime.PullDigest = (_, _) => "sha256:pulled";
+        harness.Runtime.MissingDigests.Add("sha256:pinned");
+        harness.Prober.Ready = true;
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:pinned", port: 8080));
+
+        // Loop 1: no container → Start (fallback to pulled). Not a BGR — the counter
+        // is untouched, so the breaker only starts counting on subsequent replaces.
+        await harness.Service.RunOnceAsync();
+        Assert.Equal("sha256:pulled", harness.Runtime.Get("svc-a")!.Digest);
+        Assert.DoesNotContain(harness.Reporter.Outcomes, o => o.Kind == ReconcileActionKind.BlueGreenReplace);
+
+        // Loops 2, 3, 4: three digest-drift replaces, each landing on pulled again.
+        // The breaker trips at the end of loop 4 (cycles == 3).
+        var bgrOutcomes = 0;
+        for (var i = 0; i < ReconcilerService.DigestDriftBreakerThreshold; i++)
+        {
+            harness.Reporter.Outcomes.Clear();
+            await harness.Service.RunOnceAsync();
+            bgrOutcomes += harness.Reporter.Outcomes.Count(o =>
+                o.Kind == ReconcileActionKind.BlueGreenReplace && o.Status == ReconcileOutcomeStatus.Succeeded);
+        }
+        Assert.Equal(ReconcilerService.DigestDriftBreakerThreshold, bgrOutcomes);
+
+        // Loop 5+: breaker tripped, no more replaces run — even after multiple loops.
+        var opsBeforeSkippedLoops = harness.Runtime.Operations.Count;
+        var portBefore = harness.Runtime.Get("svc-a")!.HostPort;
+        for (var i = 0; i < 3; i++)
+        {
+            await harness.Service.RunOnceAsync();
+        }
+
+        var newOps = harness.Runtime.Operations.Skip(opsBeforeSkippedLoops).ToList();
+        Assert.DoesNotContain(newOps, op => op.StartsWith("Start:svc-a-green") || op.StartsWith("Rename:"));
+
+        // The last successfully started container is still serving — same port and digest.
+        var container = harness.Runtime.Get("svc-a")!;
+        Assert.Equal("sha256:pulled", container.Digest);
+        Assert.Equal(portBefore, container.HostPort);
+
+        // Route follows the container's real port; the map was never frozen at a
+        // port that no longer belongs to svc-a.
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(container.HostPort, mapped);
+        Assert.Equal($"http://127.0.0.1:{container.HostPort}", harness.DestinationFor("svc-a"));
+
+        // The heartbeat entry surfaces the degraded flag (surfacing on /mgmt/services).
+        var entry = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(entry);
+        Assert.True(entry!.Degraded);
+        Assert.NotNull(entry.LastError);
+        Assert.Contains("digest-drift breaker tripped", entry.LastError!, StringComparison.OrdinalIgnoreCase);
+
+        // Exactly ONE Warning-level trip log fired across all loops — not one per loop.
+        var tripWarnings = harness.Logs.Entries.Count(e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("Digest-drift breaker tripped", StringComparison.Ordinal)
+            && e.Message.Contains("svc-a", StringComparison.Ordinal));
+        Assert.Equal(1, tripWarnings);
+    }
+
+    [Fact]
+    public async Task DigestDriftBreaker_TrippedService_DoesNotFreezeAnotherServicesPort()
+    {
+        // Requirement #4 (regression proof): a stuck / long-running swap on svc-a
+        // must NOT freeze svc-a's route at a host port Docker later reassigned to
+        // svc-b's container. Simulates a leaked / long-lived override on svc-a with
+        // an aged swap-start stamp, plus svc-b running on the port svc-a's map used
+        // to hold, and verifies the bounded skip drops svc-a so container-truth
+        // reconciliation moves the route back to svc-a's own real port.
+        var harness = new Harness();
+        // Both services have running canonical containers with distinct real ports.
+        // svc-b's port is the SAME as svc-a's stale map entry — the recycled-port
+        // scenario the incident described.
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 51000));
+        harness.Runtime.Seed(Running("svc-b", "sha256:v1", EmptyEnvHash, hostPort: 40000));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+        await harness.Store.UpsertAsync(Manifest("svc-b", digest: "sha256:v1", port: 8080));
+        // The map for svc-a is stale: it still holds 40000, which now belongs to svc-b.
+        harness.HostPorts.Set("svc-a", 40000);
+        harness.HostPorts.Set("svc-b", 40000);
+        // svc-a is mid-swap (override pointing somewhere), but the swap started long
+        // enough ago that the bounded skip must EXCLUDE it — otherwise the map
+        // would stay frozen at 40000 and svc-a's route would proxy to svc-b.
+        await harness.ProxyState.SwapDestinationAsync("svc-a", "http://127.0.0.1:59999");
+        // Advance the clock well past 2 × (readiness + drain) so svc-a's swap age
+        // exceeds the bound. With ReadinessTimeout = 50ms and DrainDelay = 0, the
+        // bound is 100ms; advance by a minute to be unambiguously past it.
+        harness.Clock.Now += TimeSpan.FromMinutes(1);
+
+        await harness.Service.RunOnceAsync();
+
+        // svc-a's map now reflects its OWN container's real port (51000), not the
+        // stale 40000 that Docker reassigned to svc-b.
+        Assert.True(harness.HostPorts.TryGet("svc-a", out var svcAMapped));
+        Assert.Equal(51000, svcAMapped);
+        Assert.True(harness.HostPorts.TryGet("svc-b", out var svcBMapped));
+        Assert.Equal(40000, svcBMapped);
+        // The route CANNOT be latched to svc-b's port for svc-a: it either follows
+        // the still-live override (still pointing where the caller set it) or the
+        // real svc-a port — never the recycled port belonging to svc-b.
+        Assert.NotEqual($"http://127.0.0.1:{svcBMapped}", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task DigestDriftBreaker_NormalSingleSwap_Unaffected()
+    {
+        // Requirement #4 (c): a normal, single blue-green swap onto a satisfiable
+        // pinned digest is not disturbed by the breaker — no degraded flag, no
+        // Warning, one clean replace with the container ending on the pin.
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash, hostPort: 8080));
+        harness.Runtime.PullDigest = (_, _) => "sha256:v2";  // pin IS satisfiable
+        harness.Prober.Ready = true;
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v2", port: 8080));
+
+        await harness.Service.RunOnceAsync();
+
+        // The container is on the pinned digest — the fallback never fired.
+        Assert.Equal("sha256:v2", harness.Runtime.Get("svc-a")!.Digest);
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+
+        // No degraded flag, no breaker Warning.
+        var entry = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(entry);
+        Assert.False(entry!.Degraded);
+        Assert.Null(entry.LastError);
+        Assert.DoesNotContain(harness.Logs.Entries, e =>
+            e.Level == LogLevel.Warning && e.Message.Contains("Digest-drift breaker tripped", StringComparison.Ordinal));
+
+        // A subsequent loop is a pure no-op (converged) — no lingering breaker
+        // state, no additional replaces.
+        var opsBefore = harness.Runtime.Operations.Count;
+        harness.Reporter.Outcomes.Clear();
+        await harness.Service.RunOnceAsync();
+        Assert.Empty(harness.Runtime.Operations.Skip(opsBefore));
+        Assert.Empty(harness.Reporter.Outcomes);
+    }
+
+    [Fact]
+    public async Task DigestDriftBreaker_NewDeploy_ClearsBreaker_AndReconcilesNormally()
+    {
+        // Requirement #4 (d): a new deploy (manifest pin changes) resets the
+        // breaker so the service reconciles normally on the new pin, degraded
+        // clears, and the recovery is announced as an Info transition.
+        var harness = new Harness();
+        harness.Runtime.PullDigest = (_, _) => "sha256:pulled";
+        harness.Runtime.MissingDigests.Add("sha256:pinned");
+        harness.Prober.Ready = true;
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:pinned", port: 8080));
+
+        // Trip the breaker: one Start + N digest-drift replaces.
+        await harness.Service.RunOnceAsync();
+        for (var i = 0; i < ReconcilerService.DigestDriftBreakerThreshold; i++)
+        {
+            await harness.Service.RunOnceAsync();
+        }
+        Assert.True(HeartbeatEntry(harness, "svc-a")!.Degraded);
+
+        // A new deploy resolves a fresh, satisfiable pinned digest. Registry is now
+        // consistent: pulling yields the same sha as the pin.
+        harness.Runtime.PullDigest = (_, _) => "sha256:v3";
+        harness.Runtime.MissingDigests.Clear();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v3", port: 8080));
+
+        var opsBefore = harness.Runtime.Operations.Count;
+        harness.Reporter.Outcomes.Clear();
+
+        await harness.Service.RunOnceAsync();
+
+        // A single successful replace ran onto the new pin — no stuck-loop.
+        var outcome = Assert.Single(harness.Reporter.Outcomes);
+        Assert.Equal(ReconcileActionKind.BlueGreenReplace, outcome.Kind);
+        Assert.Equal(ReconcileOutcomeStatus.Succeeded, outcome.Status);
+        Assert.Equal("sha256:v3", harness.Runtime.Get("svc-a")!.Digest);
+
+        // The rename op happened (green promoted): the reconciler is unblocked.
+        var newOps = harness.Runtime.Operations.Skip(opsBefore).ToList();
+        Assert.Contains(newOps, op => op == "Rename:svc-a-green->svc-a");
+
+        // Degraded flag is gone and the sticky lastError is cleared.
+        var entry = HeartbeatEntry(harness, "svc-a");
+        Assert.NotNull(entry);
+        Assert.False(entry!.Degraded);
+        Assert.Null(entry.LastError);
+
+        // The recovery (breaker cleared) is announced as an Info transition.
+        Assert.Contains(harness.Logs.Entries, e =>
+            e.Level == LogLevel.Information
+            && e.Message.Contains("Digest-drift breaker for svc-a cleared", StringComparison.Ordinal));
+
+        // A subsequent loop is a pure no-op — the container converged on the new pin.
+        var opsAfterDeploy = harness.Runtime.Operations.Count;
+        harness.Reporter.Outcomes.Clear();
+        await harness.Service.RunOnceAsync();
+        Assert.Empty(harness.Runtime.Operations.Skip(opsAfterDeploy));
+        Assert.Empty(harness.Reporter.Outcomes);
     }
 }
