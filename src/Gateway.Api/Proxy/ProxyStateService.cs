@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using Gateway.Api.Data;
 using Gateway.Api.Manifest;
+using Gateway.Api.Reconcile;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Yarp.ReverseProxy.Configuration;
 
 namespace Gateway.Api.Proxy;
@@ -21,6 +24,8 @@ public sealed class ProxyStateService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IServiceAddressResolver _addressResolver;
     private readonly ServiceHostPortMap _hostPorts;
+    private readonly ReconcilerOptions? _reconcilerOptions;
+    private readonly ILogger<ProxyStateService> _logger;
 
     // Temporary per-service destination overrides used during a blue-green swap:
     // while set, a service's route points at the given address (the green
@@ -29,6 +34,15 @@ public sealed class ProxyStateService
     private readonly ConcurrentDictionary<string, string> _destinationOverrides =
         new(StringComparer.Ordinal);
 
+    // Reconciler-mode only: services currently in the no-canonical-container state.
+    // Used to log Warning+ ONCE per transition into that state (and Info once on
+    // recovery / when the service leaves the desired-running set), so a service
+    // stuck without a container port does not spam a warning every loop.
+    // Guarded by _stateLock; only touched while rebuilding the route table.
+    private readonly HashSet<string> _servicesWithoutContainer =
+        new(StringComparer.Ordinal);
+    private readonly object _stateLock = new();
+
     private static readonly IReadOnlySet<string> NoOverrides =
         new HashSet<string>(StringComparer.Ordinal);
 
@@ -36,12 +50,16 @@ public sealed class ProxyStateService
         ManifestProxyConfigProvider provider,
         IServiceScopeFactory scopeFactory,
         IServiceAddressResolver addressResolver,
-        ServiceHostPortMap hostPorts)
+        ServiceHostPortMap hostPorts,
+        ReconcilerOptions? reconcilerOptions = null,
+        ILogger<ProxyStateService>? logger = null)
     {
         _provider = provider;
         _scopeFactory = scopeFactory;
         _addressResolver = addressResolver;
         _hostPorts = hostPorts;
+        _reconcilerOptions = reconcilerOptions;
+        _logger = logger ?? NullLogger<ProxyStateService>.Instance;
     }
 
     /// <summary>
@@ -65,6 +83,7 @@ public sealed class ProxyStateService
 
         var routes = new List<RouteConfig>();
         var clusters = new List<ClusterConfig>();
+        var runningNames = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var manifest in manifests)
         {
@@ -74,6 +93,8 @@ public sealed class ProxyStateService
             {
                 continue;
             }
+
+            runningNames.Add(manifest.Name);
 
             var clusterId = $"cluster-{manifest.Name}";
 
@@ -93,38 +114,124 @@ public sealed class ProxyStateService
                 },
             });
 
+            var address = ResolveDestination(manifest);
             clusters.Add(new ClusterConfig
             {
                 ClusterId = clusterId,
-                Destinations = new Dictionary<string, DestinationConfig>
-                {
-                    ["primary"] = new DestinationConfig
+                // A null address is the reconciler-mode 'no canonical container'
+                // signal: publish the cluster with NO destinations so YARP serves
+                // 503 rather than silently proxying to a manifest-port host address
+                // that could belong to a completely different service (incident
+                // 2026-08-17). Proxy-only dev mode never returns null here — see
+                // ResolveDestination — so the fallback stays exactly as before.
+                Destinations = address is null
+                    ? new Dictionary<string, DestinationConfig>(StringComparer.Ordinal)
+                    : new Dictionary<string, DestinationConfig>
                     {
-                        // A blue-green swap in progress points this route at the
-                        // green candidate; otherwise forward to the port the
-                        // container is actually bound to (a Docker-assigned host
-                        // port), falling back to the manifest port.
-                        Address = _destinationOverrides.TryGetValue(manifest.Name, out var overrideAddress)
-                            ? overrideAddress
-                            : ResolveCanonical(manifest),
+                        ["primary"] = new DestinationConfig { Address = address },
                     },
-                },
             });
         }
+
+        // A service that dropped out of desired=running has no route this loop, so
+        // it cannot be 'in the no-container state' any more — forget it silently so
+        // the tracked set does not leak and a later re-add starts a fresh transition.
+        ForgetUntrackedServices(runningNames);
 
         _provider.Update(routes, clusters);
     }
 
     /// <summary>
-    /// The canonical destination address for a service: the actual host port of its
-    /// running container (container-truth) when known, else the manifest port. The
-    /// container-truth port is what keeps a promoted-green container — bound to its
-    /// Docker-assigned host port for the life of its process — reachable (tech-spec §7).
+    /// The canonical destination address for a service, or null when reconciler
+    /// mode has no canonical container port to forward to. Precedence:
+    /// blue-green override → container-truth host port → (proxy-only) manifest port.
+    /// The manifest-port fallback exists ONLY for proxy-only dev mode (no
+    /// reconciler) where the developer runs the app locally on that port — see
+    /// README, "Proxy-only dev mode". In reconciler mode the manifest port is a
+    /// container-internal port; the corresponding HOST port is a Docker-assigned
+    /// ephemeral that either has nothing listening or, worse, some unrelated
+    /// container's port (incident 2026-08-17: a prod service silently proxied to
+    /// its -dev sibling on the same container-side port). We return null so the
+    /// route serves 503 and the health prober reports the service down.
     /// </summary>
-    private string ResolveCanonical(ServiceManifest manifest) =>
-        _hostPorts.TryGet(manifest.Name, out var hostPort)
-            ? _addressResolver.Resolve(manifest.Name, hostPort)
-            : _addressResolver.Resolve(manifest);
+    private string? ResolveDestination(ServiceManifest manifest)
+    {
+        if (_destinationOverrides.TryGetValue(manifest.Name, out var overrideAddress))
+        {
+            // Swap in progress: do NOT touch _servicesWithoutContainer — the swap
+            // is orthogonal to whether a canonical container port exists, and its
+            // transition should be reported when the canonical port itself moves.
+            return overrideAddress;
+        }
+
+        if (_hostPorts.TryGet(manifest.Name, out var hostPort))
+        {
+            MarkContainerRecovered(manifest.Name);
+            return _addressResolver.Resolve(manifest.Name, hostPort);
+        }
+
+        if (IsReconcilerEnabled)
+        {
+            MarkContainerMissing(manifest.Name);
+            return null;
+        }
+
+        // Proxy-only dev mode: the manifest port is the host port the developer is
+        // running the app on locally — the fallback is intentional and preserved.
+        return _addressResolver.Resolve(manifest);
+    }
+
+    private bool IsReconcilerEnabled => _reconcilerOptions?.Enabled == true;
+
+    private void MarkContainerMissing(string service)
+    {
+        bool becameMissing;
+        lock (_stateLock)
+        {
+            becameMissing = _servicesWithoutContainer.Add(service);
+        }
+
+        if (becameMissing)
+        {
+            _logger.LogWarning(
+                "Service '{Service}' has no canonical container host port recorded; "
+                + "its route will serve 503 and it will report down in /api/health until "
+                + "the reconciler brings the container back. The manifest port is NOT "
+                + "used as a fallback in reconciler mode (would silently proxy to a "
+                + "stranger; incident 2026-08-17).",
+                service);
+        }
+    }
+
+    private void MarkContainerRecovered(string service)
+    {
+        bool wasMissing;
+        lock (_stateLock)
+        {
+            wasMissing = _servicesWithoutContainer.Remove(service);
+        }
+
+        if (wasMissing)
+        {
+            _logger.LogInformation(
+                "Service '{Service}' canonical container host port is recorded again; "
+                + "routing and health probing resumed.",
+                service);
+        }
+    }
+
+    private void ForgetUntrackedServices(IReadOnlySet<string> currentRunning)
+    {
+        lock (_stateLock)
+        {
+            if (_servicesWithoutContainer.Count == 0)
+            {
+                return;
+            }
+
+            _servicesWithoutContainer.RemoveWhere(name => !currentRunning.Contains(name));
+        }
+    }
 
     /// <summary>
     /// Point a service's route at <paramref name="address"/> (a blue-green

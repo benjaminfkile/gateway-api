@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Gateway.Api.Containers;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
@@ -6,6 +7,7 @@ using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.Reconcile;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Gateway.Api.Tests;
@@ -63,9 +65,41 @@ public class ReconcilerServiceTests
                 : new Dictionary<string, string>());
     }
 
+    /// <summary>
+    /// Captures every ILogger call so tests can assert transition logging
+    /// (task #98: log Warning on enter/leave no-container state, once per transition).
+    /// </summary>
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        public ConcurrentQueue<(LogLevel Level, string Category, string Message)> Entries { get; } = new();
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(Entries, categoryName);
+        public void Dispose() { }
+
+        private sealed class CapturingLogger : ILogger
+        {
+            private readonly ConcurrentQueue<(LogLevel, string, string)> _entries;
+            private readonly string _category;
+
+            public CapturingLogger(ConcurrentQueue<(LogLevel, string, string)> entries, string category)
+            {
+                _entries = entries;
+                _category = category;
+            }
+
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter) =>
+                _entries.Enqueue((logLevel, _category, formatter(state, exception)));
+        }
+    }
+
     /// <summary>Assembles a reconciler wired to fakes plus a real ProxyStateService.</summary>
     private sealed class Harness
     {
+        public CapturingLoggerProvider Logs { get; } = new();
+
         public InMemoryManifestStore Store { get; } = new();
         public FakeContainerRuntime Runtime { get; } = new();
         public FakeReadinessProber Prober { get; } = new();
@@ -108,6 +142,11 @@ public class ReconcilerServiceTests
             services.AddSingleton<ServiceHostPortMap>();
             services.AddSingleton<ManifestProxyConfigProvider>();
             services.AddSingleton<ProxyStateService>();
+            // Register the SAME ReconcilerOptions the ReconcilerService uses so
+            // ProxyStateService sees the reconciler-enabled flag (task #98:
+            // suppresses the manifest-port fallback in reconciler mode).
+            services.AddSingleton(Options);
+            services.AddLogging(logging => logging.AddProvider(Logs));
             var provider = services.BuildServiceProvider();
 
             HostPorts = provider.GetRequiredService<ServiceHostPortMap>();
@@ -145,6 +184,18 @@ public class ReconcilerServiceTests
             var cluster = ProxyConfig.GetConfig().Clusters
                 .FirstOrDefault(c => c.ClusterId == $"cluster-{service}");
             return cluster?.Destinations?.Values.FirstOrDefault()?.Address;
+        }
+
+        /// <summary>
+        /// Whether a service has a cluster whose destination set is empty — the
+        /// reconciler-mode 'no canonical container port' signal that makes YARP
+        /// serve 503 rather than silently proxying to a stranger.
+        /// </summary>
+        public bool ClusterHasNoDestinations(string service)
+        {
+            var cluster = ProxyConfig.GetConfig().Clusters
+                .FirstOrDefault(c => c.ClusterId == $"cluster-{service}");
+            return cluster is not null && (cluster.Destinations is null || cluster.Destinations.Count == 0);
         }
     }
 
@@ -1274,5 +1325,182 @@ public class ReconcilerServiceTests
         Assert.NotNull(entry);
         Assert.NotNull(entry!.LastError);
         Assert.True(entry.LastError!.Length <= InstanceServicesJson.MaxErrorLength);
+    }
+
+    // ---------------------------------------------------------------------
+    // task #98: reconciler-mode manifest-port fallback suppression.
+    // Incident 2026-08-17: ProxyStateService.ResolveCanonical() fell back to the
+    // manifest port whenever ServiceHostPortMap had no entry for a service. In
+    // reconciler mode that host port is a Docker-assigned ephemeral that can
+    // legitimately belong to a sibling service (or nothing), so the gateway
+    // silently proxied one service's traffic through a different downstream. The
+    // health prober, resolving through the same map+fallback, then reported the
+    // misrouted service 'up' — the misrouting was invisible to /api/health.
+    // ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task ReconcilerMode_NoContainerRecorded_PublishesClusterWithNoDestinations()
+    {
+        // A running-desired service whose canonical container port is not in the
+        // map → in reconciler mode the cluster is published with an EMPTY
+        // destinations dict, which is YARP's 503 signal. The manifest port must
+        // NEVER become the destination fallback here (incident 2026-08-17).
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        // What ProxyRouteInitializer does at gateway startup — build routes from
+        // the (empty-of-svc-a) map. In production this happens before the
+        // reconciler runs, so a service the reconciler has not yet started still
+        // gets a route that visibly 503s rather than silently 404ing or proxying
+        // to whatever unrelated process holds the manifest port on the host.
+        await harness.ProxyState.RefreshRoutesAsync();
+
+        Assert.False(harness.HostPorts.TryGet("svc-a", out _));
+        Assert.True(harness.ClusterHasNoDestinations("svc-a"),
+            "reconciler mode + no container port must publish an empty-destinations cluster");
+        Assert.Null(harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_ContainerRecorded_RouteForwardsToRealHostPort()
+    {
+        // Complement: once the reconciler has recorded the container's host port,
+        // the route publishes that address (not the manifest port). Covered by
+        // Start_RecordsAssignedHostPort_AndRoutesToIt above, made explicit here as
+        // the recovery case paired with the previous test.
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        await harness.Service.RunOnceAsync();
+
+        var assigned = harness.Runtime.Get("svc-a")!.HostPort;
+        Assert.NotNull(assigned);
+        Assert.NotEqual(8080, assigned);
+        Assert.Equal($"http://127.0.0.1:{assigned}", harness.DestinationFor("svc-a"));
+        Assert.False(harness.ClusterHasNoDestinations("svc-a"));
+    }
+
+    [Fact]
+    public async Task ProxyOnlyMode_NoContainerRecorded_ManifestPortFallbackPreserved()
+    {
+        // Requirement: with the reconciler disabled (proxy-only dev mode per the
+        // README), the manifest port IS the host port the developer runs the app
+        // on locally — the fallback is intentional. Refresh routes on the SAME
+        // ProxyStateService with reconciler off and no host-port map entry: the
+        // route resolves to the manifest port exactly as before task #98.
+        var harness = new Harness(enabled: false);
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        // Build routes directly (the reconciler loop is off in this mode).
+        await harness.ProxyState.RefreshRoutesAsync();
+
+        Assert.False(harness.HostPorts.TryGet("svc-a", out _));
+        Assert.Equal("http://127.0.0.1:8080", harness.DestinationFor("svc-a"));
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_SwapOverride_WinsOverMissingContainerPort()
+    {
+        // Requirement #3: a blue-green destination override is unaffected. Even
+        // with NO canonical container-port map entry, the override drives the
+        // route destination (rather than 503) — otherwise a fresh swap would
+        // fail while the map is empty.
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        // No host-port map entry has been set for svc-a.
+        await harness.ProxyState.SwapDestinationAsync("svc-a", "http://127.0.0.1:59999");
+
+        Assert.False(harness.HostPorts.TryGet("svc-a", out _));
+        Assert.Equal("http://127.0.0.1:59999", harness.DestinationFor("svc-a"));
+        Assert.False(harness.ClusterHasNoDestinations("svc-a"));
+    }
+
+    [Fact]
+    public async Task ReconcilerMode_TransitionIntoNoContainer_LogsOncePerTransition()
+    {
+        // Requirement #2: log Warning+ ONCE per transition into the no-container
+        // state (not every route rebuild), then Info once when the container-truth
+        // port reappears. A stable no-container state must not re-warn on every
+        // rebuild; otherwise a persistently-broken service floods the log.
+        var harness = new Harness();
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        // First route build (production: ProxyRouteInitializer at startup): map is
+        // empty → single Warning entered.
+        await harness.ProxyState.RefreshRoutesAsync();
+        // Second rebuild with the SAME no-container state → no new Warning.
+        await harness.ProxyState.RefreshRoutesAsync();
+
+        int WarningsForService() => harness.Logs.Entries.Count(e =>
+            e.Level == LogLevel.Warning
+            && e.Category.Contains("ProxyStateService", StringComparison.Ordinal)
+            && e.Message.Contains("svc-a", StringComparison.Ordinal));
+
+        Assert.Equal(1, WarningsForService());
+
+        // Now the reconciler records the container's real port and rebuilds: a
+        // single Info recovery is logged; no additional warnings.
+        harness.HostPorts.Set("svc-a", 40_000);
+        await harness.ProxyState.RefreshRoutesAsync();
+
+        Assert.Equal(1, WarningsForService()); // still only the original one
+        Assert.Contains(harness.Logs.Entries, e =>
+            e.Level == LogLevel.Information
+            && e.Category.Contains("ProxyStateService", StringComparison.Ordinal)
+            && e.Message.Contains("svc-a", StringComparison.Ordinal)
+            && e.Message.Contains("resumed", StringComparison.OrdinalIgnoreCase));
+
+        // If svc-a drops offline again later, that IS a fresh transition — the
+        // next entry into 'no container' must log a new Warning (not silently be
+        // treated as the previous transition still in effect).
+        harness.HostPorts.Remove("svc-a");
+        await harness.ProxyState.RefreshRoutesAsync();
+        Assert.Equal(2, WarningsForService());
+    }
+
+    [Fact]
+    public async Task StartupOrdering_HostPortMapPrimedBeforeFirstRouteBuild()
+    {
+        // Requirement #4: on gateway restart with containers already running, the
+        // ServiceHostPortMap must be primed from the runtime inventory BEFORE the
+        // first route build — otherwise the reconciler-mode no-fallback would
+        // publish an empty-destinations cluster (503) even though a healthy
+        // container is bound on its ephemeral port. This test simulates a fresh
+        // gateway process (in-memory swap state gone) whose startup path runs the
+        // ProxyRouteInitializer against a runtime that already has the container.
+        var runtime = new FakeContainerRuntime();
+        runtime.Seed(new ContainerInfo(
+            "svc-a", "registry/svc-a", "sha256:v1", "running",
+            DateTimeOffset.UnixEpoch, EmptyEnvHash, HostPort: 8081));
+        var store = new InMemoryManifestStore();
+        await store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1", port: 8080));
+
+        // Wire the proxy stack in reconciler mode; ProxyRouteInitializer primes
+        // the map from the runtime, then builds routes.
+        var services = new ServiceCollection();
+        services.AddSingleton<IManifestStore>(store);
+        services.AddSingleton<IServiceAddressResolver, HostLoopbackAddressResolver>();
+        services.AddSingleton<ServiceHostPortMap>();
+        services.AddSingleton<ManifestProxyConfigProvider>();
+        services.AddSingleton(new ReconcilerOptions { Enabled = true });
+        services.AddSingleton<ProxyStateService>();
+        services.AddLogging();
+        await using var sp = services.BuildServiceProvider();
+        var hostPorts = sp.GetRequiredService<ServiceHostPortMap>();
+        var state = sp.GetRequiredService<ProxyStateService>();
+        var config = sp.GetRequiredService<ManifestProxyConfigProvider>();
+        var initializer = new ProxyRouteInitializer(
+            state, hostPorts, NullLogger<ProxyRouteInitializer>.Instance, runtime);
+
+        await initializer.StartAsync(CancellationToken.None);
+
+        // Map has the pre-existing container's real host port.
+        Assert.True(hostPorts.TryGet("svc-a", out var mapped));
+        Assert.Equal(8081, mapped);
+        // Route was published against the real port — NOT an empty cluster.
+        var cluster = Assert.Single(config.GetConfig().Clusters);
+        Assert.NotNull(cluster.Destinations);
+        Assert.Equal("http://127.0.0.1:8081", cluster.Destinations!.Values.Single().Address);
     }
 }
