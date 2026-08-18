@@ -62,6 +62,20 @@ public sealed class ReconcilerService : BackgroundService
     // so a subsequent successful resolution clears it. Guarded by the _serviceErrors lock.
     private readonly HashSet<string> _envErrored = new(StringComparer.Ordinal);
 
+    // Per-service digest-drift circuit breaker state (task #99, incident 2026-08-17).
+    // Tracks consecutive blue-green replace cycles where the promoted container did NOT
+    // land on the manifest's pinned digest — the fingerprint of an unsatisfiable pin
+    // (the tag was overwritten in the registry, so every pull yields a different sha).
+    // After N such cycles the breaker trips: the reconciler stops replacing for that
+    // service, the last successfully started container is left serving, the service is
+    // marked degraded, and a Warning is logged ONCE per trip. Resets on a manifest
+    // change (new pinned digest) or on a subsequent replace whose container converges
+    // on the pin. Guarded by _digestDriftBreakersLock so the heartbeat's degraded
+    // snapshot never races with the reconcile loop's update.
+    private readonly Dictionary<string, DigestDriftBreaker> _digestDriftBreakers =
+        new(StringComparer.Ordinal);
+    private readonly object _digestDriftBreakersLock = new();
+
     // Fleet-event state, touched only from the single reconcile loop (no lock needed).
     // Was this instance the leader on the previous loop, so a "leaderChange" fires only
     // on the transition into leadership (task #588). Starts false: a fresh process that
@@ -188,7 +202,17 @@ public sealed class ReconcilerService : BackgroundService
         // with no gateway restart. Services mid blue-green keep their destination override
         // (skipped so it is not clobbered), and routes rebuild only on a real change so a
         // steady fleet churns nothing.
-        var midSwap = _proxyState.ServicesWithDestinationOverride();
+        // Skip mid-swap services from container-truth host-port reconciliation, but
+        // only for a BOUNDED window — 2× (readiness timeout + drain delay) — so a
+        // service that is perpetually swapping (e.g. task #99's unsatisfiable pinned
+        // digest before the circuit breaker trips, or a swap leaked by an exception)
+        // cannot freeze its map entry at a stale port that Docker later reassigns to
+        // a sibling service (incident 2026-08-17). Once the bound is exceeded, the map
+        // updates from container truth so the route always follows the real canonical
+        // container's port, even in the middle of an in-progress swap.
+        var maxSwapSkip = TimeSpan.FromTicks(
+            2 * (_options.ReadinessTimeout + _options.DrainDelay).Ticks);
+        var midSwap = _proxyState.ServicesWithDestinationOverride(maxSwapSkip);
         if (_hostPorts.ReconcileFrom(actual, midSwap))
         {
             await _proxyState.RefreshRoutesAsync(ct);
@@ -206,7 +230,22 @@ public sealed class ReconcilerService : BackgroundService
         foreach (var action in plan)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Digest-drift circuit breaker (task #99, incident 2026-08-17): reset
+            // the breaker as soon as the manifest changes, then skip the replace if
+            // the breaker is tripped — the last successfully started container is
+            // left serving.
+            await ResetBreakerIfManifestChangedAsync(action, ct);
+
+            if (ShouldSkipBecauseBreakerTripped(action))
+            {
+                await ReportBreakerTrippedIfNewAsync(action, ct);
+                continue;
+            }
+
             await ExecuteAsync(action, ct);
+
+            await UpdateDigestDriftBreakerAfterActionAsync(action, ct);
         }
 
         // Derive leadership from heartbeats (tech-spec §4.3): the election upserts our
@@ -259,7 +298,7 @@ public sealed class ReconcilerService : BackgroundService
                 PublicIp = identity.PublicIp,
                 GatewayVer = GatewayVersion.Current,
                 IsLeader = isLeader,
-                Services = InstanceServicesJson.Build(containers, SnapshotErrors()),
+                Services = InstanceServicesJson.Build(containers, SnapshotErrors(), SnapshotDegraded()),
                 HeartbeatAt = DateTimeOffset.UtcNow,
             };
 
@@ -1093,6 +1132,284 @@ public sealed class ReconcilerService : BackgroundService
             }
         }
     }
+
+    /// <summary>
+    /// Per-service digest-drift circuit breaker (task #99, incident 2026-08-17). One
+    /// exists per service that has landed on a container digest other than the manifest's
+    /// pinned digest at least once; N consecutive such cycles flip <see cref="Tripped"/>.
+    /// Reset when the manifest's pinned digest changes or a subsequent replace converges
+    /// on the pin.
+    /// </summary>
+    private sealed class DigestDriftBreaker
+    {
+        /// <summary>Pinned digest we are trying to converge on. Reset when this changes.</summary>
+        public required string PinnedDigest { get; init; }
+
+        /// <summary>The digest the container keeps landing on instead (for the log/message).</summary>
+        public string? ObservedDigest { get; set; }
+
+        /// <summary>Consecutive replace cycles ending with container.Digest != <see cref="PinnedDigest"/>.</summary>
+        public int ConsecutiveMismatches { get; set; }
+
+        /// <summary>True once <see cref="ConsecutiveMismatches"/> reaches the threshold.</summary>
+        public bool Tripped { get; set; }
+
+        /// <summary>Whether a Warning-level trip log has been emitted for the CURRENT trip.</summary>
+        public bool WarningEmitted { get; set; }
+    }
+
+    /// <summary>
+    /// The number of consecutive digest-drift replace cycles ending with the container
+    /// landing on a digest other than the pinned one before the breaker trips. Fixed to
+    /// 3 per task #99 requirement #1; exposed as a constant so the reconciler tests can
+    /// assert the exact edge.
+    /// </summary>
+    public const int DigestDriftBreakerThreshold = 3;
+
+    /// <summary>
+    /// The stable degraded reason format written to the service's <c>lastError</c> so
+    /// the ops dashboard (and the Warning log) says the same thing about a tripped
+    /// breaker: the pin, the digest we keep landing on, and how to recover.
+    /// </summary>
+    private static string BreakerReason(string pinned, string? observed) =>
+        $"digest-drift breaker tripped: pinned {pinned} unsatisfiable from tag "
+        + $"(running {observed ?? "<unknown>"}); reconcile paused, retrying on new deploy or manifest change.";
+
+    /// <summary>
+    /// Reset a service's digest-drift breaker if the manifest's pinned digest no longer
+    /// matches what the breaker is stuck on — a new deploy resolved a fresh pin, or the
+    /// pin was cleared. Requirement #1 of task #99: the breaker retries "when the
+    /// manifest row changes". Also clears the recorded degraded lastError so the fleet
+    /// rollup shows the service healthy again.
+    /// </summary>
+    private async Task ResetBreakerIfManifestChangedAsync(ReconcileAction action, CancellationToken ct)
+    {
+        var currentPin = action.Desired?.Digest;
+        var clearedFromBreaker = false;
+        bool wasTripped = false;
+
+        lock (_digestDriftBreakersLock)
+        {
+            if (!_digestDriftBreakers.TryGetValue(action.ServiceName, out var breaker))
+            {
+                return;
+            }
+
+            var manifestChanged = currentPin is null
+                || !string.Equals(currentPin, breaker.PinnedDigest, StringComparison.Ordinal);
+            if (!manifestChanged)
+            {
+                return;
+            }
+
+            wasTripped = breaker.Tripped;
+            _digestDriftBreakers.Remove(action.ServiceName);
+            clearedFromBreaker = true;
+        }
+
+        if (!clearedFromBreaker)
+        {
+            return;
+        }
+
+        if (wasTripped)
+        {
+            _logger.LogInformation(
+                "Digest-drift breaker for {Service} cleared: manifest pinned digest changed to {Pin}.",
+                action.ServiceName, currentPin ?? "<none>");
+        }
+
+        // Wipe the sticky degraded message so lastError reflects reality now.
+        await ClearBreakerServiceErrorAsync(action.ServiceName, ct);
+    }
+
+    /// <summary>
+    /// True when the plan step is a digest-drift blue-green replace for a service
+    /// whose breaker has tripped — the reconciler must skip it and leave the current
+    /// container serving.
+    /// </summary>
+    private bool ShouldSkipBecauseBreakerTripped(ReconcileAction action)
+    {
+        if (!IsDigestDriftReplace(action))
+        {
+            return false;
+        }
+
+        lock (_digestDriftBreakersLock)
+        {
+            return _digestDriftBreakers.TryGetValue(action.ServiceName, out var breaker)
+                && breaker.Tripped;
+        }
+    }
+
+    /// <summary>
+    /// Emit the Warning-once-per-trip and record the sticky degraded lastError for a
+    /// service whose breaker just tripped (or was tripped on a previous loop and is
+    /// still tripped). Requirement #1: "Warning+ once, not per loop".
+    /// </summary>
+    private async Task ReportBreakerTrippedIfNewAsync(ReconcileAction action, CancellationToken ct)
+    {
+        string? pinned = null;
+        string? observed = null;
+        var shouldEmitWarning = false;
+
+        lock (_digestDriftBreakersLock)
+        {
+            if (!_digestDriftBreakers.TryGetValue(action.ServiceName, out var breaker) || !breaker.Tripped)
+            {
+                return;
+            }
+
+            pinned = breaker.PinnedDigest;
+            observed = breaker.ObservedDigest;
+            if (!breaker.WarningEmitted)
+            {
+                breaker.WarningEmitted = true;
+                shouldEmitWarning = true;
+            }
+        }
+
+        if (shouldEmitWarning)
+        {
+            _logger.LogWarning(
+                "Digest-drift breaker tripped for {Service}: pinned {Pin} is unsatisfiable "
+                + "from the tag (last {Cycles} replaces came up on {Observed}). "
+                + "Reconcile paused; leaving the current container serving. Retries on a "
+                + "new deploy or manifest change.",
+                action.ServiceName, pinned, DigestDriftBreakerThreshold, observed ?? "<unknown>");
+
+            // Sticky degraded reason: written once (message stable across loops so
+            // ReportOutcomeAsync's changed-detection would not re-broadcast).
+            await ReportOutcomeAsync(new ReconcileOutcome(
+                action.ServiceName,
+                ReconcileActionKind.BlueGreenReplace,
+                ReconcileOutcomeStatus.Failed,
+                BreakerReason(pinned!, observed)), ct);
+        }
+    }
+
+    /// <summary>
+    /// Update the breaker after a plan step executed. For digest-drift replaces, count
+    /// a mismatch (or clear on convergence); for anything else, drop the breaker for
+    /// this service since it no longer applies (e.g. service is being stopped or the
+    /// container converged on the pin without a replace).
+    /// </summary>
+    private async Task UpdateDigestDriftBreakerAfterActionAsync(ReconcileAction action, CancellationToken ct)
+    {
+        if (!IsDigestDriftReplace(action))
+        {
+            // Any non-digest-drift action for this service invalidates the breaker.
+            var wasCleared = ClearBreakerIfPresent(action.ServiceName);
+            if (wasCleared)
+            {
+                _logger.LogInformation(
+                    "Digest-drift breaker for {Service} cleared: no digest drift remains.",
+                    action.ServiceName);
+                await ClearBreakerServiceErrorAsync(action.ServiceName, ct);
+            }
+            return;
+        }
+
+        var desiredPin = action.Desired!.Digest!;
+        var runningDigest = (await _runtime.ListManagedContainersAsync(ct))
+            .FirstOrDefault(c => string.Equals(c.Name, action.ServiceName, StringComparison.Ordinal))
+            ?.Digest;
+        var mismatched = !string.Equals(desiredPin, runningDigest, StringComparison.Ordinal);
+
+        if (!mismatched)
+        {
+            // Replace converged on the pinned digest — happy path. Drop any tracked
+            // breaker and clear a sticky degraded message.
+            var wasCleared = ClearBreakerIfPresent(action.ServiceName);
+            if (wasCleared)
+            {
+                _logger.LogInformation(
+                    "Digest-drift breaker for {Service} cleared: replace converged on pinned digest.",
+                    action.ServiceName);
+                await ClearBreakerServiceErrorAsync(action.ServiceName, ct);
+            }
+            return;
+        }
+
+        bool trippedNow;
+        lock (_digestDriftBreakersLock)
+        {
+            if (!_digestDriftBreakers.TryGetValue(action.ServiceName, out var breaker)
+                || !string.Equals(breaker.PinnedDigest, desiredPin, StringComparison.Ordinal))
+            {
+                breaker = new DigestDriftBreaker { PinnedDigest = desiredPin };
+                _digestDriftBreakers[action.ServiceName] = breaker;
+            }
+
+            breaker.ObservedDigest = runningDigest;
+            breaker.ConsecutiveMismatches++;
+            if (!breaker.Tripped && breaker.ConsecutiveMismatches >= DigestDriftBreakerThreshold)
+            {
+                breaker.Tripped = true;
+                trippedNow = true;
+            }
+            else
+            {
+                trippedNow = false;
+            }
+        }
+
+        if (trippedNow)
+        {
+            await ReportBreakerTrippedIfNewAsync(action, ct);
+        }
+    }
+
+    private bool ClearBreakerIfPresent(string service)
+    {
+        lock (_digestDriftBreakersLock)
+        {
+            return _digestDriftBreakers.Remove(service);
+        }
+    }
+
+    /// <summary>
+    /// Drop the sticky degraded <see cref="ServiceError"/> a tripped breaker recorded,
+    /// so a subsequent successful action doesn't leave the ops dashboard reading
+    /// "degraded" on a service whose breaker has cleared. Publishes the cleared
+    /// transition on ops:fleet like any other last-error clear.
+    /// </summary>
+    private async Task ClearBreakerServiceErrorAsync(string service, CancellationToken ct)
+    {
+        bool cleared;
+        lock (_serviceErrors)
+        {
+            cleared = _serviceErrors.Remove(service);
+        }
+
+        if (cleared)
+        {
+            await PublishServiceErrorAsync(service, null, ct);
+        }
+    }
+
+    /// <summary>Snapshot the tripped-breaker set for the next heartbeat build.</summary>
+    private IReadOnlySet<string> SnapshotDegraded()
+    {
+        lock (_digestDriftBreakersLock)
+        {
+            var s = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var (name, breaker) in _digestDriftBreakers)
+            {
+                if (breaker.Tripped)
+                {
+                    s.Add(name);
+                }
+            }
+            return s;
+        }
+    }
+
+    private static bool IsDigestDriftReplace(ReconcileAction action) =>
+        action.Kind == ReconcileActionKind.BlueGreenReplace
+        && action.Desired is not null
+        && !string.IsNullOrEmpty(action.Desired.Digest)
+        && action.Reason.StartsWith("digest drift", StringComparison.Ordinal);
 
     private TimeSpan NextDelay()
     {

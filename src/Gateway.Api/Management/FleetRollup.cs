@@ -27,13 +27,21 @@ namespace Gateway.Api.Management;
 /// The most recent per-service error across the fleet (by timestamp), or null when
 /// no instance reports one.
 /// </param>
+/// <param name="DegradedOn">
+/// Number of instances whose reconciler has tripped the digest-drift circuit breaker
+/// for the service (task #99, incident 2026-08-17): the pinned digest is unsatisfiable
+/// from the tag, so the reconciler has stopped replacing and the last successfully
+/// started container is left serving. Distinct from <see cref="ErrorOn"/> — degraded
+/// containers are running, just not on the pinned digest.
+/// </param>
 public sealed record FleetRollup(
     int RunningOn,
     int TotalInstances,
     IReadOnlyDictionary<string, int> Digests,
     int? HostPort,
     int ErrorOn,
-    FleetServiceError? LatestError)
+    FleetServiceError? LatestError,
+    int DegradedOn = 0)
 {
     /// <summary>Placeholder key for an instance running the service on an unknown digest.</summary>
     public const string UnknownDigest = "unknown";
@@ -52,6 +60,7 @@ public sealed record FleetRollup(
         var runningOn = 0;
         int? hostPort = null;
         var errorOn = 0;
+        var degradedOn = 0;
         FleetServiceError? latestError = null;
 
         foreach (var instance in instances)
@@ -80,9 +89,14 @@ public sealed record FleetRollup(
                     latestError = new FleetServiceError(instance.InstanceId, message, at);
                 }
             }
+
+            if (entries.Any(e => e.Degraded))
+            {
+                degradedOn++;
+            }
         }
 
-        return new FleetRollup(runningOn, instances.Count, digests, hostPort, errorOn, latestError);
+        return new FleetRollup(runningOn, instances.Count, digests, hostPort, errorOn, latestError, degradedOn);
     }
 }
 

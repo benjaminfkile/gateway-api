@@ -171,6 +171,52 @@ public class ManagementServicesReadTests
     }
 
     [Fact]
+    public async Task GetServices_RollsUpDegradedInstances_FromDigestDriftBreaker()
+    {
+        // task #99: the fleet rollup exposes degradedOn — the count of instances
+        // whose reconciler has tripped the digest-drift circuit breaker for a
+        // service (pinned digest unsatisfiable). Distinct from errorOn: the
+        // containers are still running (last successfully started), so runningOn
+        // is non-zero even when degradedOn is the fleet size.
+        await using var factory = new ManagementApiFactory();
+        await factory.WithDbAsync(async db =>
+        {
+            db.ServiceManifests.Add(ManagementTestData.Manifest("svc-a", digest: "sha256:pinned"));
+            // Two instances degraded (breaker tripped), one healthy.
+            db.InstanceStatus.Add(ManagementTestData.InstanceWithDegradedService("i-1", "svc-a"));
+            db.InstanceStatus.Add(ManagementTestData.InstanceWithDegradedService("i-2", "svc-a"));
+            db.InstanceStatus.Add(ManagementTestData.Instance("i-3", running: ("svc-a", "sha256:pinned")));
+            await db.SaveChangesAsync();
+        });
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var body = await client.GetFromJsonAsync<JsonElement>("/mgmt/services");
+
+        var svc = body.EnumerateArray().Single(s => s.GetProperty("name").GetString() == "svc-a");
+        var fleet = svc.GetProperty("fleet");
+        Assert.Equal(3, fleet.GetProperty("runningOn").GetInt32()); // all still serving
+        Assert.Equal(2, fleet.GetProperty("degradedOn").GetInt32());
+    }
+
+    [Fact]
+    public async Task GetServices_NoDegraded_ReportsZero()
+    {
+        await using var factory = new ManagementApiFactory();
+        await factory.WithDbAsync(async db =>
+        {
+            db.ServiceManifests.Add(ManagementTestData.Manifest("svc-a", digest: "sha256:v1"));
+            db.InstanceStatus.Add(ManagementTestData.Instance("i-1", running: ("svc-a", "sha256:v1")));
+            await db.SaveChangesAsync();
+        });
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var body = await client.GetFromJsonAsync<JsonElement>("/mgmt/services");
+
+        var fleet = body.EnumerateArray().Single().GetProperty("fleet");
+        Assert.Equal(0, fleet.GetProperty("degradedOn").GetInt32());
+    }
+
+    [Fact]
     public async Task GetServices_RequiresAuthentication()
     {
         await using var factory = new ManagementApiFactory();

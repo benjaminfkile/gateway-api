@@ -27,6 +27,14 @@ namespace Gateway.Api.Instances;
 /// existed, so parsing stays backward compatible.
 /// </param>
 /// <param name="LastErrorAt">When <see cref="LastError"/> was recorded, or null when there is no error.</param>
+/// <param name="Degraded">
+/// True when this instance's reconciler has tripped the digest-drift circuit breaker for
+/// this service (task #99): the pinned digest cannot be satisfied from the tag, N
+/// consecutive blue-green replaces landed on a different digest, so the reconciler has
+/// stopped replacing and the last successfully started container is left serving.
+/// Defaults to false. Backward compatible: rows written before this field existed parse
+/// with degraded=false, so old heartbeats never look degraded.
+/// </param>
 public sealed record InstanceServiceEntry(
     string Name,
     string? Digest,
@@ -35,7 +43,8 @@ public sealed record InstanceServiceEntry(
     int Restarts,
     int? HostPort = null,
     string? LastError = null,
-    DateTimeOffset? LastErrorAt = null);
+    DateTimeOffset? LastErrorAt = null,
+    bool Degraded = false);
 
 /// <summary>
 /// The outcome of the most recent reconcile action for one service on this instance
@@ -81,7 +90,8 @@ public static class InstanceServicesJson
     /// </summary>
     public static string Build(
         IReadOnlyList<ContainerInfo> containers,
-        IReadOnlyDictionary<string, ServiceError>? errors = null)
+        IReadOnlyDictionary<string, ServiceError>? errors = null,
+        IReadOnlySet<string>? degraded = null)
     {
         var entries = new List<InstanceServiceEntry>(containers.Count);
         var listed = new HashSet<string>(StringComparer.Ordinal);
@@ -92,7 +102,8 @@ public static class InstanceServicesJson
             var error = Lookup(errors, c.Name);
             entries.Add(new InstanceServiceEntry(
                 c.Name, c.Digest, c.State, c.StartedAt, c.Restarts, c.HostPort,
-                error?.Message, error?.At));
+                error?.Message, error?.At,
+                Degraded: degraded is not null && degraded.Contains(c.Name)));
         }
 
         if (errors is not null)
@@ -106,7 +117,8 @@ public static class InstanceServicesJson
 
                 entries.Add(new InstanceServiceEntry(
                     name, Digest: null, State: AbsentState, StartedAt: null, Restarts: 0,
-                    HostPort: null, LastError: error.Message, LastErrorAt: error.At));
+                    HostPort: null, LastError: error.Message, LastErrorAt: error.At,
+                    Degraded: degraded is not null && degraded.Contains(name)));
             }
         }
 
