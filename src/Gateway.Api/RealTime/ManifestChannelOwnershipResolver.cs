@@ -42,6 +42,35 @@ public sealed class ManifestChannelOwnershipResolver : IChannelOwnershipResolver
         return services.TryGetValue(prefix, out var owner) ? owner : null;
     }
 
+    public async Task<ChannelOwner?> ResolveByTokenAsync(string? presentedToken, CancellationToken ct = default)
+    {
+        // A missing or empty header never resolves — Matches() would reject each stored
+        // token below anyway, but short-circuiting here spares the DB projection touch
+        // for the common "no header" case (task #217).
+        if (string.IsNullOrEmpty(presentedToken))
+        {
+            return null;
+        }
+
+        var services = await _projection.GetAsync(ct);
+
+        // Sweep every service, keeping the match without breaking, so total compare
+        // time is O(N) regardless of which service (or none) owns the presented
+        // token — otherwise an early-exit loop leaks ordering via wall-clock timing.
+        // Matches() itself is FixedTimeEquals, so each per-service compare is
+        // length-agnostic and never short-circuits.
+        ChannelOwner? matched = null;
+        foreach (var owner in services.Values)
+        {
+            if (RealtimePublishToken.Matches(presentedToken, owner.PublishToken))
+            {
+                matched = owner;
+            }
+        }
+
+        return matched;
+    }
+
     private static IReadOnlyDictionary<string, ChannelOwner> Project(ManifestSnapshotCache.Snapshot snapshot)
     {
         var map = new Dictionary<string, ChannelOwner>(StringComparer.Ordinal);

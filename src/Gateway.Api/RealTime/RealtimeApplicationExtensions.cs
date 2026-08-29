@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Gateway.Api.Instances;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -209,13 +210,80 @@ public static class RealtimeApplicationExtensions
     }
 
     /// <summary>
-    /// The ONE owner-token authorization sequence every internal owner-scoped endpoint
+    /// Map the leadership-answer endpoint (tech-spec §4.3, task #217):
+    /// <c>GET /internal/leader</c>. A downstream container asks the gateway on its own
+    /// host "is this instance the fleet leader right now" so a service that needs a
+    /// single active worker (one poller, one publisher) can gate its own duties on
+    /// leadership instead of running its own election or holding a Postgres advisory
+    /// lock. The isolation middleware keeps this reachable only on the internal listener
+    /// — so the answering gateway is by construction the caller's host's gateway — and
+    /// that is what makes <c>isLeader</c> meaningful: it is the caller's host's leadership.
+    /// <para>
+    /// Auth: the request must carry <c>X-Gateway-Realtime-Token</c> matching the publish
+    /// token of <b>any</b> registered manifest service (constant-time compared through
+    /// the same resolver <c>/internal/publish</c> and <c>/internal/presence</c> use — one
+    /// place, no duplicated compare logic). There is no channel here, so ownership is
+    /// simply "the presented token matches some registered service"; missing, empty, or
+    /// unknown tokens are 403 with a body naming the header. The management (Cognito /
+    /// mgmt client-credentials) auth path is <b>not</b> accepted — this surface is for
+    /// containers only.
+    /// </para>
+    /// <para>
+    /// The endpoint never touches the DB and never triggers an election: it reads only
+    /// the cached <see cref="LeadershipState"/> the reconcile loop updates on every
+    /// iteration. Before the first reconcile loop completes it reports
+    /// <c>isLeader=false</c> with null <c>leaderInstanceId</c> and <c>evaluatedAt</c>,
+    /// so a booting instance never claims leadership through this surface. When the
+    /// reconciler is disabled (<c>GATEWAY_RECONCILER_ENABLED=false</c>) the endpoint
+    /// still answers, but the state stays permanently at "never evaluated" — an operator
+    /// who wants leadership answers must leave the reconciler enabled.
+    /// </para>
+    /// </summary>
+    public static IEndpointRouteBuilder MapInternalLeader(this IEndpointRouteBuilder endpoints)
+    {
+        endpoints.MapGet("/internal/leader", async (
+            HttpContext context,
+            IChannelOwnershipResolver ownership,
+            LeadershipState state,
+            InstanceMetadataProvider metadata,
+            CancellationToken ct) =>
+        {
+            // The token must match SOME registered service — there is no channel here to
+            // scope ownership to, so this is the "presenter is a container this gateway
+            // knows" check. Same resolver / same constant-time compare the channel-scoped
+            // endpoints use, so there is exactly one place tokens are matched.
+            var presenter = await ResolvePresenterAsync(context, ownership, ct);
+            if (presenter is null)
+            {
+                return Results.Json(
+                    new { error = $"The {RealtimePublishToken.Header} header does not match any registered service." },
+                    statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var identity = await metadata.GetAsync(ct);
+            var snapshot = state.Snapshot();
+
+            return Results.Json(new
+            {
+                instanceId = identity.InstanceId,
+                isLeader = snapshot.IsLeader,
+                leaderInstanceId = snapshot.LeaderInstanceId,
+                evaluatedAt = snapshot.EvaluatedAt,
+            });
+        });
+        return endpoints;
+    }
+
+    /// <summary>
+    /// The ONE owner-token authorization sequence every channel-scoped internal endpoint
     /// shares (review finding: /internal/publish and /internal/presence each carried a
     /// byte-for-byte copy; a third endpoint would have made a third). Validates the
     /// channel's shape (the same rule joins enforce — a name like <c>svc-a:</c> would
     /// otherwise pass ownership and token checks yet name a group that can never have
     /// members), refuses gateway-owned <c>ops:*</c>, resolves the owning service, and
-    /// constant-time-matches the presented <c>X-Gateway-Realtime-Token</c>.
+    /// authorizes the presented <c>X-Gateway-Realtime-Token</c> through the same
+    /// resolver method <c>/internal/leader</c> uses — the token→service compare lives in
+    /// <see cref="IChannelOwnershipResolver.ResolveByTokenAsync"/>, not here.
     /// Returns either the authorized owner or the failure <see cref="IResult"/> to
     /// short-circuit with; <paramref name="action"/> phrases the 403 (e.g. "publishing
     /// to", "reading presence for").
@@ -262,8 +330,11 @@ public static class RealtimeApplicationExtensions
                 statusCode: StatusCodes.Status403Forbidden));
         }
 
-        var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
-        if (!RealtimePublishToken.Matches(presented, owner.PublishToken))
+        // Route the presented token through the shared resolver (task #217) so the
+        // compare logic exists in exactly one place; the presenter is authorized when it
+        // is the same service that owns the channel's prefix.
+        var presenter = await ResolvePresenterAsync(context, ownership, ct);
+        if (presenter is null || !string.Equals(presenter.Service, owner.Service, StringComparison.Ordinal))
         {
             return (null, Results.Json(
                 new { error = $"The {RealtimePublishToken.Header} header does not authorize {action} '{channel}'." },
@@ -271,5 +342,20 @@ public static class RealtimeApplicationExtensions
         }
 
         return (owner, null);
+    }
+
+    /// <summary>
+    /// Read the <c>X-Gateway-Realtime-Token</c> header and resolve it to the manifest
+    /// service that minted it (task #217). This is the single call site that reads the
+    /// header — every internal owner-scoped endpoint funnels through it so the
+    /// header-name string and the presented-token → service resolution live in exactly
+    /// one place. Returns null when no header was sent, the header is empty, or the
+    /// token does not match any known service.
+    /// </summary>
+    internal static Task<ChannelOwner?> ResolvePresenterAsync(
+        HttpContext context, IChannelOwnershipResolver ownership, CancellationToken ct)
+    {
+        var presented = context.Request.Headers[RealtimePublishToken.Header].ToString();
+        return ownership.ResolveByTokenAsync(presented, ct);
     }
 }

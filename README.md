@@ -74,7 +74,7 @@ feature degrades gracefully when its variable is unset, so a bare
 | `GATEWAY_REDIS_ENDPOINT` | unset | Redis endpoint for the SignalR backplane. Unset → hub runs without a backplane (single instance). |
 | `GATEWAY_REDIS_SSL` | `true` | TLS for the Redis backplane connection. |
 | `GATEWAY_CORS_ORIGINS` | unset | Comma-separated origins allowed CORS access to `/mgmt/*` and `/hub` (the ops dashboard's origin). Unset → `/mgmt` gets no CORS; proxied application traffic is never CORS-handled either way. On `/hub` only, this static set is unioned with every manifest service's `realtimeAllowedOrigins` so a consumer app's frontend can negotiate a SignalR connection from its own domain (effective within ~30s of an upsert, no restart). |
-| `GATEWAY_INTERNAL_BIND` | `0.0.0.0:8080` | Bind address of the internal listener hosting `POST /internal/publish` (never routed by the load balancer). |
+| `GATEWAY_INTERNAL_BIND` | `0.0.0.0:8080` | Bind address of the internal listener hosting `POST /internal/publish`, `GET /internal/presence/{channel}`, and `GET /internal/leader` (never routed by the load balancer). |
 | `GATEWAY_INSTANCE_ID` | unset | Instance identity fallback when EC2 IMDS is unreachable (local dev). |
 | `GATEWAY_PRIVATE_IP` | unset | Private IP fallback for local dev. |
 | `GATEWAY_PUBLIC_IP` | unset | Public IP fallback for local dev. |
@@ -230,6 +230,22 @@ loops on `No such image` is visible through the API instead of hiding in journal
 
 Older rows written before these fields existed parse unchanged (the fields default
 to `null`).
+
+## Internal listener (containers only)
+
+A second Kestrel endpoint bound from `GATEWAY_INTERNAL_BIND` (default `0.0.0.0:8080`)
+hosts the routes downstream containers call into the gateway on. It is reachable
+only from the Docker bridge network of the instance it runs on — never routed by
+the load balancer — and the isolation middleware 404s these paths on the public
+listener. Every endpoint below is gated by `X-Gateway-Realtime-Token` (constant-time
+compared through the same token→service resolver, one place); the management
+(Cognito) auth path is not accepted on this listener.
+
+| Endpoint | Auth | Action |
+|---|---|---|
+| `POST /internal/publish` | Owner's publish token | Broadcast `{ channel, event, payload }` to the channel's SignalR group. `202` on success; `403` cross-service or on `ops:*`; `429` over the per-service publish budget. |
+| `GET  /internal/presence/{channel}` | Owner's publish token | Pull the current members of one of your channels: `{ channel, count, members: [{ connectionId, identity, joinedAt }] }`. |
+| `GET  /internal/leader` | Any registered service's publish token | Is the answering gateway's instance the fleet leader right now: `{ instanceId, isLeader, leaderInstanceId, evaluatedAt }`. Reads the reconciler's cached snapshot — no DB, no election. Before the first loop `isLeader=false` with null `leaderInstanceId`/`evaluatedAt`; a booting instance never claims leadership through this endpoint. Leadership may briefly overlap on a transition, so downstream leader-gated duties must be idempotent (see REALTIME.md §7). |
 
 ## CI
 

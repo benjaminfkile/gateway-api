@@ -105,6 +105,18 @@ survive gateway restarts.
   (internal-only listener, reachable from the Docker network, never exposed via
   the load balancer). That publish call is the app *choosing* to be
   gateway-aware; nothing more is required of it — no webhooks, no callbacks, no SDK.
+- **Internal listener route table.** All owner-scoped endpoints are gated by
+  `X-Gateway-Realtime-Token` (constant-time compared through the same resolver;
+  the token→service compare lives in exactly one place) and are reachable ONLY
+  on the internal listener — the isolation middleware 404s them on the public
+  port. The public listener never exposes any of these routes.
+  - `POST /internal/publish` — broadcast a channel event (owner's token).
+  - `GET  /internal/presence/{channel}` — pull who is present in a channel (owner's token).
+  - `GET  /internal/leader` — is the answering gateway's instance the fleet leader
+    right now (see §4.3). Accepts **any** registered service's token — the caller
+    is only proving it is a container this gateway manages. Reads the reconciler's
+    cached snapshot; never touches the DB and never triggers an election. Before the
+    first loop, `isLeader=false` with null `leaderInstanceId`/`evaluatedAt`.
 - Channel model: `{app}:{topic}` (e.g. `svc-a:updates`). Hub channels are
   **public broadcast** — the gateway performs no end-user auth (see design
   invariant). Suitable for public/live data feeds. An app needing private,
@@ -166,6 +178,20 @@ advisory locks, no session state.
 - The algorithm reads/writes only through the `IInstanceStatusStore` seam, so it is
   unit-tested against a fake — the build box has no Postgres. `InMemoryLeaderElection`
   still stands in for single-node no-DB mode.
+- **`GET /internal/leader` (internal listener).** A downstream container asks the gateway
+  on its own host "is this instance the fleet leader right now" so a service that needs a
+  single active worker (one poller, one publisher) can gate its own duties on leadership
+  instead of running its own election or holding an advisory lock. Returns
+  `{ instanceId, isLeader, leaderInstanceId, evaluatedAt }` read from the reconciler's
+  cached last-loop snapshot — the endpoint **never touches the DB and never triggers an
+  election**. Auth is any registered service's `X-Gateway-Realtime-Token` (no channel
+  scope: this surface is "is the presenter a container we manage"); the management auth
+  path is deliberately not accepted here. Before the first reconcile loop the response is
+  `isLeader=false` with null `leaderInstanceId`/`evaluatedAt`, so a booting instance never
+  claims leadership. Because leadership may briefly overlap on a transition (see above),
+  downstream leader-gated duties must be **idempotent**; the recommended client pattern is
+  poll every ~2s with a ~1s timeout, treat any failure or a result older than ~10s as
+  follower, and never cache `leader=true` across silence.
 
 ### 4.4 Desired-state manifest (PostgreSQL)
 Single source of truth, mutated only by the Management API, consumed by reconcilers.

@@ -292,6 +292,9 @@ public class ChannelAuthDecisionCacheTests
     {
         public Task<ChannelOwner?> ResolveAsync(string prefix, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<ChannelOwner?> ResolveByTokenAsync(string? presentedToken, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class StubAuthClient : IChannelAuthClient
