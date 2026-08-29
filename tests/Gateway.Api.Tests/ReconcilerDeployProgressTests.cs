@@ -116,6 +116,7 @@ public class ReconcilerDeployProgressTests
                 new NullReporter(),
                 metadata,
                 new InMemoryLeaderElection(isLeader),
+                new LeadershipState(),
                 options,
                 NullLogger<ReconcilerService>.Instance,
                 migrationGate: null,

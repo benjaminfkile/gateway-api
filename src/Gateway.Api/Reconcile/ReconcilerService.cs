@@ -37,6 +37,7 @@ public sealed class ReconcilerService : BackgroundService
     private readonly IReconcileReporter _reporter;
     private readonly InstanceMetadataProvider _metadata;
     private readonly ILeaderElection _leaderElection;
+    private readonly LeadershipState _leadershipState;
     private readonly ReconcilerOptions _options;
     private readonly ILogger<ReconcilerService> _logger;
     private readonly MigrationReadinessGate? _migrationGate;
@@ -98,6 +99,7 @@ public sealed class ReconcilerService : BackgroundService
         IReconcileReporter reporter,
         InstanceMetadataProvider metadata,
         ILeaderElection leaderElection,
+        LeadershipState leadershipState,
         ReconcilerOptions options,
         ILogger<ReconcilerService> logger,
         MigrationReadinessGate? migrationGate = null,
@@ -112,6 +114,7 @@ public sealed class ReconcilerService : BackgroundService
         _reporter = reporter;
         _metadata = metadata;
         _leaderElection = leaderElection;
+        _leadershipState = leadershipState;
         _options = options;
         _logger = logger;
         _migrationGate = migrationGate;
@@ -266,16 +269,38 @@ public sealed class ReconcilerService : BackgroundService
 
     private async Task<bool> TryAcquireLeadershipAsync(CancellationToken ct)
     {
+        LeaderResolution resolution;
         try
         {
-            return await _leaderElection.TryAcquireAsync(ct);
+            resolution = await _leaderElection.TryAcquireAsync(ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Never let a leadership hiccup stop convergence; just run as a follower.
+            // Publish the loss immediately so GET /internal/leader (task #217) does not
+            // report a stale leader=true across a failing evaluation.
             _logger.LogWarning(ex, "Leader election failed; running as non-leader this loop.");
-            return false;
+            resolution = new LeaderResolution(false, LeaderInstanceId: null);
         }
+
+        // In-memory / single-node stubs report leadership without naming the leader —
+        // when we are the leader and the election didn't name one, it is us. Failures
+        // here do not affect leadership itself; the state is still published below.
+        var leaderId = resolution.LeaderInstanceId;
+        if (resolution.IsLeader && leaderId is null)
+        {
+            try
+            {
+                leaderId = (await _metadata.GetAsync(ct)).InstanceId;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Failed to resolve own instance id for leadership state.");
+            }
+        }
+
+        _leadershipState.Update(resolution.IsLeader, leaderId, DateTimeOffset.UtcNow);
+        return resolution.IsLeader;
     }
 
     /// <summary>

@@ -115,6 +115,13 @@ public static class ReconcilerServiceCollectionExtensions
         services.TryAddSingleton<ILeaderElection>(new InMemoryLeaderElection());
         services.TryAddSingleton<IInstanceStatusStore, NullInstanceStatusStore>();
 
+        // Cached leadership snapshot for GET /internal/leader (task #217): the
+        // reconcile loop writes it on every iteration and the endpoint reads it
+        // without ever touching the DB or triggering an election. Seeded to
+        // never-evaluated so a booting instance never claims leadership through
+        // this surface before the first reconcile loop has actually run.
+        services.TryAddSingleton<LeadershipState>();
+
         // Migration gate (this task, tech-spec §6): the loop waits on this before
         // reading the schema. Program.cs registers a pending gate + the migration
         // hosted service when a DB is configured; without a DB there is nothing to

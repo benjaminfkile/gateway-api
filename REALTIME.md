@@ -457,7 +457,7 @@ message. The gateway checks, **in order**:
 3. **Rate limit.** Each connection has a token-bucket budget (default **10
    messages/second, burst 20**, shared across *all* its channels). Over budget is
    rejected with a throttled error — back off and retry.
-4. **Size.** The payload rides SignalR's 32 KB receive cap (§7). Keep it small.
+4. **Size.** The payload rides SignalR's 32 KB receive cap (§8). Keep it small.
 
 If all four pass, the gateway POSTs the message to your `realtime_message_path`.
 
@@ -635,7 +635,89 @@ event as proof a user is still present; reconcile against the API.
 
 ---
 
-## 7. Limits and operational notes
+## 7. Leadership: is my host the leader
+
+Some services need a single active worker across the fleet — one poller, one
+publisher, one job runner — instead of every instance racing. The gateway on your
+host already derives fleet leadership every reconcile loop and can tell you whether
+your box is currently the leader, so you don't have to run your own election or
+hold a Postgres advisory lock.
+
+### Contract
+
+```
+GET http://gateway:8080/internal/leader
+X-Gateway-Realtime-Token: <any registered service's publish token>
+
+200 application/json
+{
+  "instanceId":        "i-0abc",            // this gateway instance's id
+  "isLeader":          true,                // is this instance the leader?
+  "leaderInstanceId":  "i-0abc",            // id the last evaluation resolved as leader, or null if unknown
+  "evaluatedAt":       "2026-08-29T17:00:00Z" // when the reconciler last derived it; null if never
+}
+```
+
+`X-Gateway-Realtime-Token` must match the publish token of **any** registered
+service (constant-time compared through the same resolver the other internal
+endpoints use). There is no channel here so ownership is simply "the presented
+token matches some registered service"; missing, empty, or unknown tokens are
+`403`. The management (Cognito / mgmt client-credentials) auth path is **not**
+accepted — this surface is for containers only.
+
+### Answering gateway is your host's gateway
+
+The internal listener is reachable only from the Docker bridge network of the
+instance it runs on. That is what makes `isLeader` meaningful: the gateway that
+answers you is by construction the gateway on your own host, and its answer is
+**your host's leadership** — the exact bit you need to gate a single-active-worker
+duty on your container.
+
+### Leadership is heartbeat-derived and may briefly overlap
+
+Leadership is the lowest live `instance_id` among instances heartbeating within
+the stale threshold (tech-spec §4.3): no lock, no lease. A hard-killed leader
+stops heartbeating, its row ages out, and a successor takes over within one loop
+of the death. During the transition **two instances can briefly read
+`isLeader: true`** — that is by design (liveness beats exclusivity for the
+idempotent leader-only duties the gateway itself runs). Design your own
+leader-gated duty to be **idempotent**: two overlapping runs must reach the same
+end state as one run. If you cannot tolerate that, this endpoint is the wrong
+tool — take a real lock.
+
+### Cold state: `evaluatedAt: null` means "not yet known"
+
+Before the first reconcile loop completes, the endpoint returns
+`isLeader: false` with both `leaderInstanceId` and `evaluatedAt` `null`. A
+booting instance must **not** claim leadership from this endpoint until the
+reconciler has actually evaluated. Treat any answer with `evaluatedAt: null` the
+same way you would treat a request failure.
+
+If the reconciler is disabled (`GATEWAY_RECONCILER_ENABLED=false`), the endpoint
+still answers but the snapshot stays permanently at the never-evaluated seed
+above. If you need leadership answers, leave the reconciler enabled.
+
+### Recommended client pattern
+
+Poll on a tight loop and treat silence as "not the leader":
+
+- **Cadence:** poll every ~2 seconds with a ~1 second per-request timeout.
+- **Failure = follower.** Any non-2xx response, a timeout, or a network error
+  drops leadership immediately in your local view.
+- **Staleness = follower.** If the latest successful answer's `evaluatedAt` is
+  more than ~10 seconds old — including the `null` never-evaluated case —
+  treat yourself as a follower until a fresh answer arrives.
+- **Never cache `isLeader: true` across silence.** Only run your leader-only
+  duty when the *latest* successful poll said `isLeader: true` with a fresh
+  `evaluatedAt`; on the next miss, back off.
+
+The gateway's own leader-only duties (deploy completion, stale-row pruning) use
+the same heartbeat evaluation and are already idempotent; borrow the same shape
+for yours.
+
+---
+
+## 8. Limits and operational notes
 
 ### Current limits
 

@@ -43,7 +43,7 @@ public class HeartbeatLeaderElectionTests
         var clock = new MutableClock(T0);
         var election = Election(store, "i-1", clock);
 
-        Assert.True(await election.TryAcquireAsync());
+        Assert.True((await election.TryAcquireAsync()).IsLeader);
     }
 
     [Fact]
@@ -56,10 +56,10 @@ public class HeartbeatLeaderElectionTests
 
         // i-2 evaluates: it upserts its own fresh heartbeat, but i-1 is the lowest
         // live id, so i-2 is a follower.
-        Assert.False(await Election(store, "i-2", clock).TryAcquireAsync());
+        Assert.False((await Election(store, "i-2", clock).TryAcquireAsync()).IsLeader);
 
         // i-1 evaluates against the same cluster and leads.
-        Assert.True(await Election(store, "i-1", clock).TryAcquireAsync());
+        Assert.True((await Election(store, "i-1", clock).TryAcquireAsync()).IsLeader);
     }
 
     [Fact]
@@ -71,7 +71,7 @@ public class HeartbeatLeaderElectionTests
         store.Seed(Row("i-0", T0 - TimeSpan.FromMinutes(5)));
 
         // i-1 is the only live instance, so it leads despite i-0's lower id.
-        Assert.True(await Election(store, "i-1", clock).TryAcquireAsync());
+        Assert.True((await Election(store, "i-1", clock).TryAcquireAsync()).IsLeader);
     }
 
     [Fact]
@@ -83,14 +83,14 @@ public class HeartbeatLeaderElectionTests
         store.Seed(Row("i-1", T0));
 
         // While i-1 is alive, i-2 is a follower.
-        Assert.False(await Election(store, "i-2", clock).TryAcquireAsync());
+        Assert.False((await Election(store, "i-2", clock).TryAcquireAsync()).IsLeader);
 
         // i-1 is hard-killed: its row stays at T0 and never refreshes. Just past the
         // stale threshold, i-1 drops out of the candidate set and i-2 takes over on
         // its next evaluation — recovery is bounded by the threshold, with no zombie
         // session pinning leadership.
         clock.Now = T0 + Threshold + TimeSpan.FromSeconds(1);
-        Assert.True(await Election(store, "i-2", clock).TryAcquireAsync());
+        Assert.True((await Election(store, "i-2", clock).TryAcquireAsync()).IsLeader);
     }
 
     [Fact]
@@ -105,7 +105,7 @@ public class HeartbeatLeaderElectionTests
 
         // The election upserts its own heartbeat FIRST, then evaluates from a fresh
         // read — so a booting instance sees itself and can take leadership.
-        Assert.True(await election.TryAcquireAsync());
+        Assert.True((await election.TryAcquireAsync()).IsLeader);
 
         Assert.True(store.Rows.ContainsKey("i-boot"));
         Assert.Equal(T0, store.Rows["i-boot"].HeartbeatAt);
@@ -114,8 +114,35 @@ public class HeartbeatLeaderElectionTests
     [Fact]
     public async Task NoDbMode_InMemoryElection_Unchanged()
     {
-        Assert.True(await new InMemoryLeaderElection(isLeader: true).TryAcquireAsync());
-        Assert.False(await new InMemoryLeaderElection(isLeader: false).TryAcquireAsync());
+        var leader = await new InMemoryLeaderElection(isLeader: true).TryAcquireAsync();
+        Assert.True(leader.IsLeader);
+        // The in-memory stub does not know its own instance id — the reconciler
+        // fills that in from InstanceMetadataProvider before publishing state, so
+        // the resolution itself simply reports null.
+        Assert.Null(leader.LeaderInstanceId);
+
+        var follower = await new InMemoryLeaderElection(isLeader: false).TryAcquireAsync();
+        Assert.False(follower.IsLeader);
+        Assert.Null(follower.LeaderInstanceId);
+    }
+
+    [Fact]
+    public async Task Resolution_NamesTheLeader_EvenFromAFollower()
+    {
+        // Task #217: GET /internal/leader wants the resolved leader id — not just whether
+        // this instance is it. The election must surface leaderInstanceId in both the
+        // leader and follower cases so a downstream on a follower can still see who leads.
+        var store = new FakeInstanceStatusStore();
+        var clock = new MutableClock(T0);
+        store.Seed(Row("i-1", T0));
+
+        var followerResolution = await Election(store, "i-2", clock).TryAcquireAsync();
+        Assert.False(followerResolution.IsLeader);
+        Assert.Equal("i-1", followerResolution.LeaderInstanceId);
+
+        var leaderResolution = await Election(store, "i-1", clock).TryAcquireAsync();
+        Assert.True(leaderResolution.IsLeader);
+        Assert.Equal("i-1", leaderResolution.LeaderInstanceId);
     }
 
     /// <summary>Manually-advanced clock so tests control heartbeat staleness deterministically.</summary>

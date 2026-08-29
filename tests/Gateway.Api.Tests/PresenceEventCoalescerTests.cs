@@ -45,6 +45,9 @@ public class PresenceEventCoalescerTests
 
         public Task<ChannelOwner?> ResolveAsync(string prefix, CancellationToken ct = default) =>
             Task.FromResult(_owners.TryGetValue(prefix, out var o) ? o : null);
+
+        public Task<ChannelOwner?> ResolveByTokenAsync(string? presentedToken, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private static readonly DateTimeOffset T0 = DateTimeOffset.UnixEpoch;

@@ -204,6 +204,7 @@ public class InstanceStatusStoreTests
                 new NullReporter(),
                 metadata,
                 new InMemoryLeaderElection(isLeader),
+                new LeadershipState(),
                 new ReconcilerOptions { Enabled = true },
                 NullLogger<ReconcilerService>.Instance);
         }

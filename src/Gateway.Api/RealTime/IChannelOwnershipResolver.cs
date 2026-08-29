@@ -15,6 +15,20 @@ public interface IChannelOwnershipResolver
     /// gateway-owned and is never resolved here — callers handle it before asking.
     /// </summary>
     Task<ChannelOwner?> ResolveAsync(string prefix, CancellationToken ct = default);
+
+    /// <summary>
+    /// The single choke point for turning a presented <c>X-Gateway-Realtime-Token</c>
+    /// value into a manifest service (task #217). Constant-time-compares
+    /// <paramref name="presentedToken"/> against <b>every</b> known service's stored
+    /// token — even after finding a match — so both the comparison time and the number
+    /// of comparisons are independent of which service (or none) owns the token.
+    /// Returns the matching <see cref="ChannelOwner"/>, or null when the token is
+    /// missing, empty, or does not match any known service. Every internal owner-scoped
+    /// endpoint (<c>/internal/publish</c>, <c>/internal/presence</c>,
+    /// <c>/internal/leader</c>) resolves the presenter through this one method so the
+    /// header-read and compare live in exactly one place.
+    /// </summary>
+    Task<ChannelOwner?> ResolveByTokenAsync(string? presentedToken, CancellationToken ct = default);
 }
 
 /// <summary>

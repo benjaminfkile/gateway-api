@@ -108,6 +108,7 @@ public class ReconcilerServiceTests
         public FakeInstanceStatusStore StatusStore { get; } = new();
         public FakeLogGroupAdmin LogGroupAdmin { get; } = new();
         public InMemoryLeaderElection Leader { get; }
+        public LeadershipState LeadershipState { get; } = new();
         public ReconcilerOptions Options { get; }
         public ReconcilerService Service { get; }
         public ServiceHostPortMap HostPorts { get; }
@@ -177,6 +178,7 @@ public class ReconcilerServiceTests
                 Reporter,
                 metadata,
                 Leader,
+                LeadershipState,
                 Options,
                 // Use the captured logger (not NullLogger) so tests can assert
                 // transition logs — e.g. the once-per-trip Warning from the
@@ -299,6 +301,40 @@ public class ReconcilerServiceTests
         Assert.True(harness.Runtime.Exists("svc-a"));
 
         await harness.Service.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Reconcile_Leader_PublishesLeadershipStateForEndpoint()
+    {
+        // Task #217: on every loop the reconciler must publish the election's outcome
+        // to LeadershipState so GET /internal/leader can read it without touching the DB
+        // or triggering an election. Before the loop the seed is NeverEvaluated; after,
+        // isLeader/leaderInstanceId reflect the election result and evaluatedAt is set.
+        var harness = new Harness(isLeader: true);
+        Assert.Null(harness.LeadershipState.Snapshot().EvaluatedAt);
+
+        await harness.Service.RunOnceAsync();
+
+        var snapshot = harness.LeadershipState.Snapshot();
+        Assert.True(snapshot.IsLeader);
+        Assert.Equal("i-test", snapshot.LeaderInstanceId);
+        Assert.NotNull(snapshot.EvaluatedAt);
+    }
+
+    [Fact]
+    public async Task Reconcile_Follower_PublishesLeadershipStateForEndpoint()
+    {
+        // A follower still publishes state on every loop — the endpoint must be able
+        // to report "false" (with a known-null leader id, since InMemoryLeaderElection
+        // does not name one) rather than the never-evaluated seed.
+        var harness = new Harness(isLeader: false);
+
+        await harness.Service.RunOnceAsync();
+
+        var snapshot = harness.LeadershipState.Snapshot();
+        Assert.False(snapshot.IsLeader);
+        Assert.Null(snapshot.LeaderInstanceId);
+        Assert.NotNull(snapshot.EvaluatedAt);
     }
 
     [Fact]

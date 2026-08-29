@@ -59,7 +59,7 @@ public sealed class HeartbeatLeaderElection : ILeaderElection
         _clock = clock ?? TimeProvider.System;
     }
 
-    public async Task<bool> TryAcquireAsync(CancellationToken ct = default)
+    public async Task<LeaderResolution> TryAcquireAsync(CancellationToken ct = default)
     {
         var identity = await _metadata.GetAsync(ct);
         var myId = identity.InstanceId;
@@ -108,6 +108,6 @@ public sealed class HeartbeatLeaderElection : ILeaderElection
             "Heartbeat leader election: instance {Me} sees leader {Leader} (isLeader={IsLeader}).",
             myId, leaderId ?? "(none)", isLeader);
 
-        return isLeader;
+        return new LeaderResolution(isLeader, leaderId);
     }
 }
