@@ -29,4 +29,11 @@ public sealed class UnavailableContainerRuntime : IContainerRuntime
 
     public Task RenameContainerAsync(string oldName, string newName, CancellationToken ct = default) =>
         throw Unavailable();
+
+    public Task<ImagePruneResult> PruneImagesAsync(
+        IReadOnlyCollection<string> keepDigests,
+        TimeSpan minimumAge,
+        int keepPerRepository,
+        CancellationToken ct = default) =>
+        throw Unavailable();
 }
