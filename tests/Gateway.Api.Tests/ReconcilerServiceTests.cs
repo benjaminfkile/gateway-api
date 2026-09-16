@@ -1095,8 +1095,11 @@ public class ReconcilerServiceTests
 
         await harness.Service.RunOnceAsync();
 
-        // No mutating container operations, no outcomes recorded for a no-op.
-        Assert.Empty(harness.Runtime.Operations);
+        // No mutating container operations, no outcomes recorded for a no-op. The
+        // image-prune housekeeping runs at the end of every pass and is not a
+        // container mutation, so it is excluded from this assertion.
+        Assert.DoesNotContain(harness.Runtime.Operations, op =>
+            !op.StartsWith("PruneImages", StringComparison.Ordinal));
         Assert.Empty(harness.Reporter.Outcomes);
     }
 

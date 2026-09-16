@@ -83,6 +83,11 @@ public sealed class ReconcilerService : BackgroundService
     // wins the election on its first loop announces itself.
     private bool _wasLeader;
 
+    // Last wall-clock time this instance ran the image-prune housekeeping pass. Null
+    // until the first prune runs, so the first pass after startup is not throttled.
+    // Only read/written from the single reconcile loop; internal so tests can force it.
+    internal DateTimeOffset? _lastImagePruneAt;
+
     // Live instance ids this leader saw on its previous loop, so an "instances" event
     // reports only newly-joined ids (task #588). Null until the first leader observation,
     // which seeds silently so acquiring leadership does not report the whole fleet as
@@ -265,6 +270,12 @@ public sealed class ReconcilerService : BackgroundService
         // per-deploy convergence and — as leader — mark a deploy done/partial once
         // every live instance has converged.
         await ReconcileDeployProgressAsync(isLeader, ct);
+
+        // Housekeeping (tech-spec §4.3): prune stale local images so per-deploy
+        // layers do not fill this node's root volume. Every instance runs it — disk
+        // is per box, so leader-only would leave followers to bloat — and any
+        // failure is swallowed so it can never affect container convergence.
+        await PruneImagesHousekeepingAsync(desired, ct);
     }
 
     private async Task<bool> TryAcquireLeadershipAsync(CancellationToken ct)
@@ -1435,6 +1446,142 @@ public sealed class ReconcilerService : BackgroundService
         && action.Desired is not null
         && !string.IsNullOrEmpty(action.Desired.Digest)
         && action.Reason.StartsWith("digest drift", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Prune local images the node no longer needs so per-deploy layers do not fill
+    /// its root volume (tech-spec §4.3 Housekeeping). Runs at the end of every
+    /// reconcile pass on every instance — this is deliberately not leader-only,
+    /// since disk is per box. Throttled to at most once per
+    /// <see cref="ReconcilerOptions.ImagePruneInterval"/>; any failure is logged as a
+    /// single Warning and swallowed so it can never fail the reconcile pass.
+    /// </summary>
+    private async Task PruneImagesHousekeepingAsync(IReadOnlyList<DesiredService> desired, CancellationToken ct)
+    {
+        if (!_options.ImagePruneEnabled)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_lastImagePruneAt is { } last && now - last < _options.ImagePruneInterval)
+        {
+            return;
+        }
+
+        try
+        {
+            var keep = new HashSet<string>(StringComparer.Ordinal);
+
+            // Manifest-pinned digests: protect the rollback target for every desired
+            // service, even when no container is currently running it.
+            foreach (var d in desired)
+            {
+                if (!string.IsNullOrEmpty(d.Digest))
+                {
+                    keep.Add(d.Digest);
+                }
+            }
+
+            // Actual containers on this box AFTER the plan has executed — captures
+            // running, stopped, and any '-green' candidate mid blue-green.
+            var currentContainers = await _runtime.ListManagedContainersAsync(ct);
+            foreach (var c in currentContainers)
+            {
+                if (!string.IsNullOrEmpty(c.Digest))
+                {
+                    keep.Add(c.Digest);
+                }
+
+                if (!string.IsNullOrEmpty(c.Image))
+                {
+                    keep.Add(c.Image);
+                }
+            }
+
+            // Previous deploy target per service — one extra image so a rollback is
+            // instant instead of a re-pull. Best-effort: a history-read failure logs
+            // Debug and falls back to the running-plus-pinned keep set.
+            await AddPreviousDeployDigestsAsync(desired, keep, ct);
+
+            var result = await _runtime.PruneImagesAsync(
+                keep, _options.ImagePruneAge, _options.ImagePruneKeep, ct);
+
+            _lastImagePruneAt = now;
+
+            if (result.ImagesDeleted > 0)
+            {
+                _logger.LogInformation(
+                    "Image prune reclaimed {Bytes} bytes across {Count} image(s).",
+                    result.BytesReclaimed, result.ImagesDeleted);
+            }
+            else
+            {
+                _logger.LogDebug("Image prune ran with no candidates to delete.");
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // A prune failure must never fail the reconcile pass or propagate into
+            // the loop. Stamp _lastImagePruneAt anyway so a persistently-broken
+            // daemon does not retry every 30s; the next attempt waits the interval.
+            _lastImagePruneAt = now;
+            _logger.LogWarning(ex, "Image prune housekeeping failed; will retry on the next interval.");
+        }
+    }
+
+    /// <summary>
+    /// Fold the previous completed deploy's <c>ToDigest</c> per desired service into
+    /// the prune keep set. Reads <see cref="IDeployStore"/> per service; a store that
+    /// isn't registered or a per-service read failure is logged at Debug and the keep
+    /// set falls back to running-plus-pinned only. Never rethrows.
+    /// </summary>
+    private async Task AddPreviousDeployDigestsAsync(
+        IReadOnlyList<DesiredService> desired, HashSet<string> keep, CancellationToken ct)
+    {
+        if (desired.Count == 0)
+        {
+            return;
+        }
+
+        using var scope = _scopeFactory.CreateScope();
+        var deployStore = scope.ServiceProvider.GetService<IDeployStore>();
+        if (deployStore is null)
+        {
+            return;
+        }
+
+        foreach (var d in desired)
+        {
+            try
+            {
+                var history = await deployStore.ListForServiceAsync(d.Name, ct);
+                var previous = history
+                    .Where(h => !string.IsNullOrEmpty(h.ToDigest)
+                        && !string.Equals(h.Status, DeployStatus.InProgress, StringComparison.Ordinal)
+                        && !string.Equals(h.ToDigest, d.Digest, StringComparison.Ordinal))
+                    .OrderByDescending(h => h.Id)
+                    .FirstOrDefault();
+                if (previous?.ToDigest is { Length: > 0 } digest)
+                {
+                    keep.Add(digest);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "Failed to read deploy history for {Service} while building image-prune keep set; " +
+                    "falling back to running + pinned digests only.", d.Name);
+            }
+        }
+    }
 
     private TimeSpan NextDelay()
     {
