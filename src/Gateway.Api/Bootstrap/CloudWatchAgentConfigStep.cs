@@ -91,6 +91,12 @@ public sealed class CloudWatchAgentConfigStep : IBootstrapStep
                 ["append_dimensions"] = new JsonObject
                 {
                     ["InstanceId"] = "${aws:InstanceId}",
+                    ["AutoScalingGroupName"] = "${aws:AutoScalingGroupName}",
+                },
+                ["aggregation_dimensions"] = new JsonArray
+                {
+                    new JsonArray { "AutoScalingGroupName" },
+                    new JsonArray { "InstanceId" },
                 },
                 ["metrics_collected"] = new JsonObject
                 {
