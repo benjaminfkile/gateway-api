@@ -295,5 +295,97 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
         _client.Containers.RenameContainerAsync(
             oldName, new ContainerRenameParameters { NewName = newName }, ct);
 
+    public async Task<ImagePruneResult> PruneImagesAsync(
+        IReadOnlyCollection<string> keepDigests,
+        TimeSpan minimumAge,
+        int keepPerRepository,
+        CancellationToken ct = default)
+    {
+        if (minimumAge < TimeSpan.Zero)
+        {
+            minimumAge = TimeSpan.Zero;
+        }
+
+        if (keepPerRepository < 0)
+        {
+            keepPerRepository = 0;
+        }
+
+        var keep = new HashSet<string>(keepDigests, StringComparer.Ordinal);
+
+        var listed = await _client.Images.ListImagesAsync(
+            new ImagesListParameters { All = true }, ct);
+
+        var projected = new List<ImagePruneSelector.Candidate>(listed.Count);
+        foreach (var image in listed)
+        {
+            projected.Add(new ImagePruneSelector.Candidate(
+                Id: image.ID ?? string.Empty,
+                RepoTags: image.RepoTags is null ? Array.Empty<string>() : image.RepoTags.ToArray(),
+                RepoDigests: image.RepoDigests is null ? Array.Empty<string>() : image.RepoDigests.ToArray(),
+                Created: image.Created,
+                Size: image.Size));
+        }
+
+        var cutoff = DateTime.UtcNow - minimumAge;
+        var candidates = ImagePruneSelector.SelectCandidates(projected, keep, cutoff, keepPerRepository);
+
+        var deleted = 0;
+        long bytes = 0L;
+
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                var response = await _client.Images.DeleteImageAsync(
+                    candidate.Id,
+                    // Force = false leaves the daemon as the final authority: if any
+                    // container still references the image the removal is refused
+                    // with 409 rather than yanked out from under it. NoPrune = false
+                    // (PruneChildren = true) lets the daemon reclaim untagged parent
+                    // layers that only this image kept alive.
+                    new ImageDeleteParameters { Force = false, NoPrune = false },
+                    ct);
+
+                if (response is null)
+                {
+                    continue;
+                }
+
+                var reportedDeleted = false;
+                foreach (var entry in response)
+                {
+                    if (entry is not null && entry.ContainsKey("Deleted"))
+                    {
+                        reportedDeleted = true;
+                        break;
+                    }
+                }
+
+                if (reportedDeleted)
+                {
+                    deleted++;
+                    bytes += candidate.Size;
+                }
+            }
+            catch (DockerApiException)
+            {
+                // 409 Conflict (image still in use) or any other per-image daemon
+                // error: skip this image, keep pruning the rest.
+                continue;
+            }
+            catch (Exception) when (!(ct.IsCancellationRequested))
+            {
+                // Anything else at the transport level for this single image: same
+                // policy — one bad image must not abort the whole housekeeping run.
+                continue;
+            }
+        }
+
+        return deleted == 0 && bytes == 0L
+            ? ImagePruneResult.None
+            : new ImagePruneResult(deleted, bytes);
+    }
+
     public void Dispose() => _client.Dispose();
 }

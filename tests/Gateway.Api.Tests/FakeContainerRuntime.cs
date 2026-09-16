@@ -158,4 +158,146 @@ public sealed class FakeContainerRuntime : IContainerRuntime
         Operations.Enqueue($"Rename:{oldName}->{newName}");
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// A local image on the fake daemon. Mirrors the fields
+    /// <see cref="PruneImagesAsync"/> reads from Docker's image listing.
+    /// </summary>
+    public sealed record FakeImage(
+        string Id,
+        IReadOnlyList<string> RepoTags,
+        IReadOnlyList<string> RepoDigests,
+        DateTime Created,
+        long Size);
+
+    /// <summary>
+    /// Arguments passed to a <see cref="PruneImagesAsync"/> call, in order.
+    /// </summary>
+    public sealed record PruneCall(
+        IReadOnlyCollection<string> KeepDigests,
+        TimeSpan MinimumAge,
+        int KeepPerRepository);
+
+    private readonly List<FakeImage> _images = new();
+
+    /// <summary>Log of every <see cref="PruneImagesAsync"/> call, in order.</summary>
+    public ConcurrentQueue<PruneCall> PruneCalls { get; } = new();
+
+    /// <summary>
+    /// Clock used to compute the age cutoff during <see cref="PruneImagesAsync"/>.
+    /// Overridable so tests can pin "now" without waiting real time.
+    /// </summary>
+    public Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
+
+    /// <summary>
+    /// If set, the next <see cref="PruneImagesAsync"/> call throws this and clears
+    /// the field — models a transient daemon failure so tests can prove a prune
+    /// failure never propagates out of the reconcile loop.
+    /// </summary>
+    public Exception? NextPruneThrow { get; set; }
+
+    /// <summary>Snapshot of local images currently on the fake daemon.</summary>
+    public IReadOnlyList<FakeImage> Images
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _images.ToArray();
+            }
+        }
+    }
+
+    /// <summary>Replace the fake's local image list.</summary>
+    public void SetImages(IEnumerable<FakeImage> images)
+    {
+        lock (_gate)
+        {
+            _images.Clear();
+            _images.AddRange(images);
+        }
+    }
+
+    /// <summary>Add a single image to the fake's local list.</summary>
+    public void AddImage(FakeImage image)
+    {
+        lock (_gate)
+        {
+            _images.Add(image);
+        }
+    }
+
+    /// <summary>
+    /// Digests (by fake image ID) that fail deletion with a simulated 409
+    /// Conflict — models the daemon refusing to remove an image still in use.
+    /// </summary>
+    public HashSet<string> InUseImageIds { get; } = new(StringComparer.Ordinal);
+
+    public Task<ImagePruneResult> PruneImagesAsync(
+        IReadOnlyCollection<string> keepDigests,
+        TimeSpan minimumAge,
+        int keepPerRepository,
+        CancellationToken ct = default)
+    {
+        PruneCalls.Enqueue(new PruneCall(keepDigests.ToArray(), minimumAge, keepPerRepository));
+
+        if (NextPruneThrow is { } toThrow)
+        {
+            NextPruneThrow = null;
+            throw toThrow;
+        }
+
+        if (minimumAge < TimeSpan.Zero)
+        {
+            minimumAge = TimeSpan.Zero;
+        }
+
+        if (keepPerRepository < 0)
+        {
+            keepPerRepository = 0;
+        }
+
+        var keep = new HashSet<string>(keepDigests, StringComparer.Ordinal);
+
+        List<ImagePruneSelector.Candidate> candidates;
+        FakeImage[] snapshot;
+        lock (_gate)
+        {
+            snapshot = _images.ToArray();
+        }
+
+        var projected = snapshot
+            .Select(i => new ImagePruneSelector.Candidate(i.Id, i.RepoTags, i.RepoDigests, i.Created, i.Size))
+            .ToArray();
+        candidates = ImagePruneSelector.SelectCandidates(projected, keep, UtcNow() - minimumAge, keepPerRepository);
+
+        var deleted = 0;
+        long bytes = 0L;
+        foreach (var c in candidates)
+        {
+            if (InUseImageIds.Contains(c.Id))
+            {
+                continue;
+            }
+
+            lock (_gate)
+            {
+                var index = _images.FindIndex(i => string.Equals(i.Id, c.Id, StringComparison.Ordinal));
+                if (index < 0)
+                {
+                    continue;
+                }
+
+                _images.RemoveAt(index);
+            }
+
+            deleted++;
+            bytes += c.Size;
+        }
+
+        Operations.Enqueue($"PruneImages:{deleted}");
+        return Task.FromResult(deleted == 0 && bytes == 0L
+            ? ImagePruneResult.None
+            : new ImagePruneResult(deleted, bytes));
+    }
 }
