@@ -72,4 +72,37 @@ public sealed class ReconcilerOptions
     /// 10 minutes; override with <see cref="DeployTimeoutEnvVar"/>.
     /// </summary>
     public TimeSpan DeployTimeout { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Whether the image-prune housekeeping pass runs at the end of each reconcile
+    /// loop (tech-spec §4.3 Housekeeping). Every instance prunes its own root
+    /// volume — this is not a leader-only duty because disk is per box. Default true.
+    /// </summary>
+    public bool ImagePruneEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Minimum interval between image-prune runs on this instance. The reconcile
+    /// loop ticks every <see cref="Interval"/>, but scanning the daemon's image list
+    /// each pass is wasted work — one prune per hour keeps the root volume flat
+    /// without adding load. The first pass after startup may run immediately.
+    /// Default 1 hour.
+    /// </summary>
+    public TimeSpan ImagePruneInterval { get; set; } = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// Age grace period passed to <see cref="Containers.IContainerRuntime.PruneImagesAsync"/>:
+    /// images younger than this are always kept. Matches the tech-spec's
+    /// "prune untagged images older than 48h". Default 48 hours.
+    /// </summary>
+    public TimeSpan ImagePruneAge { get; set; } = TimeSpan.FromHours(48);
+
+    /// <summary>
+    /// The N most-recently-created images to keep per repository, passed through to
+    /// <see cref="Containers.IContainerRuntime.PruneImagesAsync"/>. Pure age is too
+    /// weak at this fleet's deploy cadence: a busy service is deployed many times a
+    /// day, so a 48h age floor alone still parks 20-30 stale images for it. Keeping
+    /// the N most recent per repository caps steady-state disk regardless of how
+    /// hard the fleet is deployed to. Default 3.
+    /// </summary>
+    public int ImagePruneKeep { get; set; } = 3;
 }
