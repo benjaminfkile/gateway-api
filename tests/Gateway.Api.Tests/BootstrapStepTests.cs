@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Gateway.Api.Bootstrap;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -165,6 +166,111 @@ public class BootstrapStepTests
         Assert.False(second.Changed);
         Assert.Single(host.Commands, c => c.Executable == options.CloudWatchAgentCtlPath);
     }
+
+    [Fact]
+    public async Task CloudWatchConfig_appends_both_instance_and_asg_dimensions()
+    {
+        var host = new FakeLinuxHost();
+        var options = Options();
+        var step = new CloudWatchAgentConfigStep(host, options, NullLogger<CloudWatchAgentConfigStep>.Instance);
+
+        await step.RunAsync();
+
+        var metrics = ParseMetrics(host.Files[options.CloudWatchAgentConfigPath]);
+        var append = metrics.GetProperty("append_dimensions");
+        Assert.Equal("${aws:InstanceId}", append.GetProperty("InstanceId").GetString());
+        Assert.Equal("${aws:AutoScalingGroupName}", append.GetProperty("AutoScalingGroupName").GetString());
+    }
+
+    [Fact]
+    public async Task CloudWatchConfig_publishes_both_asg_and_instance_aggregations()
+    {
+        var host = new FakeLinuxHost();
+        var options = Options();
+        var step = new CloudWatchAgentConfigStep(host, options, NullLogger<CloudWatchAgentConfigStep>.Instance);
+
+        await step.RunAsync();
+
+        var metrics = ParseMetrics(host.Files[options.CloudWatchAgentConfigPath]);
+        var agg = metrics.GetProperty("aggregation_dimensions");
+        Assert.Equal(JsonValueKind.Array, agg.ValueKind);
+        var groups = agg.EnumerateArray()
+            .Select(g => g.EnumerateArray().Select(e => e.GetString()).ToArray())
+            .ToArray();
+        Assert.Equal(2, groups.Length);
+        Assert.Equal(new[] { "AutoScalingGroupName" }, groups[0]);
+        Assert.Equal(new[] { "InstanceId" }, groups[1]);
+    }
+
+    [Fact]
+    public async Task CloudWatchConfig_namespace_defaults_to_Gateway_and_tracks_options()
+    {
+        var host = new FakeLinuxHost();
+        var defaults = Options();
+        Assert.Equal("Gateway", defaults.MetricsNamespace);
+
+        var defaultStep = new CloudWatchAgentConfigStep(host, defaults, NullLogger<CloudWatchAgentConfigStep>.Instance);
+        await defaultStep.RunAsync();
+        var metrics = ParseMetrics(host.Files[defaults.CloudWatchAgentConfigPath]);
+        Assert.Equal("Gateway", metrics.GetProperty("namespace").GetString());
+
+        var overridden = new BootstrapOptions { MetricsNamespace = "GatewayTest" };
+        var otherHost = new FakeLinuxHost();
+        var overriddenStep = new CloudWatchAgentConfigStep(otherHost, overridden, NullLogger<CloudWatchAgentConfigStep>.Instance);
+        await overriddenStep.RunAsync();
+        var overriddenMetrics = ParseMetrics(otherHost.Files[overridden.CloudWatchAgentConfigPath]);
+        Assert.Equal("GatewayTest", overriddenMetrics.GetProperty("namespace").GetString());
+    }
+
+    [Fact]
+    public async Task CloudWatchConfig_disk_and_mem_measurements_unchanged()
+    {
+        var host = new FakeLinuxHost();
+        var options = Options();
+        var step = new CloudWatchAgentConfigStep(host, options, NullLogger<CloudWatchAgentConfigStep>.Instance);
+
+        await step.RunAsync();
+
+        var collected = ParseMetrics(host.Files[options.CloudWatchAgentConfigPath])
+            .GetProperty("metrics_collected");
+
+        var disk = collected.GetProperty("disk");
+        Assert.Equal(new[] { "used_percent" },
+            disk.GetProperty("measurement").EnumerateArray().Select(e => e.GetString()).ToArray());
+        Assert.Equal(new[] { "/" },
+            disk.GetProperty("resources").EnumerateArray().Select(e => e.GetString()).ToArray());
+
+        var mem = collected.GetProperty("mem");
+        Assert.Equal(new[] { "mem_used_percent" },
+            mem.GetProperty("measurement").EnumerateArray().Select(e => e.GetString()).ToArray());
+    }
+
+    [Fact]
+    public async Task CloudWatchConfig_existing_config_in_new_shape_is_detected_as_unchanged()
+    {
+        var host = new FakeLinuxHost();
+        var options = Options();
+        var step = new CloudWatchAgentConfigStep(host, options, NullLogger<CloudWatchAgentConfigStep>.Instance);
+
+        // Prime the host with the freshly-generated config, then reformat it (extra
+        // whitespace, different key order in nested objects) to prove Canonicalize
+        // still detects the on-disk file as equivalent and does not rewrite.
+        await step.RunAsync();
+        var written = host.Files[options.CloudWatchAgentConfigPath];
+        var reformatted = JsonSerializer.Serialize(
+            JsonSerializer.Deserialize<JsonElement>(written),
+            new JsonSerializerOptions { WriteIndented = false });
+        host.Files[options.CloudWatchAgentConfigPath] = reformatted;
+        var reloadsBefore = host.Commands.Count(c => c.Executable == options.CloudWatchAgentCtlPath);
+
+        var again = await step.RunAsync();
+
+        Assert.False(again.Changed);
+        Assert.Equal(reloadsBefore, host.Commands.Count(c => c.Executable == options.CloudWatchAgentCtlPath));
+    }
+
+    private static JsonElement ParseMetrics(string configJson) =>
+        JsonSerializer.Deserialize<JsonElement>(configJson).GetProperty("metrics");
 
     // ---- Full pipeline ---------------------------------------------------------
 
