@@ -112,6 +112,7 @@ survive gateway restarts.
   port. The public listener never exposes any of these routes.
   - `POST /internal/publish` — broadcast a channel event (owner's token).
   - `GET  /internal/presence/{channel}` — pull who is present in a channel (owner's token).
+  - `GET  /internal/presence/{channel}/count` answers `{ channel, count }` behind the same owner-token guard and `ops:*` refusal, reading only the registry count (a constant-time hash length on Redis) and never the member list.
   - `GET  /internal/leader` — is the answering gateway's instance the fleet leader
     right now (see §4.3). Accepts **any** registered service's token — the caller
     is only proving it is a container this gateway manages. Reads the reconciler's

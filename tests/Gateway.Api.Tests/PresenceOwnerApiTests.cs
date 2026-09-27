@@ -101,6 +101,32 @@ public sealed class PresenceOwnerApiTests
         return await http.SendAsync(request);
     }
 
+    private static async Task<HttpResponseMessage> GetCountAsync(Gateway gateway, string channel, string? token)
+    {
+        using var http = new HttpClient();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get, $"http://127.0.0.1:{gateway.InternalPort}/internal/presence/{channel}/count");
+        if (token is not null)
+        {
+            request.Headers.Add(RealtimePublishToken.Header, token);
+        }
+
+        return await http.SendAsync(request);
+    }
+
+    private static async Task<int> ReadCountAsync(Gateway gateway, string channel)
+    {
+        var response = await GetCountAsync(gateway, channel, TokenA);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var root = doc.RootElement;
+        Assert.Equal(channel, root.GetProperty("channel").GetString());
+        // The count read answers only { channel, count }; no member list is returned.
+        Assert.False(root.TryGetProperty("members", out _));
+        return root.GetProperty("count").GetInt32();
+    }
+
     [Fact]
     public async Task Presence_WithOwnerToken_ReturnsJoinedConnection()
     {
@@ -172,6 +198,77 @@ public sealed class PresenceOwnerApiTests
         using var http = new HttpClient();
         var response = await http.GetAsync(
             $"http://127.0.0.1:{gateway.PublicPort}/internal/presence/svc-a:room");
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Count_TracksJoinsLeavesAndDisconnectSweep()
+    {
+        await using var gateway = await StartGatewayAsync();
+        Assert.Equal(0, await ReadCountAsync(gateway, "svc-a:room"));
+
+        var first = new HubConnectionBuilder()
+            .WithUrl($"http://127.0.0.1:{gateway.PublicPort}/hub")
+            .Build();
+        await using var second = new HubConnectionBuilder()
+            .WithUrl($"http://127.0.0.1:{gateway.PublicPort}/hub")
+            .Build();
+        await first.StartAsync();
+        await second.StartAsync();
+
+        await first.InvokeAsync("JoinChannel", "svc-a:room");
+        await second.InvokeAsync("JoinChannel", "svc-a:room");
+        Assert.Equal(2, await ReadCountAsync(gateway, "svc-a:room"));
+
+        await second.InvokeAsync("LeaveChannel", "svc-a:room");
+        Assert.Equal(1, await ReadCountAsync(gateway, "svc-a:room"));
+
+        await first.DisposeAsync();
+
+        // OnDisconnectedAsync runs server-side asynchronously after the client drops.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        var count = await ReadCountAsync(gateway, "svc-a:room");
+        while (count != 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+            count = await ReadCountAsync(gateway, "svc-a:room");
+        }
+
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public async Task Count_MissingToken_IsForbidden()
+    {
+        await using var gateway = await StartGatewayAsync();
+        var response = await GetCountAsync(gateway, "svc-a:room", token: null);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Count_WrongToken_IsForbidden()
+    {
+        await using var gateway = await StartGatewayAsync();
+        // svc-b's token does not authorize reading svc-a's presence count.
+        var response = await GetCountAsync(gateway, "svc-a:room", TokenB);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Count_OpsChannel_IsForbidden_EvenWithToken()
+    {
+        await using var gateway = await StartGatewayAsync();
+        var response = await GetCountAsync(gateway, "ops:fleet", TokenA);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Count_NotReachable_ViaPublicPort()
+    {
+        await using var gateway = await StartGatewayAsync();
+        using var http = new HttpClient();
+        var response = await http.GetAsync(
+            $"http://127.0.0.1:{gateway.PublicPort}/internal/presence/svc-a:room/count");
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 }
