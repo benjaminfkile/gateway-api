@@ -251,7 +251,7 @@ public class ReconcilerDeployProgressTests
         // The terminal "deploy" event carries the full contract shape with the terminal
         // status, an ISO finishedAt, and a null error (the deploy did not fail).
         var terminal = Assert.Single(
-            recorder.Published.Where(p => p.Event == "deploy"));
+            recorder.Published, p => p.Event == "deploy");
         Assert.Equal(ManagementEndpoints.OpsDeploysChannel, terminal.Channel);
         Assert.Equal(deploy.Id, terminal.Get("deployId"));
         Assert.Equal("svc-a", terminal.Get("service"));
@@ -286,7 +286,7 @@ public class ReconcilerDeployProgressTests
 
         var deploy = Assert.Single(harness.DeployStore.History);
         var instanceEvent = Assert.Single(
-            recorder.Published.Where(p => p.Event == "deployInstance"));
+            recorder.Published, p => p.Event == "deployInstance");
         Assert.Equal(ManagementEndpoints.OpsDeploysChannel, instanceEvent.Channel);
         Assert.Equal(deploy.Id, instanceEvent.Get("deployId"));
         Assert.Equal("i-test", instanceEvent.Get("instanceId"));
@@ -352,13 +352,13 @@ public class ReconcilerDeployProgressTests
         Assert.NotNull(deploy.FinishedAt);
 
         // The per-instance failure was broadcast with status "failed" and an error...
-        var instanceEvent = Assert.Single(recorder.Published.Where(p => p.Event == "deployInstance"));
+        var instanceEvent = Assert.Single(recorder.Published, p => p.Event == "deployInstance");
         Assert.Equal(DeployInstanceState.Failed, instanceEvent.Get("status"));
         Assert.Equal("i-test", instanceEvent.Get("instanceId"));
         Assert.NotNull(instanceEvent.Get("error"));
 
         // ...and the terminal "deploy" event carries the failed status + a non-null error.
-        var terminal = Assert.Single(recorder.Published.Where(p => p.Event == "deploy"));
+        var terminal = Assert.Single(recorder.Published, p => p.Event == "deploy");
         Assert.Equal(DeployStatus.Failed, terminal.Get("status"));
         Assert.NotNull(terminal.Get("error"));
         Assert.IsType<string>(terminal.Get("finishedAt"));
@@ -391,7 +391,7 @@ public class ReconcilerDeployProgressTests
         Assert.Equal(DeployStatus.Partial, deploy.Status);
         Assert.NotNull(deploy.FinishedAt);
 
-        var terminal = Assert.Single(recorder.Published.Where(p => p.Event == "deploy"));
+        var terminal = Assert.Single(recorder.Published, p => p.Event == "deploy");
         Assert.Equal(DeployStatus.Partial, terminal.Get("status"));
         Assert.NotNull(terminal.Get("error"));
     }
@@ -420,7 +420,7 @@ public class ReconcilerDeployProgressTests
         Assert.Equal(DeployStatus.Failed, deploy.Status);
         Assert.NotNull(deploy.FinishedAt);
 
-        var terminal = Assert.Single(recorder.Published.Where(p => p.Event == "deploy"));
+        var terminal = Assert.Single(recorder.Published, p => p.Event == "deploy");
         Assert.Equal(DeployStatus.Failed, terminal.Get("status"));
         Assert.Equal("deploy timed out", terminal.Get("error"));
     }

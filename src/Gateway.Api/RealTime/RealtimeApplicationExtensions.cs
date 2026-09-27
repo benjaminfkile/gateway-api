@@ -174,6 +174,11 @@ public static class RealtimeApplicationExtensions
     /// <c>realtime_presence</c> opt-in — it is the owner's own token-gated data, not a
     /// broadcast to every subscriber. <c>ops:*</c> is gateway-owned and never queryable
     /// here. The isolation middleware keeps this reachable only on the internal listener.
+    /// <para>
+    /// Also maps <c>GET /internal/presence/{channel}/count</c>, which answers
+    /// <c>{ channel, count }</c> behind the identical guard from
+    /// <see cref="IPresenceRegistry.CountAsync"/> without materializing the member list.
+    /// </para>
     /// </summary>
     public static IEndpointRouteBuilder MapInternalPresence(this IEndpointRouteBuilder endpoints)
     {
@@ -205,6 +210,32 @@ public static class RealtimeApplicationExtensions
                     .Select(m => new { connectionId = m.ConnectionId, identity = m.Identity, joinedAt = m.JoinedAt })
                     .ToArray(),
             });
+        });
+
+        // Count-only read: the same owner-token guard, ops:* refusal, and internal-listener
+        // isolation as the list read above, answered from IPresenceRegistry.CountAsync so the
+        // member list is never materialized and the cost stays constant at any channel size.
+        endpoints.MapGet("/internal/presence/{channel}/count", async (
+            string channel,
+            HttpContext context,
+            IChannelOwnershipResolver ownership,
+            IPresenceRegistry presence,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(channel))
+            {
+                return Results.BadRequest(new { error = "channel is required." });
+            }
+
+            var (_, failure) = await AuthorizeOwnerAsync(
+                channel, "reading presence for", context, ownership, ct);
+            if (failure is not null)
+            {
+                return failure;
+            }
+
+            var count = await presence.CountAsync(channel, ct);
+            return Results.Json(new { channel, count });
         });
         return endpoints;
     }

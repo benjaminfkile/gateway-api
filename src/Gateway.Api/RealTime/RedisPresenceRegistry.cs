@@ -144,8 +144,19 @@ public sealed class RedisPresenceRegistry : IPresenceRegistry
         return list;
     }
 
-    public async Task<int> CountAsync(string channel, CancellationToken ct = default) =>
-        (await ListAsync(channel, ct).ConfigureAwait(false)).Count;
+    /// <summary>
+    /// How many connections are present in <paramref name="channel"/>, read as the channel
+    /// hash length (<c>HLEN</c>) so the cost is constant at any channel size and no member
+    /// row is fetched or parsed. Unlike <see cref="ListAsync"/>, this does not filter rows by
+    /// heartbeat, so the count can briefly include rows of a crashed instance that the reaper
+    /// has not pruned yet. Presence is best-effort, and <see cref="RefreshAndReapAsync"/>
+    /// bounds that staleness to one stale window plus one reaper tick.
+    /// </summary>
+    public async Task<int> CountAsync(string channel, CancellationToken ct = default)
+    {
+        var length = await Db.HashLengthAsync(KeyFor(channel)).ConfigureAwait(false);
+        return length > int.MaxValue ? int.MaxValue : (int)length;
+    }
 
     public Task<IReadOnlyList<ChannelMembership>> LocalMembershipsAsync(CancellationToken ct = default)
     {
