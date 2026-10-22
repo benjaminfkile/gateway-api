@@ -113,7 +113,7 @@ public static partial class ManagementEndpoints
 
         mgmt.MapPost("/services/{name}/stop", StopAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
         mgmt.MapPost("/services/{name}/start", StartAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
-        mgmt.MapPost("/services/{name}/restart", RestartAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
+        mgmt.MapPost("/services/{name}/restart", RestartAsync).RequireAuthorization(ManagementAuth.OpsRestartPolicy);
         mgmt.MapPut("/services/{name}", UpsertServiceAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
         mgmt.MapDelete("/services/{name}", DeleteServiceAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
 

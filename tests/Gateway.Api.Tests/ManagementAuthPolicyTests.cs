@@ -70,6 +70,17 @@ public class ManagementAuthPolicyTests
     }
 
     [Fact]
+    public void CanRestart_ForAdminOrJobsScope_NotDeploy()
+    {
+        Assert.True(ManagementAuth.CanRestart(Principal(new[] { ManagementAuth.OpsAdminGroup })));
+        Assert.True(ManagementAuth.CanRestart(Principal(scope: ManagementAuth.JobsScope)));
+        // Neither the deploy group nor the CI deploy scope may restart.
+        Assert.False(ManagementAuth.CanRestart(Principal(new[] { ManagementAuth.OpsDeployGroup })));
+        Assert.False(ManagementAuth.CanRestart(Principal(scope: ManagementAuth.DeployScope)));
+        Assert.False(ManagementAuth.CanRestart(Principal()));
+    }
+
+    [Fact]
     public void Options_Unconfigured_WhenAuthorityUnset()
     {
         var options = ManagementAuthOptions.FromConfiguration(

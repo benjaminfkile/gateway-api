@@ -217,6 +217,27 @@ public class ManagementLifecycleTests
     }
 
     [Fact]
+    public async Task Restart_JobsScope_Allowed_ButStartAndDeployScopeAreNot()
+    {
+        await using var factory = new ManagementApiFactory();
+        await SeedAsync(factory, ManagementTestData.Manifest("svc-a", includeInHealth: false));
+
+        // A mgmt/jobs token may restart a service (a job bouncing the service it
+        // depends on) but may not start, stop or edit it; the deploy scope still
+        // may not restart.
+        var jobs = factory.CreateClient(ManagementApiFactory.JobsToken());
+        var restart = await jobs.PostAsync("/mgmt/services/svc-a/restart", null);
+        Assert.Equal(HttpStatusCode.OK, restart.StatusCode);
+
+        var start = await jobs.PostAsync("/mgmt/services/svc-a/start", null);
+        Assert.Equal(HttpStatusCode.Forbidden, start.StatusCode);
+
+        var deploy = factory.CreateClient(ManagementApiFactory.DeployToken());
+        var deployRestart = await deploy.PostAsync("/mgmt/services/svc-a/restart", null);
+        Assert.Equal(HttpStatusCode.Forbidden, deployRestart.StatusCode);
+    }
+
+    [Fact]
     public async Task Lifecycle_NoToken_Unauthorized()
     {
         await using var factory = new ManagementApiFactory();

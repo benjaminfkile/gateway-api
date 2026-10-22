@@ -28,6 +28,12 @@ public static class ManagementAuth
     /// </summary>
     public const string OpsJobsPolicy = "OpsJobs";
 
+    /// <summary>
+    /// Service restart: <c>ops-admin</c>, or a client-credentials token bearing the
+    /// <c>mgmt/jobs</c> scope, so a scheduled job can bounce a service it depends on.
+    /// </summary>
+    public const string OpsRestartPolicy = "OpsRestart";
+
     /// <summary>Claim type carrying Cognito group membership.</summary>
     public const string GroupsClaim = "cognito:groups";
 
@@ -104,6 +110,16 @@ public static class ManagementAuth
     /// with the instance role, so <c>ops-deploy</c> and the CI deploy scope do not qualify.
     /// </summary>
     public static bool CanManageJobs(ClaimsPrincipal user) =>
+        IsOpsAdmin(user) || HasScope(user, JobsScope);
+
+    /// <summary>
+    /// Satisfies <see cref="OpsRestartPolicy"/>: an <c>ops-admin</c> human, or a
+    /// client-credentials token bearing the <c>mgmt/jobs</c> scope. A restart recreates
+    /// a service on its current digest, which a job (for instance a database mirror
+    /// that needs the dev API to boot and migrate forward) may need; stop, start and
+    /// manifest edits stay admin only, and the deploy scope does not qualify.
+    /// </summary>
+    public static bool CanRestart(ClaimsPrincipal user) =>
         IsOpsAdmin(user) || HasScope(user, JobsScope);
 
     /// <summary>

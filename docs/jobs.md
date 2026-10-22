@@ -150,7 +150,10 @@ power a deployed image already has, so the bar is the same as deploy: a human
 admin or a dedicated machine client. The CI deploy client does not get this
 scope by accident; it is a separate client an operator creates if a repo's CI
 should push its script on change. Run and cancel sit under the same policy so
-an operator can also trigger from a script with that client.
+an operator can also trigger from a script with that client. The same scope may
+also call `POST /mgmt/services/{name}/restart` (policy `OpsRestart`: ops-admin or
+`mgmt/jobs`), because a job such as a database mirror needs the dependent service
+to boot again and migrate forward; stop, start and manifest edits stay admin only.
 
 Every mutation records the caller in `updated_by` or `actor`. Responses never
 include secret values; `envSecretRef` is the only secret-related field and it

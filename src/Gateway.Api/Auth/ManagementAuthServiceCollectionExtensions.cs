@@ -117,6 +117,10 @@ public static class ManagementAuthServiceCollectionExtensions
                 .RequireAuthenticatedUser()
                 .RequireAssertion(ctx => ManagementAuth.CanManageJobs(ctx.User)));
 
+            authz.AddPolicy(ManagementAuth.OpsRestartPolicy, policy => policy
+                .RequireAuthenticatedUser()
+                .RequireAssertion(ctx => ManagementAuth.CanRestart(ctx.User)));
+
             // The dashboard's ops:* hub channels: authenticate the gateway's own
             // client and require a human ops group (§4.2). This replaces the
             // placeholder "any authenticated user" hook from the hub task.
