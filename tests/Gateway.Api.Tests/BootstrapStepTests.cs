@@ -246,6 +246,20 @@ public class BootstrapStepTests
     }
 
     [Fact]
+    public async Task CloudWatchConfig_enables_the_emf_listener_for_job_metrics()
+    {
+        var host = new FakeLinuxHost();
+        var options = Options();
+        var step = new CloudWatchAgentConfigStep(host, options, NullLogger<CloudWatchAgentConfigStep>.Instance);
+
+        await step.RunAsync();
+
+        using var doc = JsonDocument.Parse(host.Files[options.CloudWatchAgentConfigPath]);
+        var emf = doc.RootElement.GetProperty("logs").GetProperty("metrics_collected").GetProperty("emf");
+        Assert.Equal(JsonValueKind.Object, emf.ValueKind);
+    }
+
+    [Fact]
     public async Task CloudWatchConfig_existing_config_in_new_shape_is_detected_as_unchanged()
     {
         var host = new FakeLinuxHost();

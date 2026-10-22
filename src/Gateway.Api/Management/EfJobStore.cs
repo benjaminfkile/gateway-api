@@ -145,4 +145,115 @@ public sealed class EfJobStore : IJobStore
 
         return await GetRunAsync(id, ct);
     }
+
+    public async Task<IReadOnlyList<Job>> ListDueAsync(DateTimeOffset now, CancellationToken ct = default)
+    {
+        // The job table is small, so the time comparison runs in memory; that keeps
+        // it portable (Sqlite in tests cannot translate a DateTimeOffset comparison).
+        var scheduled = await _db.Jobs.AsNoTracking()
+            .Where(x => x.Enabled && x.NextRunAt != null)
+            .ToListAsync(ct);
+        return scheduled
+            .Where(x => x.NextRunAt <= now)
+            .OrderBy(x => x.NextRunAt)
+            .ThenBy(x => x.Name, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    public async Task<JobRun?> TryClaimScheduledRunAsync(
+        string job, DateTimeOffset dueAt, DateTimeOffset? nextRunAt, JobRun run, CancellationToken ct = default)
+    {
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+        // The conditional advance is the claim: a second scheduler that read the same
+        // due time updates nothing (on Postgres it waits for the first commit, then
+        // re-checks the predicate and finds next_run_at moved).
+        var advanced = await _db.Jobs
+            .Where(x => x.Name == job && x.Enabled && x.NextRunAt == dueAt)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.NextRunAt, nextRunAt), ct);
+        if (advanced == 0)
+        {
+            return null;
+        }
+
+        if (await GetActiveRunAsync(job, ct) is not null)
+        {
+            // One run at a time: leave next_run_at where it was so the job runs once
+            // when the active run ends.
+            return null;
+        }
+
+        _db.JobRuns.Add(run);
+        try
+        {
+            await _db.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException)
+        {
+            _db.Entry(run).State = EntityState.Detached;
+            return null;
+        }
+
+        await tx.CommitAsync(ct);
+        return run;
+    }
+
+    public async Task<IReadOnlyList<JobRun>> ListRunsByStatusAsync(string status, CancellationToken ct = default)
+    {
+        return await _db.JobRuns.AsNoTracking()
+            .Where(x => x.Status == status)
+            .OrderBy(x => x.Id)
+            .ToListAsync(ct);
+    }
+
+    public async Task<bool> TryClaimQueuedRunAsync(long id, string instanceId, DateTimeOffset now, CancellationToken ct = default)
+    {
+        var claimed = await _db.JobRuns
+            .Where(x => x.Id == id && x.Status == JobRunStatus.Queued)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, JobRunStatus.Running)
+                .SetProperty(x => x.InstanceId, instanceId)
+                .SetProperty(x => x.StartedAt, now), ct);
+        return claimed == 1;
+    }
+
+    public async Task SetRunImageDigestAsync(long id, string digest, CancellationToken ct = default)
+    {
+        await _db.JobRuns
+            .Where(x => x.Id == id)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.ImageDigest, digest), ct);
+    }
+
+    public async Task<bool> FinishRunAsync(
+        long id,
+        string instanceId,
+        string status,
+        int? exitCode,
+        string? detail,
+        DateTimeOffset finishedAt,
+        CancellationToken ct = default)
+    {
+        var finished = await _db.JobRuns
+            .Where(x => x.Id == id
+                && x.InstanceId == instanceId
+                && (x.Status == JobRunStatus.Running || x.Status == JobRunStatus.Lost))
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, status)
+                .SetProperty(x => x.ExitCode, exitCode)
+                .SetProperty(x => x.Detail, detail)
+                .SetProperty(x => x.FinishedAt, finishedAt), ct);
+        return finished == 1;
+    }
+
+    public async Task<bool> MarkRunLostAsync(
+        long id, string instanceId, DateTimeOffset now, string detail, CancellationToken ct = default)
+    {
+        var lost = await _db.JobRuns
+            .Where(x => x.Id == id && x.InstanceId == instanceId && x.Status == JobRunStatus.Running)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, JobRunStatus.Lost)
+                .SetProperty(x => x.Detail, detail)
+                .SetProperty(x => x.FinishedAt, now), ct);
+        return lost == 1;
+    }
 }

@@ -1774,4 +1774,52 @@ public class ReconcilerServiceTests
         Assert.Empty(harness.Runtime.Operations.Skip(opsAfterDeploy));
         Assert.Empty(harness.Reporter.Outcomes);
     }
+
+    // ---------- scheduled jobs (docs/jobs.md section 3) ----------
+
+    [Fact]
+    public async Task JobContainer_IsNeitherReportedInInstanceStatus_NorStoppedAsAnOrphan()
+    {
+        var harness = new Harness();
+        harness.Runtime.Seed(Running("svc-a", "sha256:v1", EmptyEnvHash));
+        await harness.Store.UpsertAsync(Manifest("svc-a", digest: "sha256:v1"));
+
+        // A running job container with no manifest entry. It even carries the managed
+        // label, the worst case: the job label alone must keep the reconciler off it.
+        harness.Runtime.SeedJobContainer("mirror", 7, alsoManagedLabel: true);
+
+        await harness.Service.RunOnceAsync();
+        await harness.Service.RunOnceAsync();
+
+        Assert.NotNull(harness.Runtime.GetJobContainer("job-mirror-7"));
+        Assert.Equal("running", harness.Runtime.GetJobContainer("job-mirror-7")!.State);
+        Assert.DoesNotContain(harness.Runtime.Operations, op => op.Contains("job-mirror-7", StringComparison.Ordinal));
+        Assert.DoesNotContain(harness.Reporter.Outcomes, o => o.ServiceName.Contains("job-", StringComparison.Ordinal));
+
+        var services = InstanceServicesJson.Parse(harness.StatusStore.Upserts[^1].Services);
+        Assert.Equal(new[] { "svc-a" }, services.Select(s => s.Name));
+    }
+
+    [Fact]
+    public async Task EveryLoop_FeedsTheLeaderStatusSeam()
+    {
+        var harness = new Harness(isLeader: true);
+        ILeaderStatus status = harness.LeadershipState;
+        Assert.False(status.Current.IsLeader);
+        Assert.Null(status.EvaluatedAt);
+
+        await harness.Service.RunOnceAsync();
+
+        Assert.True(status.Current.IsLeader);
+        Assert.Equal("i-test", status.Current.LeaderInstanceId);
+        var first = status.EvaluatedAt;
+        Assert.NotNull(first);
+
+        harness.Leader.IsLeader = false;
+        await Task.Delay(5);
+        await harness.Service.RunOnceAsync();
+
+        Assert.False(status.Current.IsLeader);
+        Assert.True(status.EvaluatedAt > first);
+    }
 }

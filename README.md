@@ -237,9 +237,8 @@ A job is a named script with an optional five-field cron schedule, evaluated in
 the job's IANA time zone. When it is due, or when an operator presses run, the
 fleet runs the script once as a short-lived container from a runner image and
 records the result as a run. One run at a time per job; a run has a timeout. The
-design is [`docs/jobs.md`](docs/jobs.md). Part 1 (this build) is the job model,
-the store, the management API and the `ops:jobs` events; the executor is part 2,
-so until it lands a queued run stays queued.
+design is [`docs/jobs.md`](docs/jobs.md); the job model, the store, the
+management API, the `ops:jobs` events and the executor are all built.
 
 State lives in three tables (tech-spec §4.4): `job` (the current script, schedule,
 image, timeout, `next_run_at`), `job_script_version` (every script body with its
@@ -274,7 +273,82 @@ point at the runner repository in your registry) and `Jobs:DefaultTag` (default
 `latest`) fill in `image` and `tag` when a create omits them.
 
 **Logs:** a run writes to CloudWatch log group `/gateway/jobs/{name}`, stream
-`run-{id}`, read through the same log store as service logs.
+`run-{id}`, read through the same log store as service logs. The group is made by
+the awslogs driver and gets the same 30-day retention as service groups the first
+time an instance uses it. The `json-file` escape hatch (`GATEWAY_LOG_DRIVER`)
+applies to job containers exactly as to services.
+
+### Execution
+
+`JobSchedulerService` runs on every instance when a database is configured and
+ticks every `Jobs:TickInterval`. Leadership is the answer the reconciler's last
+loop published (the same in-process snapshot `GET /internal/leader` reads); the
+scheduler never runs the election itself, and treats an answer older than
+`Reconciler:InstanceStaleThreshold` as not leader.
+
+Leader duties, each tick:
+
+1. **Claim due scheduled runs.** For each enabled job with `next_run_at <= now`
+   and no queued or running run, insert a `queued` run (trigger `schedule`,
+   actor `schedule`) and advance `next_run_at` to the next occurrence after now,
+   in one transaction conditional on `next_run_at` being unchanged. A job that
+   missed several slots (the fleet was down, or its previous run was still
+   active) runs once.
+2. **Mark lost runs.** A `running` run whose instance has no `instance_status`
+   heartbeat within the stale threshold becomes `lost` with a detail line.
+3. **Claim queued runs**, oldest first, with one conditional update (`queued` to
+   `running`, `instance_id` = this instance, `started_at` = now), no more than
+   `Jobs:MaxConcurrent` minus the runs this instance already has running. Two
+   leaders ticking together start a run once: only one conditional update wins.
+
+Own duties, every tick on every instance:
+
+- **Drive** each run this instance owns on a background task: read the job's env
+  from `envSecretRef` (the same Secrets Manager provider and cache services use),
+  add `GATEWAY_JOB_NAME`, `GATEWAY_JOB_RUN_ID`, `GATEWAY_JOB_TRIGGER` and
+  `GATEWAY_JOB_SCRIPT` (the script, base64 of UTF-8), pull `image:tag` and record
+  the digest, then run container `job-{name}-{runId}` on the internal network with
+  no exposed or published port, no restart policy, the `Jobs:MemoryLimitBytes`
+  memory limit and only the labels `gateway.job` and `gateway.job-run` (never
+  `gateway.managed`, and the reconciler's inventory and orphan handling skip any
+  container with the job label). The container is removed when it ends.
+- **Finalise:** exit 0 is `succeeded`, any other exit `failed`, the job timeout
+  kills the container and records `timed_out`, a cancel request kills it and
+  records `cancelled`. `exit_code`, `finished_at` and the last 20 output lines (in
+  `detail`, at most 2 KiB) are stored and a `run` event goes out on `ops:jobs`.
+- **Cancel:** `cancel_requested_at` is polled for every driven run each tick.
+- **Re-attach:** a gateway that stops mid-run leaves the container running. On
+  the next process's first tick, a `running` run this instance owns that it did
+  not start itself is re-attached through its `gateway.job-run` label and
+  finalised with the container's real exit code; with no container left it is
+  `lost`.
+
+| Case | Behaviour |
+|---|---|
+| Secret missing or not flat JSON | `failed` before start, detail names the ref (never a value), nothing executes |
+| Image pull fails | `failed`, detail carries the registry error |
+| Script exits non-zero | `failed` with the exit code and the tail |
+| Timeout | Container killed, `timed_out` |
+| Leader dies mid-run | The run's own instance finishes it; if that instance is gone the leader marks it `lost` |
+| Gateway restarts mid-run | The container continues; the same instance re-attaches by label on its first tick |
+| Two leaders for one tick | The claim is a conditional update; one wins |
+| Job deleted mid-run | `409` unless forced; forced cancels first |
+
+**Metrics:** every finished run records `JobRunCount` (dimensions `Job`,
+`Status`) and `JobRunDuration` in seconds (dimension `Job`) on the in-process
+meter `Gateway.Jobs` and as an embedded-metric-format document sent to the
+CloudWatch agent's EMF listener, which the bootstrap step enables, so both land
+in the gateway's metric namespace. An alarm on `failed`, `timed_out` and `lost`
+counts is an operator choice per job.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Jobs:TickInterval` | `00:00:10` | Time between scheduler ticks |
+| `Jobs:MaxConcurrent` | `4` | Most runs one instance drives at once; the rest wait in `queued` |
+| `Jobs:MemoryLimitBytes` | `1073741824` | Memory limit of a job container (1 GiB) |
+| `Jobs:MetricsEndpoint` | `127.0.0.1:25888` | CloudWatch agent EMF listener for run metrics (UDP); empty turns the send off |
+| `Jobs:MetricsNamespace` | `Gateway` | CloudWatch namespace of the run metrics |
+| `Jobs:DefaultImage`, `Jobs:DefaultTag` | see above | Image and tag a create gets when it omits them |
 
 **Real-time:** the `ops:jobs` hub channel (same gate as `ops:deploys`) carries
 `job` `{ name, action, by }` on upsert, delete, enable and disable, and `run`

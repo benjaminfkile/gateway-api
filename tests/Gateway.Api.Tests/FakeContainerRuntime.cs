@@ -10,7 +10,7 @@ namespace Gateway.Api.Tests;
 /// so tests can assert ordering (e.g. that the old container is only removed after
 /// the green candidate is healthy).
 /// </summary>
-public sealed class FakeContainerRuntime : IContainerRuntime
+public sealed partial class FakeContainerRuntime : IContainerRuntime
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, ContainerInfo> _containers = new(StringComparer.Ordinal);
@@ -93,7 +93,14 @@ public sealed class FakeContainerRuntime : IContainerRuntime
     {
         lock (_gate)
         {
-            IReadOnlyList<ContainerInfo> list = _containers.Values.ToList();
+            // Models the Docker listing: a job container that also carries the managed
+            // label would match the label filter, and is dropped for its job label
+            // exactly as DockerContainerRuntime drops it.
+            var jobsMatchingFilter = _jobContainers.Values
+                .Where(j => j.Labels.TryGetValue(ContainerLabels.Managed, out var managed) && managed == "true")
+                .Where(j => !j.Labels.ContainsKey(ContainerLabels.Job))
+                .Select(j => new ContainerInfo(j.Name, j.Image, null, j.State, j.StartedAt, null));
+            IReadOnlyList<ContainerInfo> list = _containers.Values.Concat(jobsMatchingFilter).ToList();
             return Task.FromResult(list);
         }
     }

@@ -14,7 +14,7 @@ namespace Gateway.Api.Instances;
 /// claim leadership through this endpoint until the reconciler has actually run.
 /// </para>
 /// </summary>
-public sealed class LeadershipState
+public sealed class LeadershipState : ILeaderStatus
 {
     private readonly object _gate = new();
     private LeadershipSnapshot _snapshot = LeadershipSnapshot.NeverEvaluated;
@@ -32,6 +32,19 @@ public sealed class LeadershipState
             _snapshot = new LeadershipSnapshot(isLeader, leaderInstanceId, evaluatedAt);
         }
     }
+
+    /// <inheritdoc />
+    public LeaderResolution Current
+    {
+        get
+        {
+            var snapshot = Snapshot();
+            return new LeaderResolution(snapshot.IsLeader, snapshot.LeaderInstanceId);
+        }
+    }
+
+    /// <inheritdoc />
+    public DateTimeOffset? EvaluatedAt => Snapshot().EvaluatedAt;
 
     /// <summary>The last evaluation the reconciler published, or the never-evaluated seed.</summary>
     public LeadershipSnapshot Snapshot()

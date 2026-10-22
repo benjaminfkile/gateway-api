@@ -173,4 +173,127 @@ public class JobStoreTests
 
         Assert.Equal(ids[3], (await store.GetLastRunsAsync())["nightly"].Id);
     }
+
+    // ---------- executor primitives (docs/jobs.md section 3) ----------
+
+    private static readonly DateTimeOffset Due = new(2026, 1, 5, 4, 0, 0, TimeSpan.Zero);
+
+    private static JobRun ScheduledRun(string job) => new()
+    {
+        Job = job,
+        Trigger = JobRunTrigger.Schedule,
+        Actor = "schedule",
+        Status = JobRunStatus.Queued,
+        ScriptVersion = 1,
+        QueuedAt = Due,
+    };
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ListDue_ReturnsEnabledJobsAtOrBeforeNow(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        var due = NewJob("due");
+        due.NextRunAt = Due;
+        var later = NewJob("later");
+        later.NextRunAt = Due.AddMinutes(1);
+        var disabled = NewJob("disabled");
+        disabled.Enabled = false;
+        disabled.NextRunAt = Due.AddDays(-1);
+        var manual = NewJob("manual");
+        manual.Schedule = null;
+        await store.UpsertAsync(due);
+        await store.UpsertAsync(later);
+        await store.UpsertAsync(disabled);
+        await store.UpsertAsync(manual);
+
+        Assert.Equal(new[] { "due" }, (await store.ListDueAsync(Due)).Select(j => j.Name));
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ClaimScheduled_WinsOnce_AndAdvancesNextRunAt(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        var job = NewJob("nightly");
+        job.NextRunAt = Due;
+        await store.UpsertAsync(job);
+
+        var next = Due.AddDays(1);
+        var first = await store.TryClaimScheduledRunAsync("nightly", Due, next, ScheduledRun("nightly"));
+        var second = await store.TryClaimScheduledRunAsync("nightly", Due, next, ScheduledRun("nightly"));
+
+        Assert.NotNull(first);
+        Assert.Null(second);
+        Assert.Equal(next, (await store.GetAsync("nightly"))!.NextRunAt);
+        Assert.Single(await store.ListRunsAsync("nightly", 50, null));
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ClaimScheduled_WithAnActiveRun_ChangesNothing(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        var job = NewJob("nightly");
+        job.NextRunAt = Due;
+        await store.UpsertAsync(job);
+        await store.TryEnqueueRunAsync(NewRun("nightly"));
+
+        Assert.Null(await store.TryClaimScheduledRunAsync("nightly", Due, Due.AddDays(1), ScheduledRun("nightly")));
+        Assert.Equal(Due, (await store.GetAsync("nightly"))!.NextRunAt);
+        Assert.Single(await store.ListRunsAsync("nightly", 50, null));
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ClaimQueued_IsWonOnce_AndRecordsTheInstance(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        await store.UpsertAsync(NewJob("nightly"));
+        var run = await store.TryEnqueueRunAsync(NewRun("nightly"));
+
+        Assert.True(await store.TryClaimQueuedRunAsync(run!.Id, "i-0000000000000000a", Due));
+        Assert.False(await store.TryClaimQueuedRunAsync(run.Id, "i-0000000000000000b", Due));
+
+        var claimed = await store.GetRunAsync(run.Id);
+        Assert.Equal(JobRunStatus.Running, claimed!.Status);
+        Assert.Equal("i-0000000000000000a", claimed.InstanceId);
+        Assert.Equal(Due, claimed.StartedAt);
+        Assert.Equal(new[] { run.Id }, (await store.ListRunsByStatusAsync(JobRunStatus.Running)).Select(r => r.Id));
+        Assert.Empty(await store.ListRunsByStatusAsync(JobRunStatus.Queued));
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task Finish_And_Lost_AreConditionalOnTheOwningInstance(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        await store.UpsertAsync(NewJob("nightly"));
+        var run = await store.TryEnqueueRunAsync(NewRun("nightly"));
+        await store.TryClaimQueuedRunAsync(run!.Id, "i-0000000000000000a", Due);
+        await store.SetRunImageDigestAsync(run.Id, "sha256:0123");
+
+        Assert.False(await store.MarkRunLostAsync(run.Id, "i-0000000000000000b", Due, "wrong instance"));
+        Assert.True(await store.MarkRunLostAsync(run.Id, "i-0000000000000000a", Due, "no heartbeat"));
+        Assert.Equal(JobRunStatus.Lost, (await store.GetRunAsync(run.Id))!.Status);
+
+        // The owning instance's real outcome replaces the lost guess.
+        Assert.False(await store.FinishRunAsync(run.Id, "i-0000000000000000b", JobRunStatus.Succeeded, 0, null, Due));
+        Assert.True(await store.FinishRunAsync(run.Id, "i-0000000000000000a", JobRunStatus.Failed, 2, "tail", Due.AddMinutes(1)));
+
+        var finished = await store.GetRunAsync(run.Id);
+        Assert.Equal(JobRunStatus.Failed, finished!.Status);
+        Assert.Equal(2, finished.ExitCode);
+        Assert.Equal("tail", finished.Detail);
+        Assert.Equal("sha256:0123", finished.ImageDigest);
+        Assert.Equal(Due.AddMinutes(1), finished.FinishedAt);
+
+        // A finished run is never finished twice.
+        Assert.False(await store.FinishRunAsync(run.Id, "i-0000000000000000a", JobRunStatus.Succeeded, 0, null, Due));
+    }
 }

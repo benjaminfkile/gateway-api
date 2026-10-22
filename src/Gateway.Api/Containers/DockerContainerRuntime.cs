@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Docker.DotNet;
 using Docker.DotNet.Models;
 
@@ -77,6 +78,13 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
         foreach (var c in listed)
         {
             var labels = c.Labels ?? new Dictionary<string, string>();
+
+            // A job-run container is never a service, even if it somehow carried the
+            // managed label: the reconciler must neither report nor stop it.
+            if (labels.ContainsKey(ContainerLabels.Job))
+            {
+                continue;
+            }
             labels.TryGetValue(ContainerLabels.Digest, out var digest);
             labels.TryGetValue(ContainerLabels.EnvHash, out var envHash);
 
@@ -385,6 +393,224 @@ public sealed class DockerContainerRuntime : IContainerRuntime, IDisposable
         return deleted == 0 && bytes == 0L
             ? ImagePruneResult.None
             : new ImagePruneResult(deleted, bytes);
+    }
+
+    public async Task<JobRunResult> RunJobContainerAsync(JobContainerSpec spec, TimeSpan timeout, CancellationToken cancel)
+    {
+        var imageRef = string.IsNullOrEmpty(spec.Digest)
+            ? spec.Image
+            : $"{spec.Image}@{spec.Digest}";
+
+        var create = new CreateContainerParameters
+        {
+            Name = spec.Name,
+            Image = imageRef,
+            Env = spec.EnvVars.Select(kvp => $"{kvp.Key}={kvp.Value}").ToList(),
+            // Only the job labels: no managed-service label, so the reconciler never
+            // treats the container as a service or an orphan.
+            Labels = new Dictionary<string, string>(spec.Labels, StringComparer.Ordinal),
+            HostConfig = new HostConfig
+            {
+                // A job runs once: no restart policy, no exposed or published port.
+                RestartPolicy = new RestartPolicy { Name = RestartPolicyKind.No },
+                NetworkMode = spec.Network,
+                Memory = spec.MemoryLimitBytes,
+                LogConfig = new Docker.DotNet.Models.LogConfig
+                {
+                    Type = spec.LogConfig.Driver,
+                    Config = new Dictionary<string, string>(spec.LogConfig.Options),
+                },
+            },
+        };
+
+        // Create and start are not cancellable by the run's cancel token: a cancel
+        // that lands mid-create would leave an unnamed half state. The wait below
+        // observes the token immediately after start.
+        var created = await _client.Containers.CreateContainerAsync(create, CancellationToken.None);
+        try
+        {
+            await _client.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), CancellationToken.None);
+        }
+        catch
+        {
+            await RemoveQuietlyAsync(created.ID);
+            throw;
+        }
+
+        return await WaitCoreAsync(created.ID, DateTimeOffset.UtcNow, timeout, cancel);
+    }
+
+    public async Task<JobContainerInfo?> FindJobContainerAsync(long runId, CancellationToken ct = default)
+    {
+        var listed = await _client.Containers.ListContainersAsync(
+            new ContainersListParameters
+            {
+                All = true,
+                Filters = new Dictionary<string, IDictionary<string, bool>>
+                {
+                    ["label"] = new Dictionary<string, bool>
+                    {
+                        [$"{ContainerLabels.JobRun}={runId.ToString(CultureInfo.InvariantCulture)}"] = true,
+                    },
+                },
+            }, ct);
+
+        var c = listed.FirstOrDefault();
+        if (c is null)
+        {
+            return null;
+        }
+
+        var labels = c.Labels ?? new Dictionary<string, string>();
+        labels.TryGetValue(ContainerLabels.Job, out var job);
+
+        DateTimeOffset? startedAt = null;
+        try
+        {
+            var inspect = await _client.Containers.InspectContainerAsync(c.ID, ct);
+            if (DateTimeOffset.TryParse(
+                    inspect.State?.StartedAt,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out var parsed) && parsed.Year > 1)
+            {
+                startedAt = parsed;
+            }
+        }
+        catch (DockerApiException)
+        {
+            // Vanished between list and inspect: the start time stays unknown.
+        }
+
+        return new JobContainerInfo(
+            Id: c.ID,
+            Name: (c.Names?.FirstOrDefault() ?? string.Empty).TrimStart('/'),
+            Job: job ?? string.Empty,
+            RunId: runId,
+            State: c.State ?? string.Empty,
+            StartedAt: startedAt);
+    }
+
+    public Task<JobRunResult> WaitJobContainerAsync(JobContainerInfo container, TimeSpan timeout, CancellationToken cancel) =>
+        WaitCoreAsync(container.Id, container.StartedAt ?? DateTimeOffset.UtcNow, timeout, cancel);
+
+    /// <summary>
+    /// Wait for a job-run container to exit under <paramref name="timeout"/>, killing
+    /// it on timeout or on <paramref name="cancel"/>; then read the last lines of
+    /// output and remove the container. Removal runs in a finally so a failed wait
+    /// never leaks a container.
+    /// </summary>
+    private async Task<JobRunResult> WaitCoreAsync(
+        string id, DateTimeOffset startedAt, TimeSpan timeout, CancellationToken cancel)
+    {
+        int? exitCode = null;
+        var timedOut = false;
+        var cancelled = false;
+        var tail = string.Empty;
+        DateTimeOffset finishedAt;
+
+        try
+        {
+            using var timeoutCts = new CancellationTokenSource(timeout > TimeSpan.Zero ? timeout : TimeSpan.Zero);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancel);
+            try
+            {
+                var waited = await _client.Containers.WaitContainerAsync(id, linked.Token);
+                exitCode = (int)waited.StatusCode;
+            }
+            catch (OperationCanceledException) when (linked.IsCancellationRequested)
+            {
+                cancelled = cancel.IsCancellationRequested;
+                timedOut = !cancelled;
+                await KillQuietlyAsync(id);
+            }
+
+            finishedAt = DateTimeOffset.UtcNow;
+            tail = await ReadTailAsync(id);
+        }
+        finally
+        {
+            await RemoveQuietlyAsync(id);
+        }
+
+        return new JobRunResult(exitCode, timedOut, cancelled, startedAt, finishedAt, tail);
+    }
+
+    private async Task KillQuietlyAsync(string id)
+    {
+        try
+        {
+            await _client.Containers.KillContainerAsync(id, new ContainerKillParameters(), CancellationToken.None);
+        }
+        catch (DockerApiException)
+        {
+            // Already exited between the timeout and the kill.
+        }
+    }
+
+    private async Task RemoveQuietlyAsync(string id)
+    {
+        try
+        {
+            await _client.Containers.RemoveContainerAsync(
+                id, new ContainerRemoveParameters { Force = true }, CancellationToken.None);
+        }
+        catch (DockerApiException)
+        {
+            // Already gone.
+        }
+    }
+
+    /// <summary>
+    /// The last <see cref="JobRunResult.TailLines"/> lines of the container's stdout
+    /// and stderr, in output order. Docker keeps a local copy of the output for the
+    /// logs API even under the awslogs driver. A read failure yields an empty tail
+    /// rather than failing the run's bookkeeping.
+    /// </summary>
+    private async Task<string> ReadTailAsync(string id)
+    {
+        try
+        {
+            using var stream = await _client.Containers.GetContainerLogsAsync(
+                id,
+                tty: false,
+                new ContainerLogsParameters
+                {
+                    ShowStdout = true,
+                    ShowStderr = true,
+                    Tail = JobRunResult.TailLines.ToString(CultureInfo.InvariantCulture),
+                },
+                CancellationToken.None);
+
+            var decoder = Encoding.UTF8.GetDecoder();
+            var buffer = new byte[8192];
+            var chars = new char[Encoding.UTF8.GetMaxCharCount(buffer.Length)];
+            var text = new StringBuilder();
+            while (true)
+            {
+                var read = await stream.ReadOutputAsync(buffer, 0, buffer.Length, CancellationToken.None);
+                if (read.EOF)
+                {
+                    break;
+                }
+
+                var count = decoder.GetChars(buffer, 0, read.Count, chars, 0);
+                text.Append(chars, 0, count);
+            }
+
+            return LastLines(text.ToString(), JobRunResult.TailLines);
+        }
+        catch (Exception ex) when (ex is DockerApiException or IOException)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>The last <paramref name="count"/> lines of <paramref name="text"/>, without a trailing newline.</summary>
+    internal static string LastLines(string text, int count)
+    {
+        var lines = text.Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd('\n').Split('\n');
+        return string.Join('\n', lines.Skip(Math.Max(0, lines.Length - count)));
     }
 
     public void Dispose() => _client.Dispose();

@@ -84,10 +84,15 @@ public static class ReconcilerServiceCollectionExtensions
         // still boots. TryAdd-first: tests substitute a fake IServiceEnvProvider.
         services.TryAddSingleton<IAmazonSecretsManager>(_ => new AmazonSecretsManagerClient());
         services.TryAddSingleton<ISecretStore, SecretsManagerSecretStore>();
-        services.TryAddSingleton<IServiceEnvProvider>(sp =>
+        services.TryAddSingleton(sp =>
             new SecretsManagerEnvProvider(
                 () => sp.GetRequiredService<ISecretStore>(),
                 options.SecretCacheTtl));
+        services.TryAddSingleton<IServiceEnvProvider>(sp => sp.GetRequiredService<SecretsManagerEnvProvider>());
+
+        // Job env (docs/jobs.md section 3): the same provider instance by ref, so a
+        // job and a service sharing a secret share one cache entry.
+        services.TryAddSingleton<ISecretEnvProvider>(sp => sp.GetRequiredService<SecretsManagerEnvProvider>());
 
         services.TryAddSingleton<IReconcileReporter, LoggingReconcileReporter>();
 
@@ -121,6 +126,9 @@ public static class ReconcilerServiceCollectionExtensions
         // never-evaluated so a booting instance never claims leadership through
         // this surface before the first reconcile loop has actually run.
         services.TryAddSingleton<LeadershipState>();
+        // The same snapshot through the ILeaderStatus seam, which the job scheduler
+        // reads to decide whether to run its leader duties (docs/jobs.md section 3).
+        services.TryAddSingleton<ILeaderStatus>(sp => sp.GetRequiredService<LeadershipState>());
 
         // Migration gate (this task, tech-spec §6): the loop waits on this before
         // reading the schema. Program.cs registers a pending gate + the migration

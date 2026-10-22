@@ -166,6 +166,152 @@ public sealed class FakeJobStore : IJobStore
         }
     }
 
+    public Task<IReadOnlyList<Job>> ListDueAsync(DateTimeOffset now, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult<IReadOnlyList<Job>>(Jobs
+                .Where(j => j.Enabled && j.NextRunAt is { } at && at <= now)
+                .OrderBy(j => j.NextRunAt)
+                .ThenBy(j => j.Name, StringComparer.Ordinal)
+                .Select(Copy)
+                .ToList());
+        }
+    }
+
+    public Task<JobRun?> TryClaimScheduledRunAsync(
+        string job, DateTimeOffset dueAt, DateTimeOffset? nextRunAt, JobRun run, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var row = Jobs.FirstOrDefault(j => j.Name == job);
+            if (row is null || !row.Enabled || row.NextRunAt != dueAt
+                || Runs.Any(r => r.Job == job && JobRunStatus.IsActive(r.Status)))
+            {
+                return Task.FromResult<JobRun?>(null);
+            }
+
+            row.NextRunAt = nextRunAt;
+            run.Id = _nextRunId++;
+            Runs.Add(run);
+            return Task.FromResult<JobRun?>(Copy(run));
+        }
+    }
+
+    public Task<IReadOnlyList<JobRun>> ListRunsByStatusAsync(string status, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult<IReadOnlyList<JobRun>>(
+                Runs.Where(r => r.Status == status).OrderBy(r => r.Id).Select(Copy).ToList());
+        }
+    }
+
+    public Task<bool> TryClaimQueuedRunAsync(long id, string instanceId, DateTimeOffset now, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var run = Runs.FirstOrDefault(r => r.Id == id && r.Status == JobRunStatus.Queued);
+            if (run is null)
+            {
+                return Task.FromResult(false);
+            }
+
+            run.Status = JobRunStatus.Running;
+            run.InstanceId = instanceId;
+            run.StartedAt = now;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task SetRunImageDigestAsync(long id, string digest, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var run = Runs.FirstOrDefault(r => r.Id == id);
+            if (run is not null)
+            {
+                run.ImageDigest = digest;
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    public Task<bool> FinishRunAsync(
+        long id,
+        string instanceId,
+        string status,
+        int? exitCode,
+        string? detail,
+        DateTimeOffset finishedAt,
+        CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var run = Runs.FirstOrDefault(r => r.Id == id
+                && r.InstanceId == instanceId
+                && r.Status is JobRunStatus.Running or JobRunStatus.Lost);
+            if (run is null)
+            {
+                return Task.FromResult(false);
+            }
+
+            run.Status = status;
+            run.ExitCode = exitCode;
+            run.Detail = detail;
+            run.FinishedAt = finishedAt;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<bool> MarkRunLostAsync(
+        long id, string instanceId, DateTimeOffset now, string detail, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var run = Runs.FirstOrDefault(r => r.Id == id
+                && r.InstanceId == instanceId
+                && r.Status == JobRunStatus.Running);
+            if (run is null)
+            {
+                return Task.FromResult(false);
+            }
+
+            run.Status = JobRunStatus.Lost;
+            run.Detail = detail;
+            run.FinishedAt = now;
+            return Task.FromResult(true);
+        }
+    }
+
+    /// <summary>Snapshot of one run by id, for assertions.</summary>
+    public JobRun Run(long id)
+    {
+        lock (_gate)
+        {
+            return Copy(Runs.Single(r => r.Id == id));
+        }
+    }
+
+    /// <summary>Snapshot of every run, for assertions.</summary>
+    public IReadOnlyList<JobRun> AllRuns()
+    {
+        lock (_gate)
+        {
+            return Runs.Select(Copy).ToList();
+        }
+    }
+
+    /// <summary>Snapshot of one job by name, for assertions.</summary>
+    public Job JobRow(string name)
+    {
+        lock (_gate)
+        {
+            return Copy(Jobs.Single(j => j.Name == name));
+        }
+    }
+
     private static Job Copy(Job j) => new()
     {
         Name = j.Name,

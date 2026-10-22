@@ -5,8 +5,10 @@ demand, as a short-lived container on the fleet. The first job is the WMSFO
 prod to dev mirror; wisper and file-manager get the same treatment. This
 document is the contract for the build tasks at the end.
 
-Status: part 1 built (sections 2, 4 and 5: job model, store, management API,
-`ops:jobs` events). The executor (section 3) is not built yet.
+Status: built. The gateway side is complete: the job model, store, management
+API and `ops:jobs` events (sections 2, 4, 5) and the executor with its metrics and
+failure handling (sections 3, 8, 9). The dashboard (section 6) and the runner image
+(section 7) live in their own repositories.
 
 ## 1. What a job is
 
@@ -113,9 +115,11 @@ evaluated it, the same in-process answer `GET /internal/leader` reads):
   next tick on the same instance re-attaches by label and finishes the
   bookkeeping. If the instance is gone, the leader marks the run `lost`.
 
-The container runtime interface grows one method,
-`RunJobContainerAsync(JobContainerSpec, timeout, cancel) -> JobRunResult`,
-and the fake runtime in the tests grows a matching scripted implementation.
+The container runtime interface grows
+`RunJobContainerAsync(JobContainerSpec, timeout, cancel) -> JobRunResult`, plus
+`FindJobContainerAsync(runId)` and `WaitJobContainerAsync(container, timeout,
+cancel)` for the re-attach, and the fake runtime in the tests grows a matching
+scripted implementation.
 
 Runner images are pulled through the same registry login the services use.
 The image reference is per job so a job may bring its own image; the default
