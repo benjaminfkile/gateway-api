@@ -70,4 +70,59 @@ public interface IJobStore
     /// unchanged.
     /// </summary>
     Task<JobRun?> CancelRunAsync(long id, DateTimeOffset now, CancellationToken ct = default);
+
+    // ---------- executor (docs/jobs.md section 3) ----------
+
+    /// <summary>
+    /// Enabled jobs whose <c>next_run_at</c> is at or before <paramref name="now"/>,
+    /// earliest first. The leader's claim of due scheduled runs starts here.
+    /// </summary>
+    Task<IReadOnlyList<Job>> ListDueAsync(DateTimeOffset now, CancellationToken ct = default);
+
+    /// <summary>
+    /// Claim one due scheduled run, atomically: advance the job's <c>next_run_at</c>
+    /// from <paramref name="dueAt"/> to <paramref name="nextRunAt"/> only while it
+    /// still equals <paramref name="dueAt"/> and the job is enabled, and insert
+    /// <paramref name="run"/> in the same transaction unless the job already has a
+    /// queued or running run. Returns the inserted run, or null when another
+    /// scheduler claimed it first or a run is active (nothing changes then).
+    /// </summary>
+    Task<JobRun?> TryClaimScheduledRunAsync(
+        string job, DateTimeOffset dueAt, DateTimeOffset? nextRunAt, JobRun run, CancellationToken ct = default);
+
+    /// <summary>Every run in <paramref name="status"/>, oldest (lowest id) first.</summary>
+    Task<IReadOnlyList<JobRun>> ListRunsByStatusAsync(string status, CancellationToken ct = default);
+
+    /// <summary>
+    /// Claim a queued run for <paramref name="instanceId"/> with one conditional
+    /// update (<c>queued</c> to <c>running</c>, <c>instance_id</c>, <c>started_at</c>).
+    /// True only for the caller that won; a second claimer, or a run cancelled in the
+    /// meantime, gets false.
+    /// </summary>
+    Task<bool> TryClaimQueuedRunAsync(long id, string instanceId, DateTimeOffset now, CancellationToken ct = default);
+
+    /// <summary>Record the image digest a run pulled.</summary>
+    Task SetRunImageDigestAsync(long id, string digest, CancellationToken ct = default);
+
+    /// <summary>
+    /// Finalise a run its own instance drove: set <paramref name="status"/>, exit
+    /// code, detail and <c>finished_at</c>, conditional on the run still belonging to
+    /// <paramref name="instanceId"/> and being <c>running</c> or <c>lost</c> (a real
+    /// outcome replaces a leader's lost guess). True when the row changed.
+    /// </summary>
+    Task<bool> FinishRunAsync(
+        long id,
+        string instanceId,
+        string status,
+        int? exitCode,
+        string? detail,
+        DateTimeOffset finishedAt,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Mark a running run <c>lost</c> with a detail line, conditional on it still
+    /// being <c>running</c> on <paramref name="instanceId"/>. True when the row changed.
+    /// </summary>
+    Task<bool> MarkRunLostAsync(
+        long id, string instanceId, DateTimeOffset now, string detail, CancellationToken ct = default);
 }

@@ -18,7 +18,9 @@ public interface IContainerRuntime
     /// <summary>
     /// List the containers this gateway manages (marked with the
     /// <c>gateway.managed</c> label). Containers the gateway did not create are
-    /// never returned and never touched.
+    /// never returned and never touched, and neither is any container carrying the
+    /// <see cref="ContainerLabels.Job"/> label: job-run containers belong to the job
+    /// scheduler, not the reconciler's inventory or orphan handling.
     /// </summary>
     Task<IReadOnlyList<ContainerInfo>> ListManagedContainersAsync(CancellationToken ct = default);
 
@@ -87,4 +89,38 @@ public interface IContainerRuntime
         TimeSpan minimumAge,
         int keepPerRepository,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Run one job-run container to completion (docs/jobs.md section 3). Creates the
+    /// container from <paramref name="spec"/> with no exposed or published port, no
+    /// restart policy, <c>HostConfig.Memory</c> set to the limit and only the given
+    /// labels (never <see cref="ContainerLabels.Managed"/>), starts it and waits for
+    /// it to exit. When <paramref name="timeout"/> elapses or <paramref name="cancel"/>
+    /// fires the container is killed and the result says which. The last
+    /// <see cref="JobRunResult.TailLines"/> lines of output are read through the
+    /// container logs API, and the container is removed in a finally.
+    /// <para>
+    /// <paramref name="cancel"/> is the run's cancel signal, not a shutdown signal: a
+    /// gateway that stops mid-run leaves the container running, and the next process
+    /// re-attaches with <see cref="FindJobContainerAsync"/> and
+    /// <see cref="WaitJobContainerAsync"/>.
+    /// </para>
+    /// </summary>
+    Task<JobRunResult> RunJobContainerAsync(JobContainerSpec spec, TimeSpan timeout, CancellationToken cancel);
+
+    /// <summary>
+    /// Find the job-run container for <paramref name="runId"/> by its
+    /// <see cref="ContainerLabels.JobRun"/> label, in any state, or null when none
+    /// exists. Used by a restarted gateway to resume waiting on a run it owns.
+    /// </summary>
+    Task<JobContainerInfo?> FindJobContainerAsync(long runId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Wait on an existing job-run container (found with
+    /// <see cref="FindJobContainerAsync"/>) exactly as <see cref="RunJobContainerAsync"/>
+    /// waits on one it started: kill on timeout or cancel, read the tail, remove the
+    /// container in a finally. A container that already exited returns its real exit
+    /// code at once.
+    /// </summary>
+    Task<JobRunResult> WaitJobContainerAsync(JobContainerInfo container, TimeSpan timeout, CancellationToken cancel);
 }

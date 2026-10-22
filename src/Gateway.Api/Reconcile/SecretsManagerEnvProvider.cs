@@ -28,7 +28,7 @@ namespace Gateway.Api.Reconcile;
 /// failed fetch is never cached. Secret values never appear in logs or error messages.
 /// </para>
 /// </summary>
-public sealed class SecretsManagerEnvProvider : IServiceEnvProvider
+public sealed class SecretsManagerEnvProvider : IServiceEnvProvider, ISecretEnvProvider
 {
     private static readonly IReadOnlyDictionary<string, string> Empty =
         new Dictionary<string, string>(StringComparer.Ordinal);
@@ -55,10 +55,19 @@ public sealed class SecretsManagerEnvProvider : IServiceEnvProvider
     {
     }
 
+    public Task<IReadOnlyDictionary<string, string>> GetEnvAsync(
+        ServiceManifest manifest, CancellationToken ct = default) =>
+        GetEnvAsync(manifest.EnvSecretRef, ct);
+
+    /// <summary>
+    /// Resolve the env held by <paramref name="envSecretRef"/>. The manifest overload
+    /// delegates here, and the job scheduler calls it directly with a job's ref, so
+    /// services and jobs share the cache below.
+    /// </summary>
     public async Task<IReadOnlyDictionary<string, string>> GetEnvAsync(
-        ServiceManifest manifest, CancellationToken ct = default)
+        string? envSecretRef, CancellationToken ct = default)
     {
-        var reference = manifest.EnvSecretRef;
+        var reference = envSecretRef;
         if (string.IsNullOrWhiteSpace(reference))
         {
             // No secret configured → empty env (the exact prior no-op behaviour). The

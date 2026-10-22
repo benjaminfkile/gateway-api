@@ -60,15 +60,7 @@ public static class LogConfigFactory
         // GATEWAY_LOG_DRIVER=json-file or Reconciler:LogDriver:Driver=json-file.
         if (IsJsonFile(configured.Driver))
         {
-            return new LogDriverConfig
-            {
-                Driver = JsonFileDriver,
-                Options =
-                {
-                    ["max-size"] = "10m",
-                    ["max-file"] = "3",
-                },
-            };
+            return JsonFile();
         }
 
         // awslogs → CloudWatch group /gateway/services/{service}, stream = instance id.
@@ -91,6 +83,51 @@ public static class LogConfigFactory
 
         return new LogDriverConfig { Driver = AwsLogsDriver, Options = options };
     }
+
+    /// <summary>
+    /// Build the log config for one job-run container (docs/jobs.md section 3):
+    /// awslogs group <c>/gateway/jobs/{job}</c> (<see cref="CloudWatchLogStore.JobLogGroupFor"/>)
+    /// and stream <c>run-{runId}</c> (<see cref="CloudWatchLogStore.JobRunStreamFor"/>),
+    /// the names the run log endpoint reads back. The json-file escape hatch applies
+    /// exactly as for services, and retention is set separately through
+    /// <see cref="ILogGroupAdmin"/> the first time a job's group is used.
+    /// </summary>
+    public static LogDriverConfig ForJob(
+        string job,
+        long runId,
+        string? instanceRegion,
+        LogDriverConfig configured)
+    {
+        if (IsJsonFile(configured.Driver))
+        {
+            return JsonFile();
+        }
+
+        var options = new Dictionary<string, string>(configured.Options, StringComparer.Ordinal)
+        {
+            ["awslogs-group"] = CloudWatchLogStore.JobLogGroupFor(job),
+            ["awslogs-stream"] = CloudWatchLogStore.JobRunStreamFor(runId),
+            ["awslogs-create-group"] = "true",
+        };
+
+        var region = ResolveRegion(instanceRegion);
+        if (!string.IsNullOrEmpty(region))
+        {
+            options["awslogs-region"] = region;
+        }
+
+        return new LogDriverConfig { Driver = AwsLogsDriver, Options = options };
+    }
+
+    private static LogDriverConfig JsonFile() => new()
+    {
+        Driver = JsonFileDriver,
+        Options =
+        {
+            ["max-size"] = "10m",
+            ["max-file"] = "3",
+        },
+    };
 
     /// <summary>
     /// Resolve the awslogs region: <c>AWS_REGION</c> → <c>AWS_DEFAULT_REGION</c> →

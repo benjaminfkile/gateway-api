@@ -3,6 +3,7 @@ using Gateway.Api.Bootstrap;
 using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Instances;
+using Gateway.Api.Jobs;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
@@ -39,6 +40,10 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
 
     // Scheduled jobs (docs/jobs.md): job rows, script history, and the run ledger.
     builder.Services.AddScoped<IJobStore, EfJobStore>();
+
+    // Job executor (docs/jobs.md section 3): claims and drives runs from that ledger.
+    // Only with a database; it shares the reconciler's runtime and leader status.
+    builder.Services.AddJobScheduler(builder.Configuration);
 
     // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
     // instance's status row via the EF store, and leadership — which gates the

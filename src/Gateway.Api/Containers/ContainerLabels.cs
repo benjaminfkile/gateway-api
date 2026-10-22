@@ -27,4 +27,14 @@ public static class ContainerLabels
     /// fallback for pre-existing fixed-port containers until they are replaced.
     /// </summary>
     public const string HostPort = "gateway.host-port";
+
+    /// <summary>
+    /// The job a job-run container belongs to (docs/jobs.md section 3). A container
+    /// carrying this label is never a service: it has no <see cref="Managed"/> label,
+    /// and the reconciler's inventory and orphan handling skip it even if it had one.
+    /// </summary>
+    public const string Job = "gateway.job";
+
+    /// <summary>The job run id a job-run container executes, used to re-attach after a restart.</summary>
+    public const string JobRun = "gateway.job-run";
 }

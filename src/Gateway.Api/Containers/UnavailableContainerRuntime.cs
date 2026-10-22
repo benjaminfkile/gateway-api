@@ -36,4 +36,13 @@ public sealed class UnavailableContainerRuntime : IContainerRuntime
         int keepPerRepository,
         CancellationToken ct = default) =>
         throw Unavailable();
+
+    public Task<JobRunResult> RunJobContainerAsync(JobContainerSpec spec, TimeSpan timeout, CancellationToken cancel) =>
+        throw Unavailable();
+
+    public Task<JobContainerInfo?> FindJobContainerAsync(long runId, CancellationToken ct = default) =>
+        throw Unavailable();
+
+    public Task<JobRunResult> WaitJobContainerAsync(JobContainerInfo container, TimeSpan timeout, CancellationToken cancel) =>
+        throw Unavailable();
 }

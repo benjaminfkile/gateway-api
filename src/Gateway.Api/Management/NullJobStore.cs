@@ -44,4 +44,33 @@ public sealed class NullJobStore : IJobStore
 
     public Task<JobRun?> CancelRunAsync(long id, DateTimeOffset now, CancellationToken ct = default) =>
         Task.FromResult<JobRun?>(null);
+
+    public Task<IReadOnlyList<Job>> ListDueAsync(DateTimeOffset now, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Job>>(Array.Empty<Job>());
+
+    public Task<JobRun?> TryClaimScheduledRunAsync(
+        string job, DateTimeOffset dueAt, DateTimeOffset? nextRunAt, JobRun run, CancellationToken ct = default) =>
+        Task.FromResult<JobRun?>(null);
+
+    public Task<IReadOnlyList<JobRun>> ListRunsByStatusAsync(string status, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<JobRun>>(Array.Empty<JobRun>());
+
+    public Task<bool> TryClaimQueuedRunAsync(long id, string instanceId, DateTimeOffset now, CancellationToken ct = default) =>
+        Task.FromResult(false);
+
+    public Task SetRunImageDigestAsync(long id, string digest, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<bool> FinishRunAsync(
+        long id,
+        string instanceId,
+        string status,
+        int? exitCode,
+        string? detail,
+        DateTimeOffset finishedAt,
+        CancellationToken ct = default) =>
+        Task.FromResult(false);
+
+    public Task<bool> MarkRunLostAsync(
+        long id, string instanceId, DateTimeOffset now, string detail, CancellationToken ct = default) =>
+        Task.FromResult(false);
 }

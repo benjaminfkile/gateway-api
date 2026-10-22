@@ -68,6 +68,12 @@ public sealed class CloudWatchAgentConfigStep : IBootstrapStep
             },
             ["logs"] = new JsonObject
             {
+                // The EMF listener (UDP and TCP on 127.0.0.1:25888) the job
+                // scheduler sends its run metrics to (docs/jobs.md section 8).
+                ["metrics_collected"] = new JsonObject
+                {
+                    ["emf"] = new JsonObject(),
+                },
                 ["logs_collected"] = new JsonObject
                 {
                     ["files"] = new JsonObject
