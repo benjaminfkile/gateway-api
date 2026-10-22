@@ -30,6 +30,18 @@ public sealed class CloudWatchLogStore : ILogStore
     /// </summary>
     public static string LogGroupFor(string service) => LogGroupPrefix + service;
 
+    /// <summary>Log-group prefix for scheduled jobs; the job name is appended (docs/jobs.md section 3).</summary>
+    public const string JobLogGroupPrefix = "/gateway/jobs/";
+
+    /// <summary>Log-stream prefix for a job run; the run id is appended.</summary>
+    public const string JobRunStreamPrefix = "run-";
+
+    /// <summary>The log group a job's runs write to: <c>/gateway/jobs/{job}</c>.</summary>
+    public static string JobLogGroupFor(string job) => JobLogGroupPrefix + job;
+
+    /// <summary>The log stream of one job run: <c>run-{id}</c>.</summary>
+    public static string JobRunStreamFor(long runId) => JobRunStreamPrefix + runId;
+
     public async Task<IReadOnlyList<LogLine>> GetLogsAsync(
         string service,
         string? instance,
@@ -41,19 +53,7 @@ public sealed class CloudWatchLogStore : ILogStore
         if (!string.IsNullOrEmpty(instance))
         {
             // A specific instance's stream: get the most recent `tail` events.
-            var response = await _logs.GetLogEventsAsync(new GetLogEventsRequest
-            {
-                LogGroupName = group,
-                LogStreamName = instance,
-                Limit = tail,
-                StartFromHead = false,
-            }, ct);
-
-            return (response.Events ?? new List<OutputLogEvent>())
-                .Select(e => new LogLine(
-                    new DateTimeOffset(DateTime.SpecifyKind(e.Timestamp, DateTimeKind.Utc)),
-                    e.Message))
-                .ToList();
+            return await GetStreamLogsAsync(group, instance, tail, ct);
         }
 
         // No instance: pull the most recent `tail` events across every stream.
@@ -66,6 +66,27 @@ public sealed class CloudWatchLogStore : ILogStore
         return (filtered.Events ?? new List<FilteredLogEvent>())
             .Select(e => new LogLine(DateTimeOffset.FromUnixTimeMilliseconds(e.Timestamp), e.Message))
             .OrderBy(l => l.Ts)
+            .ToList();
+    }
+
+    public async Task<IReadOnlyList<LogLine>> GetStreamLogsAsync(
+        string group,
+        string stream,
+        int tail,
+        CancellationToken ct = default)
+    {
+        var response = await _logs.GetLogEventsAsync(new GetLogEventsRequest
+        {
+            LogGroupName = group,
+            LogStreamName = stream,
+            Limit = tail,
+            StartFromHead = false,
+        }, ct);
+
+        return (response.Events ?? new List<OutputLogEvent>())
+            .Select(e => new LogLine(
+                new DateTimeOffset(DateTime.SpecifyKind(e.Timestamp, DateTimeKind.Utc)),
+                e.Message))
             .ToList();
     }
 }

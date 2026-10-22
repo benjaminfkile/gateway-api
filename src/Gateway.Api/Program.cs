@@ -37,6 +37,9 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     // Management API's audit/rollout ledger, EF-backed only when a database exists.
     builder.Services.AddScoped<IDeployStore, EfDeployStore>();
 
+    // Scheduled jobs (docs/jobs.md): job rows, script history, and the run ledger.
+    builder.Services.AddScoped<IJobStore, EfJobStore>();
+
     // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
     // instance's status row via the EF store, and leadership — which gates the
     // stale-row cleanup — is derived from those same heartbeats (no lock, no lease).
@@ -317,6 +320,9 @@ app.MapManagementPlane();
 // lifecycle, deploy/rollback). Each requires a Cognito access token and audit-logs
 // mutating calls; all state is read from the DB, never local Docker.
 app.MapManagementApi();
+
+// Scheduled jobs under /mgmt/jobs (docs/jobs.md section 4), beside the service endpoints.
+app.MapJobEndpoints();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.

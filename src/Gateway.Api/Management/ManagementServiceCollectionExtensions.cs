@@ -8,7 +8,7 @@ namespace Gateway.Api.Management;
 /// <summary>
 /// Registration for the Management API's external-system seams (tech-spec §4.5):
 /// the image registry (digest resolution), the centralized log store, and the
-/// deploy-history store. Every external system is behind an interface so the
+/// deploy-history and job stores. Every external system is behind an interface so the
 /// build/test box — no AWS, no Postgres — substitutes fakes.
 /// <para>
 /// The AWS-backed implementations are registered with lazy factories so a gateway
@@ -25,6 +25,14 @@ public static class ManagementServiceCollectionExtensions
         // Deploy history: no-op unless Program wires the EF-backed store for a
         // configured database. Scoped to match the EF store's lifetime.
         services.TryAddScoped<IDeployStore, NullDeployStore>();
+
+        // Scheduled jobs (docs/jobs.md): the same no-op default until Program wires
+        // the EF-backed store for a configured database.
+        services.TryAddScoped<IJobStore, NullJobStore>();
+
+        // Clock for next_run_at and run timestamps. Keyed so a test can fix the job
+        // clock without moving the clock the rest of the host (token lifetime) reads.
+        services.TryAddKeyedSingleton(JobEndpoints.ClockKey, TimeProvider.System);
 
         // Image registry (ECR) — lazy so a region-less box boots; only constructed
         // when a deploy resolves a digest.

@@ -28,4 +28,16 @@ public interface ILogStore
         string? instance,
         int tail,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Fetch up to <paramref name="tail"/> of the most recent lines from one explicit
+    /// <paramref name="group"/> and <paramref name="stream"/>, oldest-first. Used for
+    /// job run logs, which live in <c>/gateway/jobs/{job}</c> with one stream per run
+    /// (docs/jobs.md section 4).
+    /// </summary>
+    Task<IReadOnlyList<LogLine>> GetStreamLogsAsync(
+        string group,
+        string stream,
+        int tail,
+        CancellationToken ct = default);
 }

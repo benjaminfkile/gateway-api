@@ -139,6 +139,183 @@ namespace Gateway.Api.Data.Migrations
                     b.ToTable("instance_status", (string)null);
                 });
 
+            modelBuilder.Entity("Gateway.Api.Data.Job", b =>
+                {
+                    b.Property<string>("Name")
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean")
+                        .HasColumnName("enabled");
+
+                    b.Property<string>("EnvSecretRef")
+                        .HasColumnType("text")
+                        .HasColumnName("env_secret_ref");
+
+                    b.Property<string>("Image")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("image");
+
+                    b.Property<DateTimeOffset?>("NextRunAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("next_run_at");
+
+                    b.Property<string>("Schedule")
+                        .HasColumnType("text")
+                        .HasColumnName("schedule");
+
+                    b.Property<string>("Script")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("script");
+
+                    b.Property<int>("ScriptVersion")
+                        .HasColumnType("integer")
+                        .HasColumnName("script_version");
+
+                    b.Property<string>("Tag")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("tag");
+
+                    b.Property<string>("TimeZone")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("time_zone");
+
+                    b.Property<int>("TimeoutSeconds")
+                        .HasColumnType("integer")
+                        .HasColumnName("timeout_seconds");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Name");
+
+                    b.ToTable("job", (string)null);
+                });
+
+            modelBuilder.Entity("Gateway.Api.Data.JobRun", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Actor")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("actor");
+
+                    b.Property<DateTimeOffset?>("CancelRequestedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("cancel_requested_at");
+
+                    b.Property<string>("Detail")
+                        .HasColumnType("text")
+                        .HasColumnName("detail");
+
+                    b.Property<int?>("ExitCode")
+                        .HasColumnType("integer")
+                        .HasColumnName("exit_code");
+
+                    b.Property<DateTimeOffset?>("FinishedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("finished_at");
+
+                    b.Property<string>("ImageDigest")
+                        .HasColumnType("text")
+                        .HasColumnName("image_digest");
+
+                    b.Property<string>("InstanceId")
+                        .HasColumnType("text")
+                        .HasColumnName("instance_id");
+
+                    b.Property<string>("Job")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("job");
+
+                    b.Property<DateTimeOffset>("QueuedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("queued_at");
+
+                    b.Property<int>("ScriptVersion")
+                        .HasColumnType("integer")
+                        .HasColumnName("script_version");
+
+                    b.Property<DateTimeOffset?>("StartedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("started_at");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.Property<string>("Trigger")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("trigger");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Job")
+                        .IsUnique()
+                        .HasDatabaseName("ux_job_run_active")
+                        .HasFilter("status IN ('queued', 'running')");
+
+                    b.HasIndex("Status");
+
+                    b.HasIndex("Job", "Id");
+
+                    b.ToTable("job_run", (string)null);
+                });
+
+            modelBuilder.Entity("Gateway.Api.Data.JobScriptVersion", b =>
+                {
+                    b.Property<string>("Job")
+                        .HasColumnType("text")
+                        .HasColumnName("job");
+
+                    b.Property<int>("Version")
+                        .HasColumnType("integer")
+                        .HasColumnName("version");
+
+                    b.Property<string>("Script")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("script");
+
+                    b.Property<string>("Sha256")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("sha256");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Job", "Version");
+
+                    b.ToTable("job_script_version", (string)null);
+                });
+
             modelBuilder.Entity("Gateway.Api.Data.ServiceManifest", b =>
                 {
                     b.Property<string>("Name")

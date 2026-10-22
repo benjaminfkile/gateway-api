@@ -5,7 +5,8 @@ demand, as a short-lived container on the fleet. The first job is the WMSFO
 prod to dev mirror; wisper and file-manager get the same treatment. This
 document is the contract for the build tasks at the end.
 
-Status: design, 2026-10-22. Nothing in it is built.
+Status: part 1 built (sections 2, 4 and 5: job model, store, management API,
+`ops:jobs` events). The executor (section 3) is not built yet.
 
 ## 1. What a job is
 
