@@ -9,7 +9,7 @@ namespace Gateway.Api.Auth;
 /// Registration for the management-plane authentication and authorization
 /// (tech-spec §5). Wires the Cognito JWT bearer scheme and the ops authorization
 /// policies (<see cref="ManagementAuth.OpsAdminPolicy"/>,
-/// <see cref="ManagementAuth.OpsDeployPolicy"/>) plus the real
+/// <see cref="ManagementAuth.OpsDeployPolicy"/>, <see cref="ManagementAuth.OpsJobsPolicy"/>) plus the real
 /// <see cref="GatewayHub.OpsChannelPolicy"/> requirement for the dashboard's
 /// <c>ops:*</c> hub channels.
 /// <para>
@@ -112,6 +112,10 @@ public static class ManagementAuthServiceCollectionExtensions
             authz.AddPolicy(ManagementAuth.OpsDeployPolicy, policy => policy
                 .RequireAuthenticatedUser()
                 .RequireAssertion(ctx => ManagementAuth.CanDeploy(ctx.User)));
+
+            authz.AddPolicy(ManagementAuth.OpsJobsPolicy, policy => policy
+                .RequireAuthenticatedUser()
+                .RequireAssertion(ctx => ManagementAuth.CanManageJobs(ctx.User)));
 
             // The dashboard's ops:* hub channels: authenticate the gateway's own
             // client and require a human ops group (§4.2). This replaces the

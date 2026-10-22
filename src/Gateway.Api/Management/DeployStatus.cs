@@ -36,3 +36,25 @@ public static class DeployInstanceState
     public const string Converged = "converged";
     public const string Failed = "failed";
 }
+
+/// <summary>Well-known <c>job_run.status</c> values (docs/jobs.md section 2).</summary>
+public static class JobRunStatus
+{
+    public const string Queued = "queued";
+    public const string Running = "running";
+    public const string Succeeded = "succeeded";
+    public const string Failed = "failed";
+    public const string TimedOut = "timed_out";
+    public const string Cancelled = "cancelled";
+    public const string Lost = "lost";
+
+    /// <summary>True while a run holds the job's single run slot (queued or running).</summary>
+    public static bool IsActive(string status) => status is Queued or Running;
+}
+
+/// <summary>Well-known <c>job_run.trigger</c> values (docs/jobs.md section 2).</summary>
+public static class JobRunTrigger
+{
+    public const string Schedule = "schedule";
+    public const string Manual = "manual";
+}

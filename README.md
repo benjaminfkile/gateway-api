@@ -231,6 +231,57 @@ loops on `No such image` is visible through the API instead of hiding in journal
 Older rows written before these fields existed parse unchanged (the fields default
 to `null`).
 
+## Scheduled jobs
+
+A job is a named script with an optional five-field cron schedule, evaluated in
+the job's IANA time zone. When it is due, or when an operator presses run, the
+fleet runs the script once as a short-lived container from a runner image and
+records the result as a run. One run at a time per job; a run has a timeout. The
+design is [`docs/jobs.md`](docs/jobs.md). Part 1 (this build) is the job model,
+the store, the management API and the `ops:jobs` events; the executor is part 2,
+so until it lands a queued run stays queued.
+
+State lives in three tables (tech-spec §4.4): `job` (the current script, schedule,
+image, timeout, `next_run_at`), `job_script_version` (every script body with its
+sha256) and `job_run` (the run ledger, kept after a job is deleted).
+`next_run_at` is recomputed with Cronos on every upsert, enable and disable, and
+is null when the job is disabled or has no schedule.
+
+| Endpoint | Policy | Action |
+|---|---|---|
+| `GET /mgmt/jobs` | OpsDeploy | Every job with schedule, next run, last run, enabled, script version. Never the script body |
+| `GET /mgmt/jobs/{name}` | OpsDeploy | One job including its script |
+| `PUT /mgmt/jobs/{name}` | OpsJobs | Create (`201`, needs `timeZone` and `script`) or update (`200`). Body `{ schedule?, timeZone?, script?, image?, tag?, envSecretRef?, timeoutSeconds?, enabled? }`; an absent field preserves, an empty string clears `schedule` and `envSecretRef`. A changed script bumps `scriptVersion` and adds a history row. `400 { error, field }` on a bad name, cron, zone, timeout (30..21600, default 3600), script (non-empty, at most 256 KiB) or empty image/tag |
+| `DELETE /mgmt/jobs/{name}` | OpsJobs | `204`. `409 { error: "run_active" }` while a run is queued or running unless `?force=true`, which cancels it first. Run history stays |
+| `POST /mgmt/jobs/{name}/run` | OpsJobs | Queue a manual run: `202 { runId }`, `409 { error: "run_active" }` when one is active. Allowed on a disabled job |
+| `POST /mgmt/jobs/{name}/enable` and `/disable` | OpsJobs | Flip `enabled`, recompute `next_run_at` |
+| `GET /mgmt/jobs/{name}/runs?limit=50&before={id}` | OpsDeploy | Runs newest first |
+| `GET /mgmt/jobs/{name}/runs/{id}` | OpsDeploy | One run |
+| `POST /mgmt/jobs/{name}/runs/{id}/cancel` | OpsJobs | `202`: a queued run becomes `cancelled` at once, a running run gets `cancelRequestedAt` and is killed by its instance. `409` when already finished |
+| `GET /mgmt/jobs/{name}/runs/{id}/log?tail=500` | OpsAdmin | `[{ ts, message }]` from log group `/gateway/jobs/{name}`, stream `run-{id}` |
+| `GET /mgmt/jobs/{name}/script/versions` | OpsDeploy | `[{ version, sha256, updatedBy, updatedAt }]`, newest first |
+| `GET /mgmt/jobs/{name}/script/versions/{v}` | OpsDeploy | `{ version, script }` |
+
+**OpsJobs policy:** a member of `ops-admin`, or a client-credentials token
+carrying the scope `mgmt/jobs`. A job script runs with the instance role, so
+`ops-deploy` and the CI `mgmt/deploy` scope do not qualify; a repository whose CI
+should push its script uses a separate client an operator creates with
+`mgmt/jobs`. Every mutation records the caller in `updated_by` or the run's
+`actor`.
+
+**Defaults:** `Jobs:DefaultImage` (default `gateway-job-runner`, a placeholder to
+point at the runner repository in your registry) and `Jobs:DefaultTag` (default
+`latest`) fill in `image` and `tag` when a create omits them.
+
+**Logs:** a run writes to CloudWatch log group `/gateway/jobs/{name}`, stream
+`run-{id}`, read through the same log store as service logs.
+
+**Real-time:** the `ops:jobs` hub channel (same gate as `ops:deploys`) carries
+`job` `{ name, action, by }` on upsert, delete, enable and disable, and `run`
+`{ runId, job, status, trigger, actor, instanceId, startedAt, finishedAt,
+exitCode }` on every run status change. Publishing is best-effort: a backplane
+failure never fails the request.
+
 ## Internal listener (containers only)
 
 A second Kestrel endpoint bound from `GATEWAY_INTERNAL_BIND` (default `0.0.0.0:8080`)

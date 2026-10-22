@@ -398,6 +398,18 @@ prefix returns `403`. Common `403` causes:
 published through `/internal/publish` — any such request is `403` regardless of
 the token presented.
 
+The gateway's own `ops:*` channels, for reference (all joined only by an ops
+operator through the dashboard's Cognito token):
+
+| Channel | Events |
+|---|---|
+| `ops:deploys` | `deploy`, `deployInstance`: deploy and rollback progress |
+| `ops:fleet` | `heartbeat`, `serviceError`, `leaderChange`, `instances` |
+| `ops:jobs` | `job` `{ name, action: upserted \| deleted \| enabled \| disabled, by }` on every job change; `run` `{ runId, job, status, trigger, actor, instanceId, startedAt, finishedAt, exitCode }` on every run status change (see [`docs/jobs.md`](docs/jobs.md) section 5) |
+
+`ops:jobs` uses the same gate as `ops:deploys`. Like every event, these are hints:
+the dashboard refetches `/mgmt/jobs` on an event and keeps a polling floor.
+
 ### Publishes are dropped while the backplane is degraded
 
 The internal publish path is **best-effort**. If the gateway's backplane is

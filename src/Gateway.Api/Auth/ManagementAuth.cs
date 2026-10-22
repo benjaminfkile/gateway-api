@@ -22,6 +22,12 @@ public static class ManagementAuth
     /// <summary>Deploy/rollback role, also satisfied by the CI <c>mgmt/deploy</c> scope.</summary>
     public const string OpsDeployPolicy = "OpsDeploy";
 
+    /// <summary>
+    /// Scheduled-job mutations (upsert, delete, run, cancel, enable, disable):
+    /// <c>ops-admin</c>, or a client-credentials token bearing the <c>mgmt/jobs</c> scope.
+    /// </summary>
+    public const string OpsJobsPolicy = "OpsJobs";
+
     /// <summary>Claim type carrying Cognito group membership.</summary>
     public const string GroupsClaim = "cognito:groups";
 
@@ -42,6 +48,12 @@ public static class ManagementAuth
 
     /// <summary>Resource-server scope granting the CI machine token deploy rights.</summary>
     public const string DeployScope = "mgmt/deploy";
+
+    /// <summary>
+    /// Resource-server scope granting a dedicated machine client job management. The
+    /// CI deploy client does not carry it; an operator creates a separate client.
+    /// </summary>
+    public const string JobsScope = "mgmt/jobs";
 
     /// <summary>
     /// The identity stamped into audit records for a mutating call (tech-spec §4.5,
@@ -85,6 +97,14 @@ public static class ManagementAuth
     /// </summary>
     public static bool CanDeploy(ClaimsPrincipal user) =>
         IsOpsAdmin(user) || IsInGroup(user, OpsDeployGroup) || HasScope(user, DeployScope);
+
+    /// <summary>
+    /// Satisfies <see cref="OpsJobsPolicy"/>: an <c>ops-admin</c> human, or a
+    /// client-credentials token bearing the <c>mgmt/jobs</c> scope. A job script runs
+    /// with the instance role, so <c>ops-deploy</c> and the CI deploy scope do not qualify.
+    /// </summary>
+    public static bool CanManageJobs(ClaimsPrincipal user) =>
+        IsOpsAdmin(user) || HasScope(user, JobsScope);
 
     /// <summary>
     /// Whether <paramref name="user"/> may connect to the dashboard's <c>ops:*</c>

@@ -227,6 +227,43 @@ instance_status (
 -- per-instance rollout progress for a deploy ("17/20 converged")
 deploy_instance_status (deploy_id, instance_id, status, detail, updated_at,
                         primary key (deploy_id, instance_id))
+
+-- scheduled jobs (docs/jobs.md section 2)
+job (
+  name              text primary key,       -- ^[a-z0-9][a-z0-9-]{1,62}$
+  schedule          text,                   -- 5-field cron, null = manual only
+  time_zone         text not null,          -- IANA id
+  script            text not null,          -- current script body, <= 256 KiB
+  script_version    int  not null,          -- bumps when the body changes
+  image             text not null,          -- runner repository
+  tag               text not null,
+  env_secret_ref    text,                   -- secrets-store reference, flat JSON of strings
+  timeout_seconds   int  not null,          -- 30..21600, default 3600
+  enabled           boolean not null,
+  next_run_at       timestamptz,            -- null when disabled or schedule null
+  updated_by        text not null,
+  updated_at        timestamptz not null
+)
+job_script_version (job, version, script, sha256, updated_by, updated_at,
+                    primary key (job, version))
+job_run (
+  id                bigint generated always as identity primary key,
+  job               text not null,          -- not a foreign key: history outlives a deleted job
+  trigger           text not null,          -- 'schedule' | 'manual'
+  actor             text not null,          -- Cognito username, client id, or 'schedule'
+  status            text not null,          -- queued | running | succeeded | failed | timed_out | cancelled | lost
+  instance_id       text,
+  image_digest      text,
+  script_version    int not null,
+  exit_code         int,
+  queued_at         timestamptz not null,
+  started_at        timestamptz,
+  finished_at       timestamptz,
+  cancel_requested_at timestamptz,
+  detail            text                    -- <= 2 KiB
+)
+-- at most one queued or running run per job
+create unique index ux_job_run_active on job_run (job) where status in ('queued', 'running')
 ```
 
 Leadership needs no table of its own: it is derived from `instance_status`
@@ -259,6 +296,15 @@ balancer routes the dashboard's request to.
 | `DELETE /mgmt/services/{name}` | Remove a service from the manifest; the reconciler stops/removes the now-orphaned container next loop. `?force=true` required for a health-check dependency (mirrors stop) |
 | `GET  /mgmt/services/{name}/logs?instance={id}&tail=500` | Logs from the centralized log store — works for any instance regardless of which one serves the request, and survives instance replacement |
 | `GET  /mgmt/deploys` · `GET /mgmt/deploys/{id}` | History + live per-instance rollout progress (`deploy_instance_status`) |
+| `GET  /mgmt/jobs` · `GET /mgmt/jobs/{name}` | Jobs with schedule, next run, last run (OpsDeploy); the list never carries the script, the single job does (docs/jobs.md section 4) |
+| `PUT  /mgmt/jobs/{name}` | Create (`201`) or update a job (OpsJobs). Absent field preserves, empty string clears `schedule`/`envSecretRef`; a changed script bumps `script_version` and writes `job_script_version`; `400 { error, field }` on validation |
+| `DELETE /mgmt/jobs/{name}` | Remove a job (OpsJobs), `204`; `409 run_active` while a run is queued or running unless `?force=true`, which cancels it first. Run history stays |
+| `POST /mgmt/jobs/{name}/run` | Queue a manual run (OpsJobs): `202 { runId }`, `409 run_active` when one is active; allowed on a disabled job |
+| `POST /mgmt/jobs/{name}/enable` · `/disable` | Flip `enabled` and recompute `next_run_at` (OpsJobs) |
+| `GET  /mgmt/jobs/{name}/runs?limit=50&before={id}` · `GET /mgmt/jobs/{name}/runs/{id}` | Run history newest first, one run (OpsDeploy) |
+| `POST /mgmt/jobs/{name}/runs/{id}/cancel` | `202`: queued becomes `cancelled` at once, running gets `cancel_requested_at`; `409` when finished (OpsJobs) |
+| `GET  /mgmt/jobs/{name}/runs/{id}/log?tail=500` | Run log from group `/gateway/jobs/{name}`, stream `run-{id}` (OpsAdmin) |
+| `GET  /mgmt/jobs/{name}/script/versions` · `/script/versions/{v}` | Script history `[{ version, sha256, updatedBy, updatedAt }]` and one body (OpsDeploy) |
 | `WS   /hub` (`ops` channel) | Live status pushes to the dashboard — Redis backplane means events from *any* instance reach the dashboard's single connection |
 
 Guardrails: `stop` (and `delete`) on a health-check dependency requires a
@@ -306,6 +352,7 @@ own load balancer changes nothing about its auth.
   - Password policy: 12+ chars; advanced security features ON (compromised-credential blocking).
   - App client: SPA client (no secret, PKCE) for the dashboard.
 - **Machine credential for CI:** separate app client using `client_credentials` grant against a resource server scope `mgmt/deploy` — CI gets deploy-only, no dashboard powers.
+- **Job management:** the `OpsJobs` policy (job upsert, delete, run, cancel, enable, disable) is satisfied by `ops-admin` or a `client_credentials` token with scope `mgmt/jobs`, a separate client an operator creates; `ops-deploy` and `mgmt/deploy` do not qualify (docs/jobs.md section 4).
 - **Gateway-side validation:** standard JWT bearer middleware against the pool's JWKS; requires `token_use=access`, the pool issuer, and — for human tokens — an MFA-performed check. Role claim via Cognito groups: `ops-admin` (full) vs `ops-deploy` (deploy/rollback only).
 - Session: access token 60 min, refresh 30 days, revocation enabled.
 

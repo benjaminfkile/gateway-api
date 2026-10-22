@@ -18,6 +18,9 @@ public class GatewayDbContext : DbContext
     public DbSet<DeployHistory> DeployHistory => Set<DeployHistory>();
     public DbSet<InstanceStatus> InstanceStatus => Set<InstanceStatus>();
     public DbSet<DeployInstanceStatus> DeployInstanceStatus => Set<DeployInstanceStatus>();
+    public DbSet<Job> Jobs => Set<Job>();
+    public DbSet<JobScriptVersion> JobScriptVersions => Set<JobScriptVersion>();
+    public DbSet<JobRun> JobRuns => Set<JobRun>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -86,6 +89,67 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.Status).HasColumnName("status").IsRequired();
             e.Property(x => x.Detail).HasColumnName("detail");
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        // Scheduled jobs (docs/jobs.md section 2).
+        modelBuilder.Entity<Job>(e =>
+        {
+            e.ToTable("job");
+            e.HasKey(x => x.Name);
+            e.Property(x => x.Name).HasColumnName("name");
+            e.Property(x => x.Schedule).HasColumnName("schedule");
+            e.Property(x => x.TimeZone).HasColumnName("time_zone").IsRequired();
+            e.Property(x => x.Script).HasColumnName("script").IsRequired();
+            e.Property(x => x.ScriptVersion).HasColumnName("script_version");
+            e.Property(x => x.Image).HasColumnName("image").IsRequired();
+            e.Property(x => x.Tag).HasColumnName("tag").IsRequired();
+            e.Property(x => x.EnvSecretRef).HasColumnName("env_secret_ref");
+            e.Property(x => x.TimeoutSeconds).HasColumnName("timeout_seconds");
+            e.Property(x => x.Enabled).HasColumnName("enabled");
+            e.Property(x => x.NextRunAt).HasColumnName("next_run_at");
+            e.Property(x => x.UpdatedBy).HasColumnName("updated_by").IsRequired();
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        modelBuilder.Entity<JobScriptVersion>(e =>
+        {
+            e.ToTable("job_script_version");
+            e.HasKey(x => new { x.Job, x.Version });
+            e.Property(x => x.Job).HasColumnName("job");
+            e.Property(x => x.Version).HasColumnName("version");
+            e.Property(x => x.Script).HasColumnName("script").IsRequired();
+            e.Property(x => x.Sha256).HasColumnName("sha256").IsRequired();
+            e.Property(x => x.UpdatedBy).HasColumnName("updated_by").IsRequired();
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        modelBuilder.Entity<JobRun>(e =>
+        {
+            e.ToTable("job_run");
+            e.HasKey(x => x.Id);
+            // job is deliberately not a foreign key: run history outlives a deleted job.
+            e.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
+            e.Property(x => x.Job).HasColumnName("job").IsRequired();
+            e.Property(x => x.Trigger).HasColumnName("trigger").IsRequired();
+            e.Property(x => x.Actor).HasColumnName("actor").IsRequired();
+            e.Property(x => x.Status).HasColumnName("status").IsRequired();
+            e.Property(x => x.InstanceId).HasColumnName("instance_id");
+            e.Property(x => x.ImageDigest).HasColumnName("image_digest");
+            e.Property(x => x.ScriptVersion).HasColumnName("script_version");
+            e.Property(x => x.ExitCode).HasColumnName("exit_code");
+            e.Property(x => x.QueuedAt).HasColumnName("queued_at");
+            e.Property(x => x.StartedAt).HasColumnName("started_at");
+            e.Property(x => x.FinishedAt).HasColumnName("finished_at");
+            e.Property(x => x.CancelRequestedAt).HasColumnName("cancel_requested_at");
+            e.Property(x => x.Detail).HasColumnName("detail");
+            e.HasIndex(x => new { x.Job, x.Id });
+            e.HasIndex(x => x.Status);
+            // One run at a time per job, enforced by the database so two concurrent
+            // enqueues (or a manual run racing a scheduled claim) cannot both land.
+            e.HasIndex(x => x.Job)
+                .IsUnique()
+                .HasFilter("status IN ('queued', 'running')")
+                .HasDatabaseName("ux_job_run_active");
         });
     }
 }
