@@ -193,6 +193,21 @@ advisory locks, no session state.
   downstream leader-gated duties must be **idempotent**; the recommended client pattern is
   poll every ~2s with a ~1s timeout, treat any failure or a result older than ~10s as
   follower, and never cache `leader=true` across silence.
+- **Job scheduler.** `JobSchedulerService` ticks every `Jobs:TickInterval` on every
+  instance; its leader duties (claim due and queued runs, mark runs on a silent
+  instance lost) run only while `ILeaderStatus` holds a fresh leader answer, and every
+  claim is a conditional update in the store (docs/jobs.md section 3).
+- **Load scheduler.** `LoadSchedulerService` reads the same `ILeaderStatus` and does
+  nothing on a follower. Every `Load:TickInterval` (10 s) the leader guards the
+  generator group (desired above 0 with no run non-terminal is set to 0 and audited as
+  `orphan_guard`), claims the queued load run, re-runs pre-flight, and drives the run
+  one step through `fleet_up`, `generators_up`, `ramping`, `holding` and `draining`
+  through `IFleetScaler`, writing the generator spec secret through `ISecretWriter`
+  and a fleet sample every `Load:FleetSampleInterval`. Every status change is one
+  conditional update on the run's status and timeline, so two leaders in one tick
+  cannot both act, and every exit sets the generator group to 0 first. A run without
+  a driver on a new leader is adopted when it is ramping or holding with fresh stats,
+  otherwise drained with reason `leader_restart` (docs/load.md section 3).
 
 ### 4.4 Desired-state manifest (PostgreSQL)
 Single source of truth, mutated only by the Management API, consumed by reconcilers.
@@ -300,6 +315,7 @@ load_run (
   restore_fleet         boolean not null,
   hard_stop_at          timestamptz not null,
   token_hash            text not null,            -- sha256 of the run token
+  spec_token            text,                     -- the run token until the leader writes the spec secret, then null
   checked_in            int  not null,
   checkins              text not null default '{}', -- JSON object of instance id to generator index
   queued_at             timestamptz not null,

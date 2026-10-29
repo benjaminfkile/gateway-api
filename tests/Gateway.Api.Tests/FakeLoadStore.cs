@@ -203,6 +203,47 @@ public sealed class FakeLoadStore : ILoadStore
         }
     }
 
+    /// <summary>Calls of <see cref="TryAdvanceRunAsync"/> that matched nothing.</summary>
+    public int RefusedAdvances { get; private set; }
+
+    public Task<LoadRun?> TryAdvanceRunAsync(LoadRun expected, LoadRun next, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var run = Runs.FirstOrDefault(r => r.Id == expected.Id);
+            if (run is null || run.Status != expected.Status || run.Timeline != expected.Timeline)
+            {
+                RefusedAdvances++;
+                return Task.FromResult<LoadRun?>(null);
+            }
+
+            run.Status = next.Status;
+            run.Timeline = next.Timeline;
+            run.RampStartedAt = next.RampStartedAt;
+            run.FinishedAt = next.FinishedAt;
+            run.FleetSizeBefore = next.FleetSizeBefore;
+            run.StopReason = next.StopReason;
+            run.Detail = next.Detail;
+            run.SpecToken = next.SpecToken;
+            return Task.FromResult<LoadRun?>(Copy(run));
+        }
+    }
+
+    public Task<bool> SetScenarioValidationAsync(string scenario, int scriptVersion, long runId, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            var row = Scenarios.FirstOrDefault(s => s.Name == scenario && s.ScriptVersion == scriptVersion);
+            if (row is null)
+            {
+                return Task.FromResult(false);
+            }
+
+            row.LastValidationRunId = runId;
+            return Task.FromResult(true);
+        }
+    }
+
     public Task<LoadCheckInResult> CheckInAsync(long runId, string instanceId, CancellationToken ct = default)
     {
         lock (_gate)

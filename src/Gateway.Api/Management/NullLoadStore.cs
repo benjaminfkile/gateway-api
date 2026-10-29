@@ -46,6 +46,12 @@ public sealed class NullLoadStore : ILoadStore
     public Task<LoadRun?> ClaimQueuedRunAsync(long id, string by, DateTimeOffset now, CancellationToken ct = default) =>
         Task.FromResult<LoadRun?>(null);
 
+    public Task<LoadRun?> TryAdvanceRunAsync(LoadRun expected, LoadRun next, CancellationToken ct = default) =>
+        Task.FromResult<LoadRun?>(null);
+
+    public Task<bool> SetScenarioValidationAsync(string scenario, int scriptVersion, long runId, CancellationToken ct = default) =>
+        Task.FromResult(false);
+
     public Task<LoadCheckInResult> CheckInAsync(long runId, string instanceId, CancellationToken ct = default) =>
         Task.FromResult(new LoadCheckInResult(LoadCheckInOutcome.NotFound, -1, null));
 

@@ -210,6 +210,7 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.RestoreFleet).HasColumnName("restore_fleet");
             e.Property(x => x.HardStopAt).HasColumnName("hard_stop_at");
             e.Property(x => x.TokenHash).HasColumnName("token_hash").IsRequired();
+            e.Property(x => x.SpecToken).HasColumnName("spec_token");
             e.Property(x => x.CheckedIn).HasColumnName("checked_in");
             e.Property(x => x.Checkins).HasColumnName("checkins").IsRequired().HasDefaultValue("{}");
             e.Property(x => x.QueuedAt).HasColumnName("queued_at");

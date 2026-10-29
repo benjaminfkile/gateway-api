@@ -1,15 +1,23 @@
+using Amazon.SecretsManager;
+using Gateway.Api.Data;
+using Gateway.Api.Instances;
+using Gateway.Api.Jobs;
 using Gateway.Api.Management;
+using Gateway.Api.RealTime;
+using Gateway.Api.Reconcile;
+using Gateway.Api.Resources;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Gateway.Api.Load;
 
 /// <summary>
-/// Registration for the load feature's part 1 (docs/load.md sections 6, 8 and 12):
-/// the options, the store default, the pre-flight and its checks, the database
-/// headroom reader, the run-token rate limiter and the load clock. The fleet scaler the
-/// checks read through is registered by <c>AddResources</c>.
-/// <c>TryAdd</c> throughout so <c>Program</c>'s database branch and tests substitute
-/// their own. There is no scheduler here: a run stays queued.
+/// Registration for the load feature (docs/load.md sections 3, 6, 8 and 12).
+/// <see cref="AddLoad"/>: the options, the store default, the pre-flight and its
+/// checks, the database headroom reader, the run-token rate limiter, the load clock and
+/// the metrics. <see cref="AddLoadScheduler"/>: the secret writer and the load
+/// scheduler, which <c>Program</c> adds only with a database. The fleet scaler both
+/// read through is registered by <c>AddResources</c>. <c>TryAdd</c> throughout so
+/// <c>Program</c>'s database branch and tests substitute their own.
 /// </summary>
 public static class LoadServiceCollectionExtensions
 {
@@ -40,6 +48,45 @@ public static class LoadServiceCollectionExtensions
         services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, FleetClassCheck>());
         services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, TargetConfirmedCheck>());
         services.TryAddScoped<ILoadPreflight, LoadPreflight>();
+
+        // Run and stats-line metrics through the same EMF listener and namespace as
+        // the job metrics (Jobs:MetricsEndpoint, Jobs:MetricsNamespace).
+        services.TryAddSingleton<ILoadMetrics>(sp =>
+        {
+            var jobs = new JobSchedulerOptions();
+            sp.GetRequiredService<IConfiguration>().GetSection("Jobs").Bind(jobs);
+            return new LoadMetrics(jobs.MetricsEndpoint, jobs.MetricsNamespace, sp.GetRequiredService<ILogger<LoadMetrics>>());
+        });
+
+        return services;
+    }
+
+    /// <summary>
+    /// The load scheduler (docs/load.md section 3) and the Secrets Manager writer of the
+    /// generator spec secret. Only with a database: without one there is no run ledger
+    /// to drive. Leader status, reconciler options and the presence registry come from
+    /// <c>AddNodeReconciler</c> and <c>AddGatewayRealtime</c>.
+    /// </summary>
+    public static IServiceCollection AddLoadScheduler(this IServiceCollection services)
+    {
+        services.TryAddSingleton<IAmazonSecretsManager>(_ => new AmazonSecretsManagerClient());
+        services.TryAddSingleton<ISecretWriter>(sp =>
+            new SecretsManagerSecretWriter(() => sp.GetRequiredService<IAmazonSecretsManager>()));
+
+        services.AddHostedService(sp => new LoadSchedulerService(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<IFleetScaler>(),
+            sp.GetRequiredService<ISecretWriter>(),
+            sp.GetRequiredService<FleetGroupResolver>(),
+            sp.GetRequiredService<ILeaderStatus>(),
+            sp.GetRequiredService<LoadOptions>(),
+            sp.GetRequiredService<ReconcilerOptions>(),
+            sp.GetRequiredService<ILoadMetrics>(),
+            sp.GetRequiredService<ILogger<LoadSchedulerService>>(),
+            sp.GetKeyedService<TimeProvider>(LoadEndpoints.ClockKey),
+            sp.GetService<MigrationReadinessGate>(),
+            sp.GetService<IChannelEventPublisher>(),
+            sp.GetService<IPresenceRegistry>()));
 
         return services;
     }

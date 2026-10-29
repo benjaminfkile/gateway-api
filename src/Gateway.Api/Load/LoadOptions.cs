@@ -48,6 +48,23 @@ public sealed class LoadOptions
     /// <summary>How often the leader writes a fleet sample (<c>Load:FleetSampleInterval</c>, default 10 s).</summary>
     public TimeSpan FleetSampleInterval { get; set; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>Time between load scheduler ticks (<c>Load:TickInterval</c>, default 10 s).</summary>
+    public TimeSpan TickInterval { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The public origin the generators reach the gateway at, e.g.
+    /// <c>https://gateway.example.com</c> (<c>Load:GatewayBaseUrl</c>). Written into the
+    /// generator spec secret as <c>gatewayBaseUrl</c>; a run cannot bring generators up
+    /// while it is unset.
+    /// </summary>
+    public string? GatewayBaseUrl { get; set; }
+
+    /// <summary>
+    /// Consecutive failed ticks of one run's scaling or secret step before the run is
+    /// failed (<c>Load:ScaleRetryLimit</c>, default 6).
+    /// </summary>
+    public int ScaleRetryLimit { get; set; } = 6;
+
     /// <summary>
     /// Runner image a scenario gets when PUT omits it (<c>Load:DefaultImage</c>; unset
     /// falls back to <c>Jobs:DefaultImage</c>, then <see cref="JobEndpoints.FallbackImage"/>).
@@ -87,6 +104,18 @@ public sealed class LoadOptions
         {
             options.MaxGenerators = 1;
         }
+
+        if (options.ScaleRetryLimit < 1)
+        {
+            options.ScaleRetryLimit = 1;
+        }
+
+        if (options.TickInterval <= TimeSpan.Zero)
+        {
+            options.TickInterval = TimeSpan.FromSeconds(10);
+        }
+
+        options.GatewayBaseUrl = NonEmpty(options.GatewayBaseUrl)?.TrimEnd('/');
 
         return options;
     }

@@ -271,6 +271,10 @@ public class LoadEndpointsTests
         Assert.Null(run.StartedAt);
         Assert.Equal(Now.AddSeconds(180).AddMinutes(10), run.HardStopAt);
         Assert.Matches("^[0-9a-f]{64}$", run.TokenHash);
+
+        // The token itself waits on the row for the leader's spec secret write.
+        Assert.NotNull(run.SpecToken);
+        Assert.Equal(run.TokenHash, LoadEndpoints.TokenHash(run.SpecToken!));
         Assert.Equal((0, "{}", "{}"), (run.CheckedIn, run.Checkins, run.Peaks));
 
         var runParams = JsonDocument.Parse(run.Params).RootElement;

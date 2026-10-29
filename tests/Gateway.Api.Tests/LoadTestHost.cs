@@ -15,7 +15,8 @@ namespace Gateway.Api.Tests;
 /// <summary>
 /// A <see cref="ManagementApiFactory"/> for the load endpoints: a
 /// <see cref="FakeLoadStore"/>, <see cref="FakeFleetScaler"/> and
-/// <see cref="FakeDatabaseHeadroom"/> in place of the real seams, a recording publisher
+/// <see cref="FakeDatabaseHeadroom"/> in place of the real seams, a
+/// <see cref="FakeLoadMetrics"/>, a recording publisher
 /// (so <c>ops:load</c> events can be asserted), fixed <see cref="LoadOptions"/>, a
 /// generous run-token rate limiter unless a test passes its own, and an optional fixed
 /// load clock. The manifest and instance status stay on the factory's Sqlite database.
@@ -56,6 +57,9 @@ public sealed class LoadTestHost : IAsyncDisposable
             services.RemoveAll<IDatabaseHeadroom>();
             services.AddSingleton<IDatabaseHeadroom>(Headroom);
 
+            services.RemoveAll<ILoadMetrics>();
+            services.AddSingleton<ILoadMetrics>(Metrics);
+
             services.RemoveAll<LoadOptions>();
             services.AddSingleton(Options);
 
@@ -78,6 +82,8 @@ public sealed class LoadTestHost : IAsyncDisposable
     public FakeFleetScaler Scaler { get; } = new();
 
     public FakeDatabaseHeadroom Headroom { get; } = new();
+
+    public FakeLoadMetrics Metrics { get; } = new();
 
     public LoadOptions Options { get; }
 
