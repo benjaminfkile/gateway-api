@@ -7,7 +7,7 @@ generator Auto Scaling group and its own fleet group; it never creates
 infrastructure. The companion Resources page scales what already exists. This
 document is the contract for the build tasks at the end.
 
-Status: designed 2026-10-29, building v1. Built and verified so far: task 0 (wmsfo-api `tools/loadtest`, one-user run against dev passed) and task 1 (runner image with k6 1.8.2 and the load mode, smoke passed). The first scenario is an anonymous
+Status: v1 LIVE 2026-10-29. The gateway, the runner image and the dashboard are released; the first scenario (`wmsfo-tracker`, the anonymous visitor) is registered and its validation run (one generator, one user, five minutes) succeeded end to end: generator booted from the stack, checked in, stats every five seconds, drained to zero. Known gaps for phase 2: fleet samples carry no node stats yet (the heartbeat rows have none), and `Load:DefaultImage` should be the full registry path. Built and verified so far: task 0 (wmsfo-api `tools/loadtest`, one-user run against dev passed) and task 1 (runner image with k6 1.8.2 and the load mode, smoke passed). The first scenario is an anonymous
 WMSFO tracker visitor on the dev stack; the first generator group is one
 t4g.small. Phase 2 (the signed-in flow, bigger generators, CloudWatch-backed
 fleet metrics, the 100k ladder) is listed in section 13 and is not part of v1.
