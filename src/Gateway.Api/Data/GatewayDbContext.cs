@@ -21,6 +21,10 @@ public class GatewayDbContext : DbContext
     public DbSet<Job> Jobs => Set<Job>();
     public DbSet<JobScriptVersion> JobScriptVersions => Set<JobScriptVersion>();
     public DbSet<JobRun> JobRuns => Set<JobRun>();
+    public DbSet<LoadScenario> LoadScenarios => Set<LoadScenario>();
+    public DbSet<LoadScenarioVersion> LoadScenarioVersions => Set<LoadScenarioVersion>();
+    public DbSet<LoadRun> LoadRuns => Set<LoadRun>();
+    public DbSet<LoadRunStat> LoadRunStats => Set<LoadRunStat>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -150,6 +154,88 @@ public class GatewayDbContext : DbContext
                 .IsUnique()
                 .HasFilter("status IN ('queued', 'running')")
                 .HasDatabaseName("ux_job_run_active");
+        });
+
+        // Load runs (docs/load.md section 2).
+        modelBuilder.Entity<LoadScenario>(e =>
+        {
+            e.ToTable("load_scenario");
+            e.HasKey(x => x.Name);
+            e.Property(x => x.Name).HasColumnName("name");
+            e.Property(x => x.Repository).HasColumnName("repository").IsRequired();
+            e.Property(x => x.CommitSha).HasColumnName("commit_sha");
+            e.Property(x => x.Script).HasColumnName("script").IsRequired();
+            e.Property(x => x.ScriptVersion).HasColumnName("script_version");
+            e.Property(x => x.Image).HasColumnName("image").IsRequired();
+            e.Property(x => x.Tag).HasColumnName("tag").IsRequired();
+            e.Property(x => x.ParamsDefault).HasColumnName("params_default").IsRequired();
+            e.Property(x => x.MaxVusPerGenerator).HasColumnName("max_vus_per_generator");
+            e.Property(x => x.LastValidationRunId).HasColumnName("last_validation_run_id");
+            e.Property(x => x.UpdatedBy).HasColumnName("updated_by").IsRequired();
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        modelBuilder.Entity<LoadScenarioVersion>(e =>
+        {
+            e.ToTable("load_scenario_version");
+            e.HasKey(x => new { x.Scenario, x.Version });
+            e.Property(x => x.Scenario).HasColumnName("scenario");
+            e.Property(x => x.Version).HasColumnName("version");
+            e.Property(x => x.Script).HasColumnName("script").IsRequired();
+            e.Property(x => x.Sha256).HasColumnName("sha256").IsRequired();
+            e.Property(x => x.UpdatedBy).HasColumnName("updated_by").IsRequired();
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        modelBuilder.Entity<LoadRun>(e =>
+        {
+            e.ToTable("load_run");
+            e.HasKey(x => x.Id);
+            // scenario is deliberately not a foreign key: run history outlives a deleted scenario.
+            e.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
+            e.Property(x => x.Scenario).HasColumnName("scenario").IsRequired();
+            e.Property(x => x.ScenarioVersion).HasColumnName("scenario_version");
+            e.Property(x => x.Target).HasColumnName("target").IsRequired();
+            e.Property(x => x.Validation).HasColumnName("validation");
+            e.Property(x => x.Actor).HasColumnName("actor").IsRequired();
+            e.Property(x => x.Status).HasColumnName("status").IsRequired();
+            e.Property(x => x.Generators).HasColumnName("generators");
+            e.Property(x => x.VusPerGenerator).HasColumnName("vus_per_generator");
+            e.Property(x => x.RampSeconds).HasColumnName("ramp_seconds");
+            e.Property(x => x.HoldSeconds).HasColumnName("hold_seconds");
+            e.Property(x => x.Params).HasColumnName("params").IsRequired();
+            e.Property(x => x.FleetSizeRequested).HasColumnName("fleet_size_requested");
+            e.Property(x => x.FleetSizeBefore).HasColumnName("fleet_size_before");
+            e.Property(x => x.RestoreFleet).HasColumnName("restore_fleet");
+            e.Property(x => x.HardStopAt).HasColumnName("hard_stop_at");
+            e.Property(x => x.TokenHash).HasColumnName("token_hash").IsRequired();
+            e.Property(x => x.CheckedIn).HasColumnName("checked_in");
+            e.Property(x => x.Checkins).HasColumnName("checkins").IsRequired().HasDefaultValue("{}");
+            e.Property(x => x.QueuedAt).HasColumnName("queued_at");
+            e.Property(x => x.StartedAt).HasColumnName("started_at");
+            e.Property(x => x.RampStartedAt).HasColumnName("ramp_started_at");
+            e.Property(x => x.FinishedAt).HasColumnName("finished_at");
+            e.Property(x => x.StopRequestedAt).HasColumnName("stop_requested_at");
+            e.Property(x => x.StopReason).HasColumnName("stop_reason");
+            e.Property(x => x.Verdict).HasColumnName("verdict");
+            e.Property(x => x.Detail).HasColumnName("detail");
+            e.Property(x => x.Peaks).HasColumnName("peaks").IsRequired();
+            e.Property(x => x.Timeline).HasColumnName("timeline").IsRequired();
+            e.HasIndex(x => x.Status);
+            e.HasIndex(x => new { x.Scenario, x.Id });
+        });
+
+        modelBuilder.Entity<LoadRunStat>(e =>
+        {
+            e.ToTable("load_run_stat");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
+            e.Property(x => x.RunId).HasColumnName("run_id");
+            e.Property(x => x.Source).HasColumnName("source").IsRequired();
+            e.Property(x => x.Index).HasColumnName("index");
+            e.Property(x => x.At).HasColumnName("at");
+            e.Property(x => x.Body).HasColumnName("body").IsRequired();
+            e.HasIndex(x => new { x.RunId, x.At });
         });
     }
 }

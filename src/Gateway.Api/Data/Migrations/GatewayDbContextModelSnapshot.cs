@@ -316,6 +316,280 @@ namespace Gateway.Api.Data.Migrations
                     b.ToTable("job_script_version", (string)null);
                 });
 
+            modelBuilder.Entity("Gateway.Api.Data.LoadRun", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Actor")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("actor");
+
+                    b.Property<int>("CheckedIn")
+                        .HasColumnType("integer")
+                        .HasColumnName("checked_in");
+
+                    b.Property<string>("Checkins")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("text")
+                        .HasDefaultValue("{}")
+                        .HasColumnName("checkins");
+
+                    b.Property<string>("Detail")
+                        .HasColumnType("text")
+                        .HasColumnName("detail");
+
+                    b.Property<DateTimeOffset?>("FinishedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("finished_at");
+
+                    b.Property<int?>("FleetSizeBefore")
+                        .HasColumnType("integer")
+                        .HasColumnName("fleet_size_before");
+
+                    b.Property<int?>("FleetSizeRequested")
+                        .HasColumnType("integer")
+                        .HasColumnName("fleet_size_requested");
+
+                    b.Property<int>("Generators")
+                        .HasColumnType("integer")
+                        .HasColumnName("generators");
+
+                    b.Property<DateTimeOffset>("HardStopAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("hard_stop_at");
+
+                    b.Property<int>("HoldSeconds")
+                        .HasColumnType("integer")
+                        .HasColumnName("hold_seconds");
+
+                    b.Property<string>("Params")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("params");
+
+                    b.Property<string>("Peaks")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("peaks");
+
+                    b.Property<DateTimeOffset>("QueuedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("queued_at");
+
+                    b.Property<int>("RampSeconds")
+                        .HasColumnType("integer")
+                        .HasColumnName("ramp_seconds");
+
+                    b.Property<DateTimeOffset?>("RampStartedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("ramp_started_at");
+
+                    b.Property<bool>("RestoreFleet")
+                        .HasColumnType("boolean")
+                        .HasColumnName("restore_fleet");
+
+                    b.Property<string>("Scenario")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("scenario");
+
+                    b.Property<int>("ScenarioVersion")
+                        .HasColumnType("integer")
+                        .HasColumnName("scenario_version");
+
+                    b.Property<DateTimeOffset?>("StartedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("started_at");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.Property<string>("StopReason")
+                        .HasColumnType("text")
+                        .HasColumnName("stop_reason");
+
+                    b.Property<DateTimeOffset?>("StopRequestedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("stop_requested_at");
+
+                    b.Property<string>("Target")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("target");
+
+                    b.Property<string>("Timeline")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("timeline");
+
+                    b.Property<string>("TokenHash")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("token_hash");
+
+                    b.Property<bool>("Validation")
+                        .HasColumnType("boolean")
+                        .HasColumnName("validation");
+
+                    b.Property<string>("Verdict")
+                        .HasColumnType("text")
+                        .HasColumnName("verdict");
+
+                    b.Property<int>("VusPerGenerator")
+                        .HasColumnType("integer")
+                        .HasColumnName("vus_per_generator");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Status");
+
+                    b.HasIndex("Scenario", "Id");
+
+                    b.ToTable("load_run", (string)null);
+                });
+
+            modelBuilder.Entity("Gateway.Api.Data.LoadRunStat", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("At")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("at");
+
+                    b.Property<string>("Body")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("body");
+
+                    b.Property<int?>("Index")
+                        .HasColumnType("integer")
+                        .HasColumnName("index");
+
+                    b.Property<long>("RunId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("run_id");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("source");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RunId", "At");
+
+                    b.ToTable("load_run_stat", (string)null);
+                });
+
+            modelBuilder.Entity("Gateway.Api.Data.LoadScenario", b =>
+                {
+                    b.Property<string>("Name")
+                        .HasColumnType("text")
+                        .HasColumnName("name");
+
+                    b.Property<string>("CommitSha")
+                        .HasColumnType("text")
+                        .HasColumnName("commit_sha");
+
+                    b.Property<string>("Image")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("image");
+
+                    b.Property<long?>("LastValidationRunId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("last_validation_run_id");
+
+                    b.Property<int>("MaxVusPerGenerator")
+                        .HasColumnType("integer")
+                        .HasColumnName("max_vus_per_generator");
+
+                    b.Property<string>("ParamsDefault")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("params_default");
+
+                    b.Property<string>("Repository")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("repository");
+
+                    b.Property<string>("Script")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("script");
+
+                    b.Property<int>("ScriptVersion")
+                        .HasColumnType("integer")
+                        .HasColumnName("script_version");
+
+                    b.Property<string>("Tag")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("tag");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Name");
+
+                    b.ToTable("load_scenario", (string)null);
+                });
+
+            modelBuilder.Entity("Gateway.Api.Data.LoadScenarioVersion", b =>
+                {
+                    b.Property<string>("Scenario")
+                        .HasColumnType("text")
+                        .HasColumnName("scenario");
+
+                    b.Property<int>("Version")
+                        .HasColumnType("integer")
+                        .HasColumnName("version");
+
+                    b.Property<string>("Script")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("script");
+
+                    b.Property<string>("Sha256")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("sha256");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("updated_at");
+
+                    b.Property<string>("UpdatedBy")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("updated_by");
+
+                    b.HasKey("Scenario", "Version");
+
+                    b.ToTable("load_scenario_version", (string)null);
+                });
+
             modelBuilder.Entity("Gateway.Api.Data.ServiceManifest", b =>
                 {
                     b.Property<string>("Name")

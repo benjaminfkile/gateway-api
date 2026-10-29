@@ -4,6 +4,7 @@ using Gateway.Api.Data;
 using Gateway.Api.Health;
 using Gateway.Api.Instances;
 using Gateway.Api.Jobs;
+using Gateway.Api.Load;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
@@ -40,6 +41,11 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
 
     // Scheduled jobs (docs/jobs.md): job rows, script history, and the run ledger.
     builder.Services.AddScoped<IJobStore, EfJobStore>();
+
+    // Load runs (docs/load.md): scenarios, script history, the run ledger and stats,
+    // and the database headroom read on the gateway's own connection.
+    builder.Services.AddScoped<ILoadStore, EfLoadStore>();
+    builder.Services.AddScoped<IDatabaseHeadroom, EfDatabaseHeadroom>();
 
     // Job executor (docs/jobs.md section 3): claims and drives runs from that ledger.
     // Only with a database; it shares the reconciler's runtime and leader status.
@@ -112,6 +118,11 @@ builder.Services.AddManagementAuthentication();
 // so a region-less box still boots; the deploy store defaults to a no-op unless the
 // DB branch above wired the EF-backed one.
 builder.Services.AddManagementServices();
+
+// Load runs part 1 (docs/load.md): options, pre-flight, the fleet scaler seam and the
+// run-token rate limiter. The store defaults to a no-op unless the DB branch above
+// wired the EF-backed one. No scheduler yet: a started run stays queued.
+builder.Services.AddLoad();
 
 // Cross-origin access for the ops dashboard (tech-spec §4.6): the SPA is served
 // from its own origin, so browsers require CORS on /mgmt/* and the /hub
@@ -328,6 +339,10 @@ app.MapManagementApi();
 
 // Scheduled jobs under /mgmt/jobs (docs/jobs.md section 4), beside the service endpoints.
 app.MapJobEndpoints();
+
+// Load runs under /mgmt/load (docs/load.md section 8): scenarios, runs, pre-flight,
+// and the two run-token endpoints the generators call.
+app.MapLoadEndpoints();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.

@@ -42,6 +42,12 @@ public sealed class CloudWatchLogStore : ILogStore
     /// <summary>The log stream of one job run: <c>run-{id}</c>.</summary>
     public static string JobRunStreamFor(long runId) => JobRunStreamPrefix + runId;
 
+    /// <summary>The log group every load generator writes to (docs/load.md section 5).</summary>
+    public const string LoadLogGroup = "/gateway/load";
+
+    /// <summary>The log stream of one generator of a load run: <c>run-{id}-{index}</c>.</summary>
+    public static string LoadRunStreamFor(long runId, int index) => $"{JobRunStreamPrefix}{runId}-{index}";
+
     public async Task<IReadOnlyList<LogLine>> GetLogsAsync(
         string service,
         string? instance,
