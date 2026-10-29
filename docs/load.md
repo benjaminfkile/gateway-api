@@ -11,6 +11,13 @@ Status: designed 2026-10-29, building v1. The first scenario is an anonymous
 WMSFO tracker visitor on the dev stack; the first generator group is one
 t4g.small. Phase 2 (the signed-in flow, bigger generators, CloudWatch-backed
 fleet metrics, the 100k ladder) is listed in section 13 and is not part of v1.
+Part 1 built (build plan item 2): the data model and the `AddLoad` migration,
+`ILoadStore` (EF and no-database), the `/mgmt/load` API with the OpsLoad policy,
+the two generator endpoints, pre-flight behind `ILoadPreflight` with
+`IDatabaseHeadroom` and the `IFleetScaler` seam (only `NullFleetScaler` is
+registered, so `generator_group` is red and `fleet_class` amber until the
+resources task lands), the `ops:load` events and the `Load` options. No
+scheduler yet: a started run stays `queued`.
 
 ## 1. What a load run is
 
@@ -73,6 +80,7 @@ load_run (
   hard_stop_at          timestamptz not null,     -- started_at + ramp + hold + 10 min, at most started_at + 4 h
   token_hash            text not null,            -- sha256 of the run token the generators present
   checked_in            int  not null,            -- generators that have checked in
+  checkins              text not null default '{}', -- JSON object of instance id to assigned index
   queued_at             timestamptz not null,
   started_at            timestamptz,              -- when the status left queued
   ramp_started_at       timestamptz,
@@ -93,7 +101,15 @@ load_run_stat (
   body        text not null                       -- the stats line as received, <= 64 KiB
 )
 -- index on (run_id, at)
+-- at most one non-terminal run (Postgres only, a constant-expression partial index)
+create unique index ux_load_run_active on load_run ((true))
+  where status not in ('succeeded', 'stopped', 'expired', 'failed', 'lost')
 ```
+
+`checkins` is what makes a repeated check-in answer the same index: the
+check-in update sets `checked_in = n + 1` and adds the instance to `checkins`
+conditional on `checked_in` still being `n`, so the previous value is the
+assigned index and a losing concurrent check-in reads again.
 
 The run token is 32 random bytes, base64url, minted at Start, shown to nobody,
 written into the generator spec secret (section 5) and compared by hash on
@@ -241,7 +257,11 @@ gateway answers, on the public listener with the token as the only credential:
   when the run is in `generators_up` and `checked_in < generators`; `index` is
   assigned in check-in order and `checked_in` is incremented in the same
   conditional update, so two instances never share an index. A repeat
-  check-in from the same `instanceId` answers the same assignment.
+  check-in from the same `instanceId` answers the same assignment while the run
+  is in `generators_up`, `ramping` or `holding`. `script` is the plain script
+  body of the run's scenario version (the user data base64-encodes it into
+  `GATEWAY_LOAD_SCRIPT`); `statsUrl` is built from the request's host and
+  `X-Forwarded-Proto`.
 - `409 { error: "run_full" }` or `409 { error: "run_not_accepting" }`
   otherwise; the user data then shuts the instance down (the group will
   replace it only if desired capacity still says so, and the leader lowers it
@@ -330,6 +350,44 @@ client an operator creates, as for jobs.
 The run token endpoints are not behind Cognito. They are rate limited per
 source address to 5 requests per second, answer the same `401` for a wrong
 token and an unknown run, and log nothing about the token.
+
+Built as: the rate limit is the gateway's own `TokenBucket` (the building block of
+the realtime limits), one bucket per source address, 5 per second with a burst
+of 10, instance-local, answering `429 { error: "rate_limited" }` with
+`Retry-After`. The source address is the last `X-Forwarded-For` entry (the
+address the load balancer saw), else the connection's remote address. The body
+cap answers `413 { error: "body_too_large" }`. The token check is the sha256 of
+the `X-Gateway-Load-Token` header compared with `token_hash` by
+`CryptographicOperations.FixedTimeEquals`; an unknown run is compared against a
+dummy hash so both cases cost the same. The order is rate limit, body cap,
+token, then the run's state.
+
+Details of the built API:
+
+- `GET /mgmt/load/preflight` answers `{ ok, checks }`; `ok` is false while any
+  check is red. `confirm` and `validation` are query parameters beside the ones
+  above; `generators` and `vus` default to 1.
+- `POST /mgmt/load/runs` checks in this order: the body (`400 { error, field }`,
+  an unknown scenario is `field: scenario`), `503 load_unconfigured`,
+  `409 run_active`, `409 preflight_failed { checks }`. For `validation: true` the
+  gateway sets generators 1, users 1, ramp 0 and hold `Load:ValidationHoldSeconds`
+  and ignores the sent values. `restoreFleet` defaults to true. `hard_stop_at` is
+  the Start time plus ramp, hold and 10 minutes, at most plus 4 hours.
+- Stats lines: `runId` must equal the path id, `index` must be in
+  `0..generators-1`, `at` an ISO 8601 time, `vus` a non-negative number and
+  `metrics`, when present, an object. Peaks take every numeric leaf under
+  `metrics`. The aggregate is `{ generators, vus, metrics }` over the newest
+  received line of each generator: counter and gauge fields summed, trend fields
+  the maximum except `min` (the minimum), rate metrics summing `passes` and
+  `fails` and recomputing `rate`, any other type the maximum per field. A
+  terminal run answers `409 { error: "run_terminal" }`.
+- `stats?step=` buckets per source, index and `step` seconds aligned to the Unix
+  epoch; `stats.csv` has `at,source,index` then one column per numeric leaf
+  (dotted paths, arrays by position, sorted).
+- Stop answers `409 run_finished` on a terminal run; a second stop keeps the
+  first stamp. Verdict and run delete answer `409 run_active` on a non-terminal
+  run. A scenario re-created after a delete continues its version numbers after
+  the kept history.
 
 ## 9. Resources API
 

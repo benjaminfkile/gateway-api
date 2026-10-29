@@ -356,6 +356,98 @@ counts is an operator choice per job.
 exitCode }` on every run status change. Publishing is best-effort: a backplane
 failure never fails the request.
 
+## Load runs
+
+A load run ramps a fleet of k6 generators against a service behind the gateway,
+collects their stats every five seconds, and can never outlive its hard clock.
+The design is [`docs/load.md`](docs/load.md). Part 1 is built: the load model,
+the store, the management API, the two generator endpoints, pre-flight and the
+`ops:load` events. There is no scheduler yet, so a started run stays `queued`;
+the fleet scaler seam (`IFleetScaler`) is registered as `NullFleetScaler`, which
+refuses every call, so the `generator_group` check is red until the resources
+task wires the AWS implementation.
+
+State lives in four tables (tech-spec §4.4): `load_scenario` (the current k6
+script, repository, image, default params, users per generator, last validation
+run), `load_scenario_version` (every script body with its sha256, kept after a
+delete), `load_run` (the run ledger with its token hash, check-ins, peaks and
+timeline) and `load_run_stat` (every stats line, indexed on `(run_id, at)`).
+
+| Endpoint | Policy | Action |
+|---|---|---|
+| `GET /mgmt/load/scenarios` | OpsDeploy | Every scenario with version, repository, commit, validation state, users per generator. Never the script body |
+| `GET /mgmt/load/scenarios/{name}` | OpsDeploy | One scenario including its script |
+| `PUT /mgmt/load/scenarios/{name}` | OpsLoad | Create (`201`, needs `repository`, `script`, `maxVusPerGenerator`) or update (`200`). Body `{ repository?, commitSha?, script?, image?, tag?, paramsDefault?, maxVusPerGenerator? }`. A changed script bumps `scriptVersion`, adds a history row and clears `lastValidationRunId`. `400 { error, field }` on a bad name, repository (`owner/name`), commit, script (non-empty, at most 256 KiB), params (a flat object of strings) or users (1..100000) |
+| `DELETE /mgmt/load/scenarios/{name}` | OpsLoad | `204`; `409 run_active` while a run of it is non-terminal. History and runs stay |
+| `GET /mgmt/load/scenarios/{name}/script/versions` and `/script/versions/{v}` | OpsDeploy | `[{ version, sha256, updatedBy, updatedAt }]` newest first, and `{ version, script }` |
+| `GET /mgmt/load/preflight?scenario=&target=&confirm=&generators=&vus=&fleet=&validation=` | OpsDeploy | `{ ok, checks: [{ name, status, message, fix }] }` |
+| `POST /mgmt/load/runs` | OpsLoad | Start. Body `{ scenario, target, confirm, generators, vusPerGenerator, rampSeconds, holdSeconds, params?, fleetSize?, restoreFleet?, validation? }`. `202 { runId }`; `400 { error, field }`; `503 load_unconfigured` when `Load:GeneratorGroup` is unset; `409 run_active` while any run is non-terminal; `409 preflight_failed { checks }` when a check is red |
+| `GET /mgmt/load/runs?limit=50&before={id}` | OpsDeploy | Runs newest first, with peaks, without timeline or stats |
+| `GET /mgmt/load/runs/{id}` | OpsDeploy | One run with timeline, peaks and check-ins |
+| `GET /mgmt/load/runs/{id}/stats?from=&to=&source=&index=&step=` | OpsDeploy | Stats rows; `step` downsamples to one row per bucket, the maximum of each numeric leaf |
+| `GET /mgmt/load/runs/{id}/stats.csv` | OpsDeploy | The same rows, one column per numeric leaf |
+| `POST /mgmt/load/runs/{id}/stop` | OpsLoad | `202`: stamps `stopRequestedAt` (the first request wins). `409 run_finished` when terminal |
+| `PUT /mgmt/load/runs/{id}/verdict` | OpsLoad | `{ verdict }` (at most 500 characters, empty clears) on a terminal run; `409 run_active` otherwise |
+| `DELETE /mgmt/load/runs/{id}` | OpsLoad | `204`: removes a terminal run and its stats; `409 run_active` otherwise |
+| `POST /mgmt/load/runs/{id}/checkin` | run token | `{ instanceId }` to `200 { index, count, vus, rampSeconds, holdSeconds, scenario, target, script, params, statsUrl }`, `409 run_full` or `409 run_not_accepting` |
+| `POST /mgmt/load/runs/{id}/stats` | run token | A generator stats line: `200 { action: "continue" \| "stop" }`, `409 run_terminal` |
+| `GET /mgmt/load/runs/{id}/log?index=0&tail=500` | OpsAdmin | `[{ ts, message }]` from log group `/gateway/load`, stream `run-{id}-{index}` |
+
+**OpsLoad policy:** a member of `ops-admin`, or a client-credentials token
+carrying the scope `mgmt/load`. Start scales the fleet, so `ops-deploy`, the CI
+`mgmt/deploy` scope and the `mgmt/jobs` scope do not qualify; a repository whose
+CI pushes its scenario script uses a separate client an operator creates with
+`mgmt/load`.
+
+**Run token:** Start mints 32 random bytes (base64url) and stores only their
+sha256 in `token_hash`. The check-in and stats endpoints are anonymous and take
+the token in `X-Gateway-Load-Token`: the hash comparison is constant time, a
+wrong token and an unknown run answer the same `401`, the body is capped at
+64 KiB (`413`), and each source address (the last `X-Forwarded-For` entry, else
+the connection) gets 5 requests per second with a burst of 10 (`429` with
+`Retry-After`).
+
+**Check-in** hands out generator indexes in order with a conditional update on
+`checked_in`, so two instances never share one; a repeated check-in from the
+same instance gets its earlier index back. **Stats** lines are stored as
+received, raise the run's `peaks` (the maximum of every numeric leaf, keyed
+`metric.field`), and are merged into a fleet-wide aggregate over the newest line
+of each generator (counters and gauges summed, trends by the worst value). The
+answer is `stop` once a stop is requested or the run is draining.
+
+**Pre-flight** checks, each `green`, `amber` or `red`: `generator_group` (the
+generator group is empty and its max fits the run, read through `IFleetScaler`),
+`fleet_healthy` (every `instance_status` row heartbeats and runs the target),
+`target_known`, `scenario_validated` (the last validation ran the current
+script version; skipped for a validation run), `presence_off` (the target's
+`realtime_presence` is off), `database_headroom` (`max_connections` minus
+`pg_stat_activity` covers fleet nodes times `Load:DbConnectionsPerNode` plus
+`Load:DbConnectionMargin`, read on the gateway's own connection), `fleet_class`
+(amber for a burstable fleet class, amber "unknown" when the template cannot be
+read) and `target_confirmed` (`confirm` equals the target).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Load:GeneratorGroup` | unset | Generator Auto Scaling group name; unset answers Start with `503 load_unconfigured` |
+| `Load:GeneratorSpecSecret` | unset | Secrets Manager name of the generator spec secret |
+| `Load:MaxGenerators` | `2` | Most generators a run may ask for |
+| `Load:CheckInTimeout` | `00:05:00` | How long `generators_up` waits for every generator |
+| `Load:StatsStaleAfter` | `00:01:00` | Ramp or hold with no generator line for this long marks the run `lost` |
+| `Load:ValidationHoldSeconds` | `300` | Hold of a validation run |
+| `Load:DbConnectionsPerNode` | `20` | Per-node database connections the headroom check assumes |
+| `Load:DbConnectionMargin` | `10` | Spare connections the headroom check requires |
+| `Load:DbDowngradeMarginPercent` | `25` | Resources: a smaller database class must exceed connections in use by this much |
+| `Load:FleetSampleInterval` | `00:00:10` | How often the leader writes a fleet sample |
+| `Load:DefaultImage`, `Load:DefaultTag` | `Jobs:DefaultImage`, `Jobs:DefaultTag` | Runner image and tag a scenario gets when PUT omits them |
+
+**Real-time:** the `ops:load` hub channel (same gate as `ops:deploys`) carries
+`scenario` `{ name, action: upserted | deleted, by }`, `run` `{ runId, scenario,
+status, actor, generators, vusPerGenerator, startedAt, finishedAt, stopReason }`
+on Start, on a stop request and on every status change, `stats` `{ runId, at,
+aggregate }` after every stored generator line, and `fleet` `{ runId, at, sample }`
+after every fleet sample. Publishing is best-effort: a backplane failure never
+fails the request.
+
 ## Internal listener (containers only)
 
 A second Kestrel endpoint bound from `GATEWAY_INTERNAL_BIND` (default `0.0.0.0:8080`)

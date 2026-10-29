@@ -21,7 +21,7 @@ namespace Gateway.Api.Tests;
 /// <summary>
 /// Test host for the fleet-aware Management API (tech-spec §4.5): a real
 /// <see cref="Program"/> pipeline with the Cognito authority set (plane configured),
-/// backed by Sqlite for the manifest / instance-status / deploy-history / job stores and
+/// backed by Sqlite for the manifest / instance-status / deploy-history / job / load stores and
 /// fakes for the AWS seams (image registry, log store). Tokens are locally signed
 /// (see <see cref="TestManagementAuth"/>) so the authz matrix is exercised without a
 /// network JWKS fetch.
@@ -79,6 +79,9 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<IJobStore>();
             services.AddScoped<IJobStore, EfJobStore>();
 
+            services.RemoveAll<ILoadStore>();
+            services.AddScoped<ILoadStore, EfLoadStore>();
+
             services.RemoveAll<IImageRegistry>();
             services.AddSingleton<IImageRegistry>(ImageRegistry);
 
@@ -132,4 +135,8 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
     /// <summary>A client-credentials token carrying only the <c>mgmt/jobs</c> scope.</summary>
     public static string JobsToken() =>
         TestManagementAuth.CreateToken(scopes: new[] { ManagementAuth.JobsScope }, username: "jobs-client");
+
+    /// <summary>A client-credentials token carrying only the <c>mgmt/load</c> scope.</summary>
+    public static string LoadToken() =>
+        TestManagementAuth.CreateToken(scopes: new[] { ManagementAuth.LoadScope }, username: "load-client");
 }

@@ -81,6 +81,19 @@ public class ManagementAuthPolicyTests
     }
 
     [Fact]
+    public void CanManageLoad_ForAdminOrLoadScope_NotDeployOrJobs()
+    {
+        Assert.True(ManagementAuth.CanManageLoad(Principal(new[] { ManagementAuth.OpsAdminGroup })));
+        Assert.True(ManagementAuth.CanManageLoad(Principal(scope: $"openid {ManagementAuth.LoadScope}")));
+        // Start scales the fleet: the deploy group, the deploy scope and the jobs scope do not qualify.
+        Assert.False(ManagementAuth.CanManageLoad(Principal(new[] { ManagementAuth.OpsDeployGroup })));
+        Assert.False(ManagementAuth.CanManageLoad(Principal(scope: ManagementAuth.DeployScope)));
+        Assert.False(ManagementAuth.CanManageLoad(Principal(scope: ManagementAuth.JobsScope)));
+        Assert.False(ManagementAuth.CanManageLoad(Principal(scope: "mgmt/loader")));
+        Assert.False(ManagementAuth.CanManageLoad(Principal()));
+    }
+
+    [Fact]
     public void Options_Unconfigured_WhenAuthorityUnset()
     {
         var options = ManagementAuthOptions.FromConfiguration(

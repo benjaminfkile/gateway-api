@@ -264,6 +264,67 @@ job_run (
 )
 -- at most one queued or running run per job
 create unique index ux_job_run_active on job_run (job) where status in ('queued', 'running')
+
+-- load runs (docs/load.md section 2)
+load_scenario (
+  name                    text primary key,       -- ^[a-z0-9][a-z0-9-]{1,62}$
+  repository              text not null,          -- owner/name of the repo that owns the script
+  commit_sha              text,
+  script                  text not null,          -- k6 script body, <= 256 KiB
+  script_version          int  not null,          -- bumps when the body changes
+  image                   text not null,          -- runner repository
+  tag                     text not null,
+  params_default          text not null,          -- JSON object of strings, '{}' when none
+  max_vus_per_generator   int  not null,          -- 1..100000
+  last_validation_run_id  bigint,                 -- cleared when the script changes
+  updated_by              text not null,
+  updated_at              timestamptz not null
+)
+load_scenario_version (scenario, version, script, sha256, updated_by, updated_at,
+                       primary key (scenario, version))
+load_run (
+  id                    bigint generated always as identity primary key,
+  scenario              text not null,            -- not a foreign key: history outlives a deleted scenario
+  scenario_version      int  not null,
+  target                text not null,            -- manifest service name
+  validation            boolean not null,
+  actor                 text not null,
+  status                text not null,            -- queued | fleet_up | generators_up | ramping | holding | draining | succeeded | stopped | expired | failed | lost
+  generators            int  not null,
+  vus_per_generator     int  not null,
+  ramp_seconds          int  not null,
+  hold_seconds          int  not null,
+  params                text not null,            -- JSON object of strings
+  fleet_size_requested  int,
+  fleet_size_before     int,
+  restore_fleet         boolean not null,
+  hard_stop_at          timestamptz not null,
+  token_hash            text not null,            -- sha256 of the run token
+  checked_in            int  not null,
+  checkins              text not null default '{}', -- JSON object of instance id to generator index
+  queued_at             timestamptz not null,
+  started_at            timestamptz,
+  ramp_started_at       timestamptz,
+  finished_at           timestamptz,
+  stop_requested_at     timestamptz,
+  stop_reason           text,                     -- operator | hard_clock | lost | leader_restart | failed
+  verdict               text,                     -- <= 500 chars
+  detail                text,                     -- <= 2 KiB
+  peaks                 text not null,            -- JSON: maximum of every numeric stat, keyed metric.field
+  timeline              text not null             -- JSON array of { at, status, by, note }
+)
+load_run_stat (
+  id          bigint generated always as identity primary key,
+  run_id      bigint not null,
+  source      text not null,                      -- 'generator' | 'fleet'
+  index       int,                                -- generator index, null for fleet samples
+  at          timestamptz not null,
+  body        text not null                       -- the line as received, <= 64 KiB
+)
+create index on load_run_stat (run_id, at)
+-- at most one non-terminal load run
+create unique index ux_load_run_active on load_run ((true))
+  where status not in ('succeeded', 'stopped', 'expired', 'failed', 'lost')
 ```
 
 Leadership needs no table of its own: it is derived from `instance_status`
@@ -305,6 +366,18 @@ balancer routes the dashboard's request to.
 | `POST /mgmt/jobs/{name}/runs/{id}/cancel` | `202`: queued becomes `cancelled` at once, running gets `cancel_requested_at`; `409` when finished (OpsJobs) |
 | `GET  /mgmt/jobs/{name}/runs/{id}/log?tail=500` | Run log from group `/gateway/jobs/{name}`, stream `run-{id}` (OpsAdmin) |
 | `GET  /mgmt/jobs/{name}/script/versions` · `/script/versions/{v}` | Script history `[{ version, sha256, updatedBy, updatedAt }]` and one body (OpsDeploy) |
+| `GET  /mgmt/load/scenarios` · `GET /mgmt/load/scenarios/{name}` | Load scenarios (OpsDeploy); the list never carries the script, the single scenario does (docs/load.md section 8) |
+| `PUT  /mgmt/load/scenarios/{name}` | Create (`201`) or update a scenario (OpsLoad); a changed script bumps `script_version`, writes `load_scenario_version` and clears `last_validation_run_id`; `400 { error, field }` on validation |
+| `DELETE /mgmt/load/scenarios/{name}` | Remove a scenario (OpsLoad), `204`; `409 run_active` while a run of it is non-terminal. History and runs stay |
+| `GET  /mgmt/load/scenarios/{name}/script/versions` · `/script/versions/{v}` | Script history and one body (OpsDeploy) |
+| `GET  /mgmt/load/preflight` | `{ ok, checks }` for a draft run (OpsDeploy) |
+| `POST /mgmt/load/runs` | Start (OpsLoad): `202 { runId }`, `400 { error, field }`, `503 load_unconfigured`, `409 run_active`, `409 preflight_failed { checks }` |
+| `GET  /mgmt/load/runs?limit=50&before={id}` · `GET /mgmt/load/runs/{id}` | Runs newest first, one run with timeline and peaks (OpsDeploy) |
+| `GET  /mgmt/load/runs/{id}/stats` · `/stats.csv` | Stats rows, optionally downsampled with `step`, or flattened to CSV (OpsDeploy) |
+| `POST /mgmt/load/runs/{id}/stop` | `202`: stamps `stop_requested_at`; `409` when terminal (OpsLoad) |
+| `PUT  /mgmt/load/runs/{id}/verdict` · `DELETE /mgmt/load/runs/{id}` | Verdict on, or removal of, a terminal run and its stats (OpsLoad) |
+| `POST /mgmt/load/runs/{id}/checkin` · `/stats` | Generator check-in and stats intake: anonymous, run token in `X-Gateway-Load-Token`, 64 KiB cap, 5 per second per address |
+| `GET  /mgmt/load/runs/{id}/log?index=&tail=500` | Generator log from group `/gateway/load`, stream `run-{id}-{index}` (OpsAdmin) |
 | `WS   /hub` (`ops` channel) | Live status pushes to the dashboard — Redis backplane means events from *any* instance reach the dashboard's single connection |
 
 Guardrails: `stop` (and `delete`) on a health-check dependency requires a

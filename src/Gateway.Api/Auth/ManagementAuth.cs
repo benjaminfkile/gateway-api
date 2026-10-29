@@ -34,6 +34,12 @@ public static class ManagementAuth
     /// </summary>
     public const string OpsRestartPolicy = "OpsRestart";
 
+    /// <summary>
+    /// Load mutations (scenario upsert and delete, start, stop, verdict, run delete):
+    /// <c>ops-admin</c>, or a client-credentials token bearing the <c>mgmt/load</c> scope.
+    /// </summary>
+    public const string OpsLoadPolicy = "OpsLoad";
+
     /// <summary>Claim type carrying Cognito group membership.</summary>
     public const string GroupsClaim = "cognito:groups";
 
@@ -60,6 +66,12 @@ public static class ManagementAuth
     /// CI deploy client does not carry it; an operator creates a separate client.
     /// </summary>
     public const string JobsScope = "mgmt/jobs";
+
+    /// <summary>
+    /// Resource-server scope granting a dedicated machine client load management (docs/load.md
+    /// section 8). Neither the deploy nor the jobs client carries it.
+    /// </summary>
+    public const string LoadScope = "mgmt/load";
 
     /// <summary>
     /// The identity stamped into audit records for a mutating call (tech-spec §4.5,
@@ -111,6 +123,14 @@ public static class ManagementAuth
     /// </summary>
     public static bool CanManageJobs(ClaimsPrincipal user) =>
         IsOpsAdmin(user) || HasScope(user, JobsScope);
+
+    /// <summary>
+    /// Satisfies <see cref="OpsLoadPolicy"/>: an <c>ops-admin</c> human, or a
+    /// client-credentials token bearing the <c>mgmt/load</c> scope. Start scales the
+    /// fleet, so <c>ops-deploy</c>, the deploy scope and the jobs scope do not qualify.
+    /// </summary>
+    public static bool CanManageLoad(ClaimsPrincipal user) =>
+        IsOpsAdmin(user) || HasScope(user, LoadScope);
 
     /// <summary>
     /// Satisfies <see cref="OpsRestartPolicy"/>: an <c>ops-admin</c> human, or a
