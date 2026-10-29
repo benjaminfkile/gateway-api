@@ -55,6 +55,10 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     // Only with a database; it shares the reconciler's runtime and leader status.
     builder.Services.AddJobScheduler(builder.Configuration);
 
+    // Load scheduler (docs/load.md section 3): the leader drives load runs from the
+    // ledger above through the fleet scaler and writes the generator spec secret.
+    builder.Services.AddLoadScheduler();
+
     // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
     // instance's status row via the EF store, and leadership — which gates the
     // stale-row cleanup — is derived from those same heartbeats (no lock, no lease).
@@ -123,9 +127,9 @@ builder.Services.AddManagementAuthentication();
 // DB branch above wired the EF-backed one.
 builder.Services.AddManagementServices();
 
-// Load runs part 1 (docs/load.md): options, pre-flight and the run-token rate limiter.
-// The store defaults to a no-op unless the DB branch above wired the EF-backed one. No
-// scheduler yet: a started run stays queued.
+// Load runs (docs/load.md): options, pre-flight, the run-token rate limiter and the
+// metrics. The store defaults to a no-op unless the DB branch above wired the EF-backed
+// one, together with the load scheduler.
 builder.Services.AddLoad();
 
 // Resources page (docs/load.md section 9): the fleet, cache and database scalers (AWS

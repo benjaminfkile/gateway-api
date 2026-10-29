@@ -57,6 +57,13 @@ public class LoadRun
     /// <summary>Lowercase hex sha256 of the run token the generators present.</summary>
     public string TokenHash { get; set; } = default!;
 
+    /// <summary>
+    /// The run token itself, held only from Start until the leader has written it into
+    /// the generator spec secret (docs/load.md section 5); null afterwards. Never part
+    /// of a response or a log line.
+    /// </summary>
+    public string? SpecToken { get; set; }
+
     /// <summary>Generators that have checked in.</summary>
     public int CheckedIn { get; set; }
 
@@ -92,4 +99,7 @@ public class LoadRun
 
     /// <summary>JSON array of <c>{ at, status, by, note }</c>.</summary>
     public string Timeline { get; set; } = "[]";
+
+    /// <summary>A shallow copy: every column is a value or an immutable string.</summary>
+    public LoadRun Clone() => (LoadRun)MemberwiseClone();
 }

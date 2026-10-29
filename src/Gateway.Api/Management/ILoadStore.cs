@@ -94,6 +94,27 @@ public interface ILoadStore
     Task<LoadRun?> ClaimQueuedRunAsync(long id, string by, DateTimeOffset now, CancellationToken ct = default);
 
     /// <summary>
+    /// The load scheduler's one conditional update per step (docs/load.md section 3).
+    /// Writes <paramref name="next"/>'s <c>status</c>, <c>timeline</c>,
+    /// <c>ramp_started_at</c>, <c>finished_at</c>, <c>fleet_size_before</c>,
+    /// <c>stop_reason</c>, <c>detail</c> and <c>spec_token</c>, only while the stored row
+    /// still has <paramref name="expected"/>'s status and timeline. A stop request and
+    /// every other step append to the timeline, so a step decided on an older read
+    /// matches nothing and two leaders ticking together cannot both act. Check-in
+    /// columns are never written here. Returns the run after the update, or null when
+    /// the update matched nothing.
+    /// </summary>
+    Task<LoadRun?> TryAdvanceRunAsync(LoadRun expected, LoadRun next, CancellationToken ct = default);
+
+    /// <summary>
+    /// Record <paramref name="runId"/> as the scenario's <c>last_validation_run_id</c>,
+    /// only while the scenario's <c>script_version</c> is still
+    /// <paramref name="scriptVersion"/> (a script changed during the run stays
+    /// unvalidated). False when nothing matched.
+    /// </summary>
+    Task<bool> SetScenarioValidationAsync(string scenario, int scriptVersion, long runId, CancellationToken ct = default);
+
+    /// <summary>
     /// Assign a generator index to <paramref name="instanceId"/> (docs/load.md section
     /// 5). A new instance gets the current <c>checked_in</c> as its index, and
     /// <c>checked_in</c> is incremented in the same conditional update (conditional on

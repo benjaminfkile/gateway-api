@@ -360,9 +360,10 @@ failure never fails the request.
 
 A load run ramps a fleet of k6 generators against a service behind the gateway,
 collects their stats every five seconds, and can never outlive its hard clock.
-The design is [`docs/load.md`](docs/load.md). Part 1 is built: the load model,
-the store, the management API, the two generator endpoints, pre-flight and the
-`ops:load` events. There is no scheduler yet, so a started run stays `queued`.
+The design is [`docs/load.md`](docs/load.md). Built: parts 1 and 2 and
+resources: the load model, the store, the management API, the two generator
+endpoints, pre-flight, the `ops:load` events and the load scheduler that drives
+a run on the fleet leader.
 The `generator_group` and `fleet_class` checks read through the fleet scaler of
 the Resources section below (the AWS one once `Load:GeneratorGroup` or a
 `Resources:Fleet*` key is set, `NullFleetScaler` otherwise).
@@ -371,7 +372,8 @@ State lives in four tables (tech-spec §4.4): `load_scenario` (the current k6
 script, repository, image, default params, users per generator, last validation
 run), `load_scenario_version` (every script body with its sha256, kept after a
 delete), `load_run` (the run ledger with its token hash, check-ins, peaks and
-timeline) and `load_run_stat` (every stats line, indexed on `(run_id, at)`).
+timeline; `spec_token` holds the token from Start until the leader has written
+the spec secret) and `load_run_stat` (every stats line, indexed on `(run_id, at)`).
 
 | Endpoint | Policy | Action |
 |---|---|---|
@@ -427,6 +429,58 @@ script version; skipped for a validation run), `presence_off` (the target's
 amber "unknown" when the template is unset or cannot be read; never red in v1)
 and `target_confirmed` (`confirm` equals the target).
 
+### Load scheduler
+
+`LoadSchedulerService` drives a run from `queued` to a terminal status. It ticks
+every `Load:TickInterval` (10 s) after the migration gate, acts only while
+`ILeaderStatus` holds a fresh leader answer (the job scheduler's seam), and takes
+one step per tick. Every status change is one conditional update on the run's
+status and timeline, appends a timeline entry by `gateway` and publishes `run` on
+`ops:load`, so two leaders in the same tick cannot both act.
+
+| Status | The leader | Leaves when |
+|---|---|---|
+| `queued` | claims it (one run at a time) and runs pre-flight again with `confirm` = target | claimed; a red check drains it with reason `failed`, `detail` = the check name |
+| `fleet_up` (only with `fleetSize`) | records `fleet_size_before`, sets min, max and desired of the fleet group together | that many instances heartbeat |
+| `generators_up` | writes the generator spec secret once, then sets only the generator group's desired to `generators` | every generator checked in (`ramp_started_at` stamped); `failed`/`checkin_timeout` after `Load:CheckInTimeout` |
+| `ramping` | | `ramp_seconds` after `ramp_started_at` |
+| `holding` | | `hold_seconds` after it began |
+| `draining` | keeps the generator group at 0; restores the fleet group's min, max and desired to `fleet_size_before` when `restoreFleet` | the generator group has zero in service, then `succeeded` (no reason), `stopped` (operator), `expired` (hard_clock), `failed` or `lost` (lost, leader_restart) |
+
+**Exits and guards:** in `fleet_up`, `generators_up`, `ramping` and `holding`
+the leader drains a run past `hard_stop_at` (`hard_clock`), a ramping or holding
+run whose newest generator line is older than `Load:StatsStaleAfter` (`lost`),
+and a run with `stopRequestedAt` (`operator`). Every path into `draining` sets
+the generator group's desired to 0 first. With no run non-terminal, a generator
+group above desired 0 is set to 0 and audited as `generators`/`orphan_guard` on
+`/mgmt/resources/audit`. On gaining leadership (also after a process restart), a
+non-terminal run this process is not driving is adopted when it is ramping or
+holding with fresh stats, or already draining; anything else drains with
+`leader_restart`. A scaler or secret call that throws is retried on the next
+tick; after `Load:ScaleRetryLimit` failed ticks in a row the run fails, with the
+generator group set to 0 regardless. A succeeded validation run records itself
+as the scenario's `lastValidationRunId`.
+
+**Generator spec secret:** written through `ISecretWriter` (Secrets Manager
+`PutSecretValue`, so the gateway role needs it on that secret) to
+`Load:GeneratorSpecSecret` as `{ runId, gatewayBaseUrl, token, image, tag }`, with
+`gatewayBaseUrl` from `Load:GatewayBaseUrl` and the image and tag of the
+scenario. The value is never logged or published.
+
+**Fleet samples:** every `Load:FleetSampleInterval` while a run is non-terminal
+the leader stores one `fleet` stats row `{ at, instances: [{ instanceId, leader,
+heartbeatAt, gatewayVersion, runningServices, cpu, memory, disk, hubConnections }],
+channelMembers }` from the instances with a fresh heartbeat (cpu, memory, disk and
+hub connections are null: the heartbeat row does not carry them yet) and the
+presence count of the run's `params.channel` (null without one), and publishes
+`fleet` on `ops:load`.
+
+**Metrics:** `ILoadMetrics` sends `LoadRunCount` (dimensions `Scenario`,
+`Status`) and `LoadRunDuration` (seconds, `Scenario`) when a run ends, and
+`LoadGeneratorStats` (`Scenario`) for every stored generator line, through the
+same EMF path and namespace as the job metrics (`Jobs:MetricsEndpoint`,
+`Jobs:MetricsNamespace`).
+
 | Key | Default | Meaning |
 |---|---|---|
 | `Load:GeneratorGroup` | unset | Generator Auto Scaling group name; unset answers Start with `503 load_unconfigured` |
@@ -439,6 +493,9 @@ and `target_confirmed` (`confirm` equals the target).
 | `Load:DbConnectionMargin` | `10` | Spare connections the headroom check requires |
 | `Load:DbDowngradeMarginPercent` | `25` | Resources: a smaller database class must exceed connections in use by this much |
 | `Load:FleetSampleInterval` | `00:00:10` | How often the leader writes a fleet sample |
+| `Load:TickInterval` | `00:00:10` | How often the load scheduler ticks |
+| `Load:GatewayBaseUrl` | unset | Public origin the generators reach the gateway at, e.g. `https://gateway.example.com`; written into the spec secret, and a run fails in `generators_up` while it is unset |
+| `Load:ScaleRetryLimit` | `6` | Failed ticks in a row of a run's scaling or secret step before the run fails |
 | `Load:DefaultImage`, `Load:DefaultTag` | `Jobs:DefaultImage`, `Jobs:DefaultTag` | Runner image and tag a scenario gets when PUT omits them |
 
 **Real-time:** the `ops:load` hub channel (same gate as `ops:deploys`) carries

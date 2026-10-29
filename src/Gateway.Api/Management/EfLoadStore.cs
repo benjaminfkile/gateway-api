@@ -162,6 +162,33 @@ public sealed class EfLoadStore : ILoadStore
         return claimed == 1 ? await GetRunAsync(id, ct) : null;
     }
 
+    public async Task<LoadRun?> TryAdvanceRunAsync(LoadRun expected, LoadRun next, CancellationToken ct = default)
+    {
+        var updated = await _db.LoadRuns
+            .Where(x => x.Id == expected.Id
+                && x.Status == expected.Status
+                && x.Timeline == expected.Timeline)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(x => x.Status, next.Status)
+                .SetProperty(x => x.Timeline, next.Timeline)
+                .SetProperty(x => x.RampStartedAt, next.RampStartedAt)
+                .SetProperty(x => x.FinishedAt, next.FinishedAt)
+                .SetProperty(x => x.FleetSizeBefore, next.FleetSizeBefore)
+                .SetProperty(x => x.StopReason, next.StopReason)
+                .SetProperty(x => x.Detail, next.Detail)
+                .SetProperty(x => x.SpecToken, next.SpecToken), ct);
+
+        return updated == 1 ? await GetRunAsync(expected.Id, ct) : null;
+    }
+
+    public async Task<bool> SetScenarioValidationAsync(string scenario, int scriptVersion, long runId, CancellationToken ct = default)
+    {
+        var updated = await _db.LoadScenarios
+            .Where(x => x.Name == scenario && x.ScriptVersion == scriptVersion)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.LastValidationRunId, runId), ct);
+        return updated == 1;
+    }
+
     public async Task<LoadCheckInResult> CheckInAsync(long runId, string instanceId, CancellationToken ct = default)
     {
         for (var attempt = 0; attempt < MaxAttempts; attempt++)

@@ -404,6 +404,10 @@ namespace Gateway.Api.Data.Migrations
                         .HasColumnType("integer")
                         .HasColumnName("scenario_version");
 
+                    b.Property<string>("SpecToken")
+                        .HasColumnType("text")
+                        .HasColumnName("spec_token");
+
                     b.Property<DateTimeOffset?>("StartedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("started_at");

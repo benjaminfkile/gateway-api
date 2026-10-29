@@ -338,6 +338,9 @@ public class LoadTokenEndpointsTests
         host.Store.Run(41).StopRequestedAt = null;
         host.Store.Run(41).Status = LoadRunStatus.Draining;
         Assert.Equal("stop", await ActionAsync());
+
+        // LoadGeneratorStats: one per stored line, by scenario.
+        Assert.Equal(new[] { "tracker", "tracker", "tracker" }, host.Metrics.StatsLines);
     }
 
     [Theory]

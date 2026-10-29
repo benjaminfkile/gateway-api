@@ -293,6 +293,57 @@ public class LoadStoreTests
         Assert.False(await store.DeleteRunAsync(done.Id));
     }
 
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task TryAdvance_WritesTheSchedulerColumns_OnlyWhileStatusAndTimelineAreUnchanged(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        var created = await store.TryCreateRunAsync(NewRun());
+        var run = await store.ClaimQueuedRunAsync(created!.Id, "leader", T0);
+        await store.CheckInAsync(run!.Id, "i-0placeholder0");
+
+        var next = run.Clone();
+        next.Status = LoadRunStatus.Ramping;
+        next.RampStartedAt = T0.AddMinutes(1);
+        next.FleetSizeBefore = 4;
+        next.SpecToken = null;
+        next.Detail = "note";
+        next.Timeline = LoadJson.AppendTimeline(run.Timeline, T0.AddMinutes(1), LoadRunStatus.Ramping, "leader");
+
+        var after = await store.TryAdvanceRunAsync(run, next);
+        Assert.NotNull(after);
+        Assert.Equal((LoadRunStatus.Ramping, T0.AddMinutes(1), 4, "note"), (after!.Status, after.RampStartedAt, after.FleetSizeBefore, after.Detail));
+        // Check-in columns are never written by an advance.
+        Assert.Equal(1, after.CheckedIn);
+
+        // A step decided on the old read matches nothing.
+        Assert.Null(await store.TryAdvanceRunAsync(run, next));
+
+        // A stop request changes the timeline, so an advance read before it loses.
+        var stopped = await store.RequestStopAsync(run.Id, "alice-admin", T0.AddMinutes(2));
+        var late = after.Clone();
+        late.Status = LoadRunStatus.Holding;
+        Assert.Null(await store.TryAdvanceRunAsync(after, late));
+        Assert.Equal(LoadRunStatus.Ramping, (await store.GetRunAsync(run.Id))!.Status);
+        Assert.NotNull(await store.TryAdvanceRunAsync(stopped!, late));
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task SetScenarioValidation_OnlyForTheVersionTheRunRan(string kind)
+    {
+        using var handle = new StoreHandle(kind);
+        var store = handle.Store;
+        await store.UpsertScenarioAsync(LoadTestHost.Scenario("tracker"));
+
+        Assert.False(await store.SetScenarioValidationAsync("tracker", 2, 7));
+        Assert.Null((await store.GetScenarioAsync("tracker"))!.LastValidationRunId);
+        Assert.True(await store.SetScenarioValidationAsync("tracker", 1, 7));
+        Assert.Equal(7, (await store.GetScenarioAsync("tracker"))!.LastValidationRunId);
+        Assert.False(await store.SetScenarioValidationAsync("missing", 1, 7));
+    }
+
     // ---------- stats ----------
 
     [Theory]

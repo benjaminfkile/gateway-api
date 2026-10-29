@@ -56,8 +56,8 @@ public sealed record LoadVerdictRequest(string? Verdict = null);
 /// generator endpoints (<c>checkin</c> and <c>stats</c>) take the run token instead
 /// of Cognito: anonymous, rate limited per source address, a 64 KiB body cap, and the
 /// same <c>401</c> for a wrong token and an unknown run. Every mutation publishes a
-/// best-effort event on <see cref="OpsLoadChannel"/>. There is no scheduler here: a
-/// queued run stays queued until the load scheduler claims it.
+/// best-effort event on <see cref="OpsLoadChannel"/>. A queued run stays queued until
+/// <see cref="LoadSchedulerService"/> on the leader claims it.
 /// </summary>
 public static partial class LoadEndpoints
 {
@@ -590,7 +590,8 @@ public static partial class LoadEndpoints
         var actor = ManagementAuth.ResolveUsername(user);
         var now = time.GetUtcNow();
 
-        // The token is shown to nobody: only its hash is kept.
+        // The token is shown to nobody: the hash is what check-in and stats compare, and
+        // spec_token holds the token only until the leader writes the spec secret.
         var token = MintToken();
         var lifetime = TimeSpan.FromSeconds(ramp + hold) + HardStopSlack;
 
@@ -611,6 +612,7 @@ public static partial class LoadEndpoints
             RestoreFleet = request.RestoreFleet ?? true,
             HardStopAt = now + (lifetime < HardStopCeiling ? lifetime : HardStopCeiling),
             TokenHash = TokenHash(token),
+            SpecToken = token,
             CheckedIn = 0,
             Checkins = "{}",
             QueuedAt = now,
@@ -779,6 +781,7 @@ public static partial class LoadEndpoints
         ILoadStore store,
         LoadTokenRateLimiter limiter,
         IChannelEventPublisher publisher,
+        ILoadMetrics metrics,
         CancellationToken ct)
     {
         var (run, body, refusal) = await AdmitAsync(id, http, store, limiter, ct);
@@ -807,6 +810,7 @@ public static partial class LoadEndpoints
             Body = body!,
         }, ct);
         await store.UpdatePeaksAsync(id, LoadStats.MetricLeaves(line.Metrics), ct);
+        metrics.GeneratorStatsReceived(run.Scenario);
 
         // The fleet-wide view: the newest line of every generator, merged.
         var latest = await store.GetLatestGeneratorStatsAsync(id, ct);
@@ -816,6 +820,8 @@ public static partial class LoadEndpoints
             .Select(o => o!));
         publisher.TryPublish(OpsLoadChannel, "stats", new { runId = id, at = line.At, aggregate });
 
+        // The scheduler stamps draining on every exit path, so a generator hears stop
+        // on its next line after any of them.
         var stop = run.StopRequestedAt is not null || run.Status == LoadRunStatus.Draining;
         return Results.Json(new { action = stop ? "stop" : "continue" });
     }
