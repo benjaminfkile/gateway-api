@@ -3,20 +3,11 @@ using Gateway.Api.Resources;
 
 namespace Gateway.Api.Load;
 
-/// <summary>Configuration keys of the Resources page the pre-flight checks read (docs/load.md section 9).</summary>
-public static class ResourcesConfig
-{
-    /// <summary>The fleet Auto Scaling group name.</summary>
-    public const string FleetGroupKey = "Resources:FleetGroup";
-
-    /// <summary>The fleet launch template name or id.</summary>
-    public const string FleetTemplateKey = "Resources:FleetTemplate";
-}
-
 /// <summary>
 /// <c>generator_group</c>: green when the generator group has desired 0, nothing in
 /// service, and a max that fits the run's generator count. Read through
-/// <see cref="IFleetScaler"/>; a group that cannot be read is red.
+/// <see cref="IFleetScaler"/> (the AWS one whenever <c>Load:GeneratorGroup</c> is set);
+/// a group that cannot be read is red.
 /// </summary>
 public sealed class GeneratorGroupCheck : ILoadPreflightCheck
 {
@@ -44,7 +35,7 @@ public sealed class GeneratorGroupCheck : ILoadPreflightCheck
         }
         catch (NotSupportedException ex)
         {
-            return Red($"The generator group cannot be read: {ex.Message}", "Wire the AWS fleet scaler (the resources build task).");
+            return Red($"The generator group cannot be read: {ex.Message}", "Set Load:GeneratorGroup so the AWS fleet scaler is registered.");
         }
 
         if (size is null)
@@ -77,19 +68,19 @@ public sealed class GeneratorGroupCheck : ILoadPreflightCheck
 /// <summary>
 /// <c>fleet_healthy</c>: green when every <c>instance_status</c> row has a fresh
 /// heartbeat and the target service is running on each (read the way the Instances
-/// endpoint reads them). When <c>Resources:FleetGroup</c> is set and the group can be
-/// read through <see cref="IFleetScaler"/>, the group's in-service count must not
-/// exceed the instances that heartbeat.
+/// endpoint reads them). When the fleet group is known (<see cref="FleetGroupResolver"/>)
+/// and can be read through <see cref="IFleetScaler"/>, the group's in-service count
+/// must not exceed the instances that heartbeat.
 /// </summary>
 public sealed class FleetHealthyCheck : ILoadPreflightCheck
 {
     private readonly IFleetScaler _scaler;
-    private readonly IConfiguration _configuration;
+    private readonly FleetGroupResolver _groups;
 
-    public FleetHealthyCheck(IFleetScaler scaler, IConfiguration configuration)
+    public FleetHealthyCheck(IFleetScaler scaler, FleetGroupResolver groups)
     {
         _scaler = scaler;
-        _configuration = configuration;
+        _groups = groups;
     }
 
     public string Name => "fleet_healthy";
@@ -123,8 +114,8 @@ public sealed class FleetHealthyCheck : ILoadPreflightCheck
                 "Start or deploy the target service and wait for every instance to converge.");
         }
 
-        var group = _configuration[ResourcesConfig.FleetGroupKey];
-        if (!string.IsNullOrWhiteSpace(group))
+        var group = await _groups.GetAsync(ct);
+        if (group is not null)
         {
             FleetGroupSize? size = null;
             try
@@ -133,7 +124,7 @@ public sealed class FleetHealthyCheck : ILoadPreflightCheck
             }
             catch (NotSupportedException)
             {
-                // No scaler yet: the heartbeats above are the whole check.
+                // The null scaler: the heartbeats above are the whole check.
             }
 
             if (size is not null && size.InService > context.FreshInstances.Count)
@@ -272,28 +263,29 @@ public sealed class DatabaseHeadroomCheck : ILoadPreflightCheck
 /// <summary>
 /// <c>fleet_class</c>: the fleet launch template's <c>$Default</c> instance type is
 /// not a burstable family (<c>t2</c>, <c>t3</c>, <c>t3a</c>, <c>t4g</c>). Amber, never
-/// red, in v1; amber "unknown" when the template is not configured or cannot be read
-/// through <see cref="IFleetScaler"/>.
+/// red, in v1; amber "unknown" when <c>Resources:FleetTemplate</c> is unset or the
+/// template cannot be read through <see cref="IFleetScaler"/> (the AWS one whenever the
+/// template is set).
 /// </summary>
 public sealed class FleetClassCheck : ILoadPreflightCheck
 {
     private static readonly string[] Burstable = { "t2", "t3", "t3a", "t4g" };
 
     private readonly IFleetScaler _scaler;
-    private readonly IConfiguration _configuration;
+    private readonly ResourcesOptions _resources;
 
-    public FleetClassCheck(IFleetScaler scaler, IConfiguration configuration)
+    public FleetClassCheck(IFleetScaler scaler, ResourcesOptions resources)
     {
         _scaler = scaler;
-        _configuration = configuration;
+        _resources = resources;
     }
 
     public string Name => "fleet_class";
 
     public async Task<PreflightCheckResult> EvaluateAsync(LoadPreflightContext context, CancellationToken ct = default)
     {
-        var template = _configuration[ResourcesConfig.FleetTemplateKey];
-        if (string.IsNullOrWhiteSpace(template))
+        var template = _resources.FleetTemplate;
+        if (template is null)
         {
             return Unknown("Resources:FleetTemplate is not set.");
         }
@@ -303,12 +295,17 @@ public sealed class FleetClassCheck : ILoadPreflightCheck
         {
             described = await _scaler.DescribeLaunchTemplateAsync(template, ct);
         }
-        catch (NotSupportedException ex)
+        catch (Exception ex) when (ex is NotSupportedException or Amazon.Runtime.AmazonServiceException)
         {
             return Unknown(ex.Message);
         }
 
-        if (described?.InstanceType is not { Length: > 0 } instanceType)
+        if (described is null)
+        {
+            return Unknown($"the launch template {template} does not exist.");
+        }
+
+        if (described.InstanceType is not { Length: > 0 } instanceType)
         {
             return Unknown("the template's $Default sets no instance type.");
         }

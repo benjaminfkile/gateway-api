@@ -157,6 +157,7 @@ public class LoadModelTests
             () => scaler.SetGroupSizeAsync("g", 0, 0, 0),
             () => scaler.SetDesiredAsync("g", 0),
             () => scaler.DescribeLaunchTemplateAsync("t"),
+            () => scaler.DescribeLaunchTemplateVersionAsync("t", 2),
             () => scaler.CreateLaunchTemplateVersionAsync("t", "m7g.large"),
             () => scaler.SetDefaultLaunchTemplateVersionAsync("t", 2),
             () => scaler.StartInstanceRefreshAsync("g", new FleetRefreshPreferences(100, 150, 300)),

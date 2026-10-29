@@ -407,9 +407,10 @@ operator through the dashboard's Cognito token):
 | `ops:fleet` | `heartbeat`, `serviceError`, `leaderChange`, `instances` |
 | `ops:jobs` | `job` `{ name, action: upserted \| deleted \| enabled \| disabled, by }` on every job change; `run` `{ runId, job, status, trigger, actor, instanceId, startedAt, finishedAt, exitCode }` on every run status change (see [`docs/jobs.md`](docs/jobs.md) section 5) |
 | `ops:load` | `scenario` `{ name, action: upserted \| deleted, by }`; `run` `{ runId, scenario, status, actor, generators, vusPerGenerator, startedAt, finishedAt, stopReason }` on every run status change; `stats` `{ runId, at, aggregate }` after every stored generator line; `fleet` `{ runId, at, sample }` after every fleet sample (see [`docs/load.md`](docs/load.md) section 10) |
+| `ops:resources` | `change` `{ resource, action, by, before, after }` after every audited Resources change; `refresh` `{ refreshId, status, percentComplete }` when a fleet class change or rollback starts its instance refresh and on every 30 s poll until it ends (see [`docs/load.md`](docs/load.md) section 10) |
 
-`ops:jobs` and `ops:load` use the same gate as `ops:deploys`. Like every event, these are hints:
-the dashboard refetches `/mgmt/jobs` or `/mgmt/load` on an event and keeps a polling floor.
+`ops:jobs`, `ops:load` and `ops:resources` use the same gate as `ops:deploys`. Like every event, these are hints:
+the dashboard refetches `/mgmt/jobs`, `/mgmt/load` or `/mgmt/resources` on an event and keeps a polling floor.
 
 ### Publishes are dropped while the backplane is degraded
 

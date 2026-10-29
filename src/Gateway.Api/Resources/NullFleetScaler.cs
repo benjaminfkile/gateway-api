@@ -1,9 +1,10 @@
 namespace Gateway.Api.Resources;
 
 /// <summary>
-/// The <see cref="IFleetScaler"/> registered while no AWS implementation exists. Every
-/// member throws <see cref="NotSupportedException"/>, so nothing is ever scaled; the
-/// pre-flight checks that read through it report the group or template as unreadable
+/// The <see cref="IFleetScaler"/> registered when neither a fleet group, a fleet
+/// template nor a generator group is configured (a dev box without AWS). Every member
+/// throws <see cref="NotSupportedException"/>, so nothing is ever scaled; the pre-flight
+/// checks that read through it report the group or template as unreadable
 /// (<c>generator_group</c> red, <c>fleet_class</c> amber "unknown").
 /// </summary>
 public sealed class NullFleetScaler : IFleetScaler
@@ -28,6 +29,10 @@ public sealed class NullFleetScaler : IFleetScaler
         throw new NotSupportedException(NotConfiguredMessage);
 
     /// <exception cref="NotSupportedException">Always.</exception>
+    public Task<FleetTemplateVersion?> DescribeLaunchTemplateVersionAsync(string template, long version, CancellationToken ct = default) =>
+        throw new NotSupportedException(NotConfiguredMessage);
+
+    /// <exception cref="NotSupportedException">Always.</exception>
     public Task<long> CreateLaunchTemplateVersionAsync(string template, string instanceType, CancellationToken ct = default) =>
         throw new NotSupportedException(NotConfiguredMessage);
 
@@ -44,6 +49,6 @@ public sealed class NullFleetScaler : IFleetScaler
         throw new NotSupportedException(NotConfiguredMessage);
 
     /// <exception cref="NotSupportedException">Always.</exception>
-    public Task<IReadOnlyList<FleetRefresh>> DescribeInstanceRefreshesAsync(string group, CancellationToken ct = default) =>
+    public Task<IReadOnlyList<FleetRefresh>> DescribeInstanceRefreshesAsync(string group, string? refreshId = null, CancellationToken ct = default) =>
         throw new NotSupportedException(NotConfiguredMessage);
 }
