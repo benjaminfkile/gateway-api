@@ -356,7 +356,7 @@ page while any check is red, and by the API with `409 preflight_failed`.
 | `target_known` | the target is a manifest service | not a service | yes |
 | `scenario_validated` | `last_validation_run_id` is set and its run's `scenario_version` equals the current version (skipped for a validation run) | validate first | yes |
 | `presence_off` | the target service's `realtime_presence` is false | a join batch would broadcast to every member | yes |
-| `database_headroom` | `max_connections - in use >= fleet nodes * Load:DbConnectionsPerNode + Load:DbConnectionMargin` on the gateway's own database connection | name the numbers; fix: the database card on Resources | yes |
+| `database_headroom` | `max_connections - in use >= added nodes * Load:DbConnectionsPerNode + Load:DbConnectionMargin` on the gateway's own database connection, where added nodes is what the requested fleet size would add beyond the nodes that heartbeat now (the live nodes are already in "in use"); zero added means only the margin | name the numbers; fix: the database card on Resources | yes |
 | `fleet_class` | the fleet launch template's `$Default` instance type is not a burstable family (`t2`, `t3`, `t3a`, `t4g`) | amber, not red, in v1 (the first runs are small and the fleet is t4g.small) | amber |
 | `target_confirmed` | the page sent `confirm` equal to the target name | type the target to confirm; production is allowed | yes |
 | `file_descriptors`, `backplane`, `spend` | phase 2 | | no |

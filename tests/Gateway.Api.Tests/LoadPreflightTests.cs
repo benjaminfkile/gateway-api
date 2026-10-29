@@ -269,15 +269,17 @@ public class LoadPreflightTests
     // ---------- database_headroom ----------
 
     [Theory]
-    // free 50, 2 nodes x 20 + 10 = 50: exactly enough.
+    // No fleet change: only the margin of 10 is needed; free 50.
     [InlineData(100, 50, 2, null, PreflightStatus.Green)]
-    // free 49 against 50.
-    [InlineData(100, 51, 2, null, PreflightStatus.Red)]
-    // A requested fleet of 3 counts 3 nodes: 70 needed.
-    [InlineData(100, 50, 2, 3, PreflightStatus.Red)]
-    // A requested fleet smaller than the live one counts the live one.
-    [InlineData(100, 50, 2, 1, PreflightStatus.Green)]
-    // No instance heartbeats: still at least one node, 30 needed.
+    // No fleet change but free 5 against the margin of 10.
+    [InlineData(100, 95, 2, null, PreflightStatus.Red)]
+    // A requested fleet of 3 adds one node: 1 x 20 + 10 = 30 against free 25.
+    [InlineData(100, 75, 2, 3, PreflightStatus.Red)]
+    // The same request against free 30: exactly enough.
+    [InlineData(100, 70, 2, 3, PreflightStatus.Green)]
+    // A requested fleet smaller than the live one adds nothing.
+    [InlineData(100, 95, 2, 1, PreflightStatus.Red)]
+    // No instance heartbeats and no request: only the margin, free 30.
     [InlineData(40, 10, 0, null, PreflightStatus.Green)]
     public async Task DatabaseHeadroom_Arithmetic(int max, int inUse, int nodes, int? fleet, string status)
     {
@@ -298,10 +300,11 @@ public class LoadPreflightTests
         var options = new LoadOptions { GeneratorGroup = Group, DbConnectionsPerNode = 45, DbConnectionMargin = 11 };
 
         var result = await new DatabaseHeadroomCheck(headroom).EvaluateAsync(Context(
+            Request(fleet: 4),
             fresh: new[] { LoadTestHost.Instance("i-0a", Now), LoadTestHost.Instance("i-0b", Now) },
             options: options));
         Assert.Equal(PreflightStatus.Red, result.Status);
-        Assert.Contains("2 nodes x 45 + 11 needs 101", result.Message);
+        Assert.Contains("2 live nodes, 2 added x 45 + 11 needs 101", result.Message);
 
         headroom.Connections = null;
         Assert.Equal(PreflightStatus.Amber, (await new DatabaseHeadroomCheck(headroom).EvaluateAsync(Context())).Status);

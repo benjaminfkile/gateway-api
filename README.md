@@ -423,8 +423,9 @@ generator group is empty and its max fits the run, read through `IFleetScaler`),
 `target_known`, `scenario_validated` (the last validation ran the current
 script version; skipped for a validation run), `presence_off` (the target's
 `realtime_presence` is off), `database_headroom` (`max_connections` minus
-`pg_stat_activity` covers fleet nodes times `Load:DbConnectionsPerNode` plus
-`Load:DbConnectionMargin`, read on the gateway's own connection), `fleet_class`
+`pg_stat_activity` covers the nodes a requested fleet size would add times
+`Load:DbConnectionsPerNode` plus `Load:DbConnectionMargin`, read on the
+gateway's own connection; the live nodes are already counted in use), `fleet_class`
 (amber for a burstable `$Default` instance type of `Resources:FleetTemplate`,
 amber "unknown" when the template is unset or cannot be read; never red in v1)
 and `target_confirmed` (`confirm` equals the target).

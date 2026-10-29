@@ -222,9 +222,11 @@ public sealed class PresenceOffCheck : ILoadPreflightCheck
 
 /// <summary>
 /// <c>database_headroom</c>: green when
-/// <c>max_connections - in use &gt;= fleet nodes * Load:DbConnectionsPerNode + Load:DbConnectionMargin</c>,
-/// where fleet nodes is the larger of the instances that heartbeat and the requested
-/// fleet size (at least 1). Amber when there is no database to ask.
+/// <c>max_connections - in use &gt;= added nodes * Load:DbConnectionsPerNode + Load:DbConnectionMargin</c>,
+/// where added nodes is how many instances the run's requested fleet size would add
+/// beyond those that heartbeat now (zero when no size is requested or it is not
+/// larger): the live nodes' connections are already counted in "in use". Amber when
+/// there is no database to ask.
 /// </summary>
 public sealed class DatabaseHeadroomCheck : ILoadPreflightCheck
 {
@@ -245,13 +247,14 @@ public sealed class DatabaseHeadroomCheck : ILoadPreflightCheck
             return new PreflightCheckResult(Name, PreflightStatus.Amber, "Unknown: no database to ask.", null);
         }
 
-        var nodes = Math.Max(1, Math.Max(context.FreshInstances.Count, context.Request.FleetSize ?? 0));
+        var live = context.FreshInstances.Count;
+        var added = Math.Max(0, (context.Request.FleetSize ?? live) - live);
         var perNode = context.Options.DbConnectionsPerNode;
         var margin = context.Options.DbConnectionMargin;
-        var needed = (nodes * perNode) + margin;
+        var needed = (added * perNode) + margin;
         var free = connections.MaxConnections - connections.InUse;
         var numbers = $"max_connections {connections.MaxConnections}, in use {connections.InUse}, free {free}; "
-            + $"{nodes} nodes x {perNode} + {margin} needs {needed}.";
+            + $"{live} live nodes, {added} added x {perNode} + {margin} needs {needed}.";
 
         return free >= needed
             ? new PreflightCheckResult(Name, PreflightStatus.Green, numbers, null)
