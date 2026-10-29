@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Load generators for the gateway's load runs (docs/load.md section 5): one
+  Auto Scaling group that rests at zero, a launch template whose user data
+  checks a generator in with the gateway and runs the runner image in load
+  mode, a security group with no inbound rule, an instance role that can pull
+  the runner image, write the log group and read the generator spec secret,
+  and the log group. Created once by an operator; the gateway only ever sets
+  the group's desired capacity.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC the generators run in (any VPC that reaches the gateway's public origin).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (the generators need a route to the internet and get a public address).
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    Description: Generator instance type; arm64 only (the AMI is Amazon Linux 2023 arm64).
+  MaxSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 50
+    Description: Most generators the group may hold. The gateway's Load:MaxGenerators must not exceed it.
+  GroupName:
+    Type: String
+    Default: gateway-load-generators
+    Description: Name of the Auto Scaling group; the gateway reads it from Load:GeneratorGroup.
+  SpecSecretName:
+    Type: String
+    Default: gateway/load/generator-spec
+    Description: Secrets Manager name of the generator spec secret the gateway writes at Start (Load:GeneratorSpecSecret). Created outside this stack with a placeholder value.
+  RunnerRepositoryArn:
+    Type: String
+    Description: ARN of the ECR repository that holds the runner image.
+  LogGroupName:
+    Type: String
+    Default: /gateway/load
+    Description: Log group the generators write to, stream run-{id}-{index}.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: !Ref LogRetentionDays
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Gateway load generators; egress only, no inbound rule.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: gateway:role
+          Value: load-generator
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: load-generator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PullRunnerImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Ref RunnerRepositoryArn
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${LogGroup.Arn}:*"
+              - Sid: ReadSpec
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SpecSecretName}-*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${GroupName}-lt"
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}"
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref SecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 16
+              VolumeType: gp3
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: gateway:role
+                Value: load-generator
+              - Key: Name
+                Value: !Ref GroupName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Boots one load generator (docs/load.md section 5): reads the
+            # generator spec secret, logs in to the registry, pulls the runner
+            # image, checks in with the gateway for its share of the run, and
+            # runs the image in load mode. A check-in the gateway refuses leaves
+            # the instance idle; the gateway scales the group to zero when the
+            # run leaves generators_up or ends. No credential is in this script.
+            set -uo pipefail
+            exec > >(logger -t gateway-load) 2>&1
+
+            spec_secret="${SpecSecretName}"
+            log_group="${LogGroupName}"
+            state=/var/lib/gateway-load
+            mkdir -p "$state"
+            chmod 700 "$state"
+
+            dnf install -y -q docker jq
+            systemctl enable --now docker
+
+            imds() {
+              local token
+              token=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              curl -s -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
+            }
+            region=$(imds placement/region)
+            instance_id=$(imds instance-id)
+
+            spec=$(aws secretsmanager get-secret-value --region "$region" --secret-id "$spec_secret" --query SecretString --output text) || { echo "spec secret unreadable"; exit 1; }
+            run_id=$(jq -r '.runId' <<<"$spec")
+            base_url=$(jq -r '.gatewayBaseUrl' <<<"$spec")
+            image=$(jq -r '.image' <<<"$spec")
+            tag=$(jq -r '.tag' <<<"$spec")
+            jq -r '.token' <<<"$spec" > "$state/token"
+            chmod 600 "$state/token"
+            unset spec
+
+            registry="${!image%%/*}"
+            aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry" >/dev/null
+            docker pull "$image:$tag" >/dev/null
+
+            printf 'header = "X-Gateway-Load-Token: %s"\n' "$(cat "$state/token")" > "$state/curl.conf"
+            chmod 600 "$state/curl.conf"
+            status=$(curl -s -K "$state/curl.conf" -o "$state/checkin.json" -w '%{http_code}' --max-time 20 \
+              -H 'Content-Type: application/json' -X POST \
+              --data "{\"instanceId\":\"$instance_id\"}" "$base_url/mgmt/load/runs/$run_id/checkin")
+            if [ "$status" != "200" ]; then
+              echo "check-in refused: HTTP $status; idle until the gateway scales the group in"
+              exit 0
+            fi
+
+            index=$(jq -r '.index' "$state/checkin.json")
+            {
+              echo "GATEWAY_LOAD_RUN_ID=$run_id"
+              echo "GATEWAY_LOAD_SCENARIO=$(jq -r '.scenario' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_INDEX=$index"
+              echo "GATEWAY_LOAD_COUNT=$(jq -r '.count' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_VUS=$(jq -r '.vus' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_RAMP_SECONDS=$(jq -r '.rampSeconds' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_HOLD_SECONDS=$(jq -r '.holdSeconds' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_TARGET=$(jq -r '.target' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_PARAMS=$(jq -c '.params' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_SCRIPT=$(jq -r '.script' "$state/checkin.json" | base64 -w0)"
+              echo "GATEWAY_LOAD_STATS_URL=$(jq -r '.statsUrl' "$state/checkin.json")"
+              echo "GATEWAY_LOAD_TOKEN=$(cat "$state/token")"
+            } > "$state/run.env"
+            chmod 600 "$state/run.env"
+
+            docker run --rm --name "load-run-$run_id-$index" \
+              --log-driver awslogs \
+              --log-opt "awslogs-region=$region" \
+              --log-opt "awslogs-group=$log_group" \
+              --log-opt "awslogs-stream=run-$run_id-$index" \
+              --env-file "$state/run.env" \
+              "$image:$tag"
+            echo "run $run_id generator $index ended with $?; idle until the gateway scales the group in"
+            rm -f "$state/run.env" "$state/token" "$state/curl.conf"
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Ref GroupName
+      MinSize: "0"
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: "0"
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: gateway:role
+          Value: load-generator
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: false
+
+Outputs:
+  GroupName:
+    Value: !Ref AutoScalingGroup
+    Description: Set Load:GeneratorGroup to this.
+  LogGroupName:
+    Value: !Ref LogGroup
+  InstanceRoleArn:
+    Value: !GetAtt InstanceRole.Arn

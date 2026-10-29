@@ -7,7 +7,7 @@ generator Auto Scaling group and its own fleet group; it never creates
 infrastructure. The companion Resources page scales what already exists. This
 document is the contract for the build tasks at the end.
 
-Status: designed 2026-10-29, building v1. The first scenario is an anonymous
+Status: designed 2026-10-29, building v1. Built and verified so far: task 0 (wmsfo-api `tools/loadtest`, one-user run against dev passed) and task 1 (runner image with k6 1.8.2 and the load mode, smoke passed). The first scenario is an anonymous
 WMSFO tracker visitor on the dev stack; the first generator group is one
 t4g.small. Phase 2 (the signed-in flow, bigger generators, CloudWatch-backed
 fleet metrics, the 100k ladder) is listed in section 13 and is not part of v1.
@@ -178,8 +178,8 @@ which runs k6 against the script with this environment:
 Inside k6 these are `__ENV.GATEWAY_LOAD_*`. The script must:
 
 - define its load with a `ramping-vus` executor whose stages are `[{ duration: RAMP, target: VUS }, { duration: HOLD, target: VUS }]`, so the gateway's ramp and hold are the script's;
-- set `summaryTrendStats` to `["avg", "min", "med", "max", "p(95)", "p(99)"]` so trends report the percentiles the page draws;
-- keep every custom metric name in `snake_case` with a unit suffix where one applies (`event_lag_ms`, `poll_ms`, `seq_gaps`, `ws_errors`);
+- set `summaryTrendStats` to `["avg", "min", "med", "max", "p(95)", "p(99)"]` for the end-of-run summary; note that k6's REST API, which the reporter reads, carries `p(90)` and `p(95)` for a trend and no `p(99)`, so the page draws `p(95)` as the high percentile;
+- keep every custom metric name in `snake_case` with a unit suffix where one applies (`event_lag_ms`, `poll_ms`, `event_gap_ms`, `ws_errors`);
 - read every URL and name from `__ENV.GATEWAY_LOAD_PARAMS`, never from a literal, so the same script runs against dev and prod;
 - never carry a credential in the script text: secrets, when phase 2 needs them, arrive through the run's secret reference.
 
@@ -200,8 +200,9 @@ The runner's reporter posts one line every five seconds per generator to
   "metrics": {
     "vus":          { "type": "gauge",   "value": 480 },
     "ws_sessions":  { "type": "counter", "count": 480, "rate": 0 },
-    "event_lag_ms": { "type": "trend",   "avg": 41, "min": 12, "med": 38, "max": 410, "p(95)": 120, "p(99)": 310 },
-    "seq_gaps":     { "type": "counter", "count": 0, "rate": 0 },
+    "event_lag_ms": { "type": "trend",   "avg": 41, "min": 12, "med": 38, "max": 410, "p(90)": 95, "p(95)": 120 },
+    "event_gap_ms": { "type": "trend",   "avg": 1001, "min": 940, "med": 1000, "max": 1310, "p(90)": 1040, "p(95)": 1080 },
+    "seq_regressions": { "type": "counter", "count": 0, "rate": 0 },
     "ws_errors":    { "type": "counter", "count": 1, "rate": 0 }
   } }
 ```
@@ -253,7 +254,7 @@ role, log in to ECR, pull `image:tag`, then `POST {gatewayBaseUrl}/mgmt/load/run
 with header `X-Gateway-Load-Token` and body `{ "instanceId": "i-..." }`. The
 gateway answers, on the public listener with the token as the only credential:
 
-- `200 { index, count, vus, rampSeconds, holdSeconds, scenario, target, script, params, statsUrl }`
+- `200 { index, count, vus, rampSeconds, holdSeconds, scenario, target, script, params, statsUrl }` (`script` is the plain script body; the user data base64-encodes it into `GATEWAY_LOAD_SCRIPT` for the runner, and `statsUrl` is built from the request's forwarded scheme and host)
   when the run is in `generators_up` and `checked_in < generators`; `index` is
   assigned in check-in order and `checked_in` is incremented in the same
   conditional update, so two instances never share an index. A repeat
@@ -445,7 +446,7 @@ at `/resources` after Node stats. The Jobs page is untouched.
 **Load page**, three views:
 
 - **Runs list** (default): status chip, scenario, target, generators times
-  users, started, duration, peak of `event_lag_ms.p(99)` when present,
+  users, started, duration, peak of `event_lag_ms.p(95)` when present,
   verdict, with New run, Validate, Stop, Open and Delete.
 - **Run**: the form (scenario, target with a typed confirm field, generators,
   users each with the computed total, ramp and hold in minutes, fleet size with
@@ -454,7 +455,7 @@ at `/resources` after Node stats. The Jobs page is untouched.
   (debounced `GET /mgmt/load/preflight`), Start disabled while any check is
   red; once started, the same screen becomes the live view: a status strip
   with the state, elapsed, hard stop time and Stop; tiles for total users,
-  every top-level counter and the `p(99)` of every trend from the aggregate;
+  every top-level counter and the `p(95)` of every trend from the aggregate;
   a chart of users and the first trend over the run; a fleet panel with one
   row per instance (connections, cpu, memory) and the channel member count;
   the timeline. A finished run shows the same view from stored stats, with
@@ -533,7 +534,7 @@ posted. Nothing touches the fleet until an operator merges main.
 0. **wmsfo-api: scenario v1.** `tools/loadtest/`: a k6 script for an anonymous
    tracker visitor (raw websocket SignalR handshake and `JoinChannel`, one
    location event per second measured as `event_lag_ms` from `publishedAt`,
-   `seq_gaps`, CDN poll of the live object at the poll cadence for the poll
+   `event_gap_ms` and `seq_regressions` (seq values are not consecutive on the hub: every stored fix of the event takes one, spare beacons included, so only a repeat or a step back is a fault), CDN poll of the live object at the poll cadence for the poll
    fraction, keepalive pings, re-join on `channelEvicted`), offline tests with
    a fake socket, README. The signed-in pick is phase 2.
 1. **gateway-job-runner: k6 and the load mode.** Section 7, smoke test with
