@@ -362,10 +362,10 @@ A load run ramps a fleet of k6 generators against a service behind the gateway,
 collects their stats every five seconds, and can never outlive its hard clock.
 The design is [`docs/load.md`](docs/load.md). Part 1 is built: the load model,
 the store, the management API, the two generator endpoints, pre-flight and the
-`ops:load` events. There is no scheduler yet, so a started run stays `queued`;
-the fleet scaler seam (`IFleetScaler`) is registered as `NullFleetScaler`, which
-refuses every call, so the `generator_group` check is red until the resources
-task wires the AWS implementation.
+`ops:load` events. There is no scheduler yet, so a started run stays `queued`.
+The `generator_group` and `fleet_class` checks read through the fleet scaler of
+the Resources section below (the AWS one once `Load:GeneratorGroup` or a
+`Resources:Fleet*` key is set, `NullFleetScaler` otherwise).
 
 State lives in four tables (tech-spec §4.4): `load_scenario` (the current k6
 script, repository, image, default params, users per generator, last validation
@@ -423,8 +423,9 @@ script version; skipped for a validation run), `presence_off` (the target's
 `realtime_presence` is off), `database_headroom` (`max_connections` minus
 `pg_stat_activity` covers fleet nodes times `Load:DbConnectionsPerNode` plus
 `Load:DbConnectionMargin`, read on the gateway's own connection), `fleet_class`
-(amber for a burstable fleet class, amber "unknown" when the template cannot be
-read) and `target_confirmed` (`confirm` equals the target).
+(amber for a burstable `$Default` instance type of `Resources:FleetTemplate`,
+amber "unknown" when the template is unset or cannot be read; never red in v1)
+and `target_confirmed` (`confirm` equals the target).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -447,6 +448,69 @@ on Start, on a stop request and on every status change, `stats` `{ runId, at,
 aggregate }` after every stored generator line, and `fleet` `{ runId, at, sample }`
 after every fleet sample. Publishing is best-effort: a backplane failure never
 fails the request.
+
+## Resources
+
+The Resources page scales what already exists: the fleet Auto Scaling group and
+its launch template, the realtime backplane's ElastiCache replication group, and
+the RDS instance every service shares. The design is section 9 of
+[`docs/load.md`](docs/load.md). Every AWS call goes through `IFleetScaler`,
+`ICacheScaler` or `IDatabaseScaler`; each is the AWS SDK implementation
+(`AwsFleetScaler`, `ElastiCacheScaler`, `RdsDatabaseScaler`: default credential
+chain, region from the environment, one client per service) when its keys are
+set, and a null one that refuses every call otherwise, so a box without AWS
+still boots. Reads need OpsDeploy; every mutation needs OpsAdmin, so neither
+`ops-deploy`, the CI scope, the `mgmt/jobs` client nor the `mgmt/load` client
+can change a resource.
+
+| Endpoint | Policy | Action |
+|---|---|---|
+| `GET /mgmt/resources` | OpsDeploy | `{ runActive, fleet: { group, min, desired, max, inService, instanceClass, templateVersion, refreshInProgress, classes, maxSize, error }, generators: { group, desired, inService, max, error }, cache: { id, nodeType, status, nodeTypes, error }, database: { id, instanceClass, status, maxConnections, connectionsInUse, documentedMaxConnections, classes, error } }`; a block is null when its key is unset, and `error` carries an AWS read failure |
+| `GET /mgmt/resources/fleet/refresh` | OpsDeploy | The fleet group's newest instance refresh: `{ group, refreshId, status, percentComplete, inProgress }` |
+| `GET /mgmt/resources/audit?limit=50` | OpsDeploy | `[{ id, at, actor, resource, action, before, after, detail }]` newest first, `limit` 1..500 |
+| `PUT /mgmt/resources/fleet/size` | OpsAdmin | `{ size }` (1..`Resources:FleetMaxSize`): sets min, desired and max together (never desired alone: target tracking scales an idle fleet back in). `202 { group, min, desired, max }` |
+| `PUT /mgmt/resources/fleet/class` | OpsAdmin | `{ instanceClass }` from `Resources:FleetClasses`: creates a template version from `$Default` with only `InstanceType` changed, makes it `$Default`, raises the group's max by one and starts an instance refresh with the deploy preferences (min healthy 100, max healthy 150, warmup 300 s). `202 { templateVersion, refreshId }` |
+| `PUT /mgmt/resources/fleet/class/rollback` | OpsAdmin | `{ templateVersion }` of a version that exists (`400 version_not_found` otherwise): makes it `$Default` and starts a refresh the same way |
+| `PUT /mgmt/resources/cache/node-type` | OpsAdmin | `{ nodeType }` from `Resources:CacheNodeTypes`: modifies the replication group, applied immediately. `202 { id, nodeType, note }`; the note (also in the audit row) says publishes are dropped while the backplane is degraded |
+| `PUT /mgmt/resources/database/class` | OpsAdmin | `{ instanceClass, confirm }` from `Resources:DatabaseClasses`, `confirm` equal to `Resources:DatabaseInstance` (`400 confirm_mismatch`). Class only, applied immediately. A downgrade is `409 downgrade_unsafe` unless the target's documented `max_connections` is at least connections in use plus `Load:DbDowngradeMarginPercent`. `202 { id, instanceClass, services, note }`: every manifest service and the reboot warning |
+
+Every mutation answers, in order: `503 resource_unconfigured` when the
+resource's key is unset, `400` on the body (`class_not_allowed` outside the allow
+list), `409 run_active` while a load run is non-terminal, then
+`409 refresh_in_progress` (fleet size, class and rollback, while the fleet group's
+newest refresh is in flight, whoever started it) or `409 downgrade_unsafe`. An
+AWS error answers `502 { error: "aws_error", detail }`. A change that reaches AWS
+writes a `resource_audit` row (migration `AddResourceAudit`) and publishes on
+`ops:resources`.
+
+**Downgrade rule:** a class is a downgrade when its documented `max_connections`
+is lower than the current class's, or when either class is missing from the
+operator-maintained table in `DatabaseClassConnections` (the RDS Postgres default
+`LEAST({DBInstanceClassMemory/9531392}, 5000)` over each class's nominal memory,
+listed in docs/load.md section 9). An unknown target, or unknown connections in
+use, refuses the downgrade.
+
+**Refresh watcher:** a hosted service polls every 30 s. It finds the refreshes
+the gateway started through their audit rows (so the instance that started a
+refresh may be replaced by it), publishes `refresh` progress, and when the
+refresh ends (successful, failed, cancelled, rolled back, or unknown to Auto
+Scaling) puts the group's max back to its value before the raise and writes a
+`refresh_ended` row. Only the fresh leader acts; an instance with the reconciler
+disabled acts alone.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Resources:FleetGroup` | unset | Fleet Auto Scaling group name. When unset and `Resources:FleetTemplate` is set, read from the instance's `aws:autoscaling:groupName` tag through IMDS (needs instance metadata tags on) |
+| `Resources:FleetTemplate` | unset | Fleet launch template name, or id when it starts with `lt-` |
+| `Resources:FleetClasses` | empty | Allowed fleet instance types, comma separated |
+| `Resources:FleetMaxSize` | `50` | Largest size `fleet/size` accepts |
+| `Resources:CacheReplicationGroup`, `Resources:CacheNodeTypes` | unset, empty | The backplane replication group and its allowed node types |
+| `Resources:DatabaseInstance`, `Resources:DatabaseClasses` | unset, empty | The database instance identifier and its allowed classes |
+
+**Real-time:** the `ops:resources` hub channel (same gate as `ops:deploys`)
+carries `change` `{ resource, action, by, before, after }` after every audited
+change and `refresh` `{ refreshId, status, percentComplete }` when a class change
+or rollback starts its refresh and on every watcher poll until it ends.
 
 ## Internal listener (containers only)
 

@@ -10,6 +10,7 @@ using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
+using Gateway.Api.Resources;
 using Gateway.Api.Systemd;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -46,6 +47,9 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     // and the database headroom read on the gateway's own connection.
     builder.Services.AddScoped<ILoadStore, EfLoadStore>();
     builder.Services.AddScoped<IDatabaseHeadroom, EfDatabaseHeadroom>();
+
+    // Resources page (docs/load.md section 9): the audit of every resource change.
+    builder.Services.AddScoped<IResourceAuditStore, EfResourceAuditStore>();
 
     // Job executor (docs/jobs.md section 3): claims and drives runs from that ledger.
     // Only with a database; it shares the reconciler's runtime and leader status.
@@ -119,10 +123,16 @@ builder.Services.AddManagementAuthentication();
 // DB branch above wired the EF-backed one.
 builder.Services.AddManagementServices();
 
-// Load runs part 1 (docs/load.md): options, pre-flight, the fleet scaler seam and the
-// run-token rate limiter. The store defaults to a no-op unless the DB branch above
-// wired the EF-backed one. No scheduler yet: a started run stays queued.
+// Load runs part 1 (docs/load.md): options, pre-flight and the run-token rate limiter.
+// The store defaults to a no-op unless the DB branch above wired the EF-backed one. No
+// scheduler yet: a started run stays queued.
 builder.Services.AddLoad();
+
+// Resources page (docs/load.md section 9): the fleet, cache and database scalers (AWS
+// when their Resources: keys are set, null otherwise), the audit store default and
+// the fleet refresh watcher. The load pre-flight reads both groups through the fleet
+// scaler registered here.
+builder.Services.AddResources();
 
 // Cross-origin access for the ops dashboard (tech-spec §4.6): the SPA is served
 // from its own origin, so browsers require CORS on /mgmt/* and the /hub
@@ -343,6 +353,10 @@ app.MapJobEndpoints();
 // Load runs under /mgmt/load (docs/load.md section 8): scenarios, runs, pre-flight,
 // and the two run-token endpoints the generators call.
 app.MapLoadEndpoints();
+
+// Resources under /mgmt/resources (docs/load.md section 9): scale the fleet, the
+// backplane and the database that already exist, with an audit of every change.
+app.MapResourceEndpoints();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.

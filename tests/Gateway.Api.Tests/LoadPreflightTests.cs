@@ -63,10 +63,13 @@ public class LoadPreflightTests
         UpdatedBy = "seed",
     };
 
-    private static IConfiguration Config(params (string Key, string Value)[] pairs) =>
-        new ConfigurationBuilder()
+    private static ResourcesOptions Config(params (string Key, string Value)[] pairs) =>
+        ResourcesOptions.FromConfiguration(new ConfigurationBuilder()
             .AddInMemoryCollection(pairs.ToDictionary(p => p.Key, p => (string?)p.Value))
-            .Build();
+            .Build());
+
+    private static FleetGroupResolver Groups(params (string Key, string Value)[] pairs) =>
+        new(Config(pairs), new FakeFleetGroupSource(), new FixedClock());
 
     private static FakeFleetScaler Scaler(FleetGroupSize? generators = null)
     {
@@ -133,7 +136,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetHealthy_Green_WhenEveryInstanceHeartbeatsAndRunsTheTarget()
     {
-        var check = new FleetHealthyCheck(new FakeFleetScaler(), Config());
+        var check = new FleetHealthyCheck(new FakeFleetScaler(), Groups());
 
         var result = await check.EvaluateAsync(Context(fresh: new[]
         {
@@ -148,7 +151,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetHealthy_Red_NamesTheStaleInstance()
     {
-        var check = new FleetHealthyCheck(new FakeFleetScaler(), Config());
+        var check = new FleetHealthyCheck(new FakeFleetScaler(), Groups());
 
         var result = await check.EvaluateAsync(Context(stale: new[] { LoadTestHost.Instance("i-0stale", Now.AddMinutes(-5)) }));
 
@@ -159,7 +162,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetHealthy_Red_WhenTheTargetIsNotRunningOnAnInstance_OrNoInstanceHeartbeats()
     {
-        var check = new FleetHealthyCheck(new FakeFleetScaler(), Config());
+        var check = new FleetHealthyCheck(new FakeFleetScaler(), Groups());
 
         var notRunning = await check.EvaluateAsync(Context(fresh: new[]
         {
@@ -180,7 +183,7 @@ public class LoadPreflightTests
     {
         var scaler = new FakeFleetScaler();
         scaler.Groups["fleet-placeholder"] = new FleetGroupSize(2, 3, 4, 3);
-        var check = new FleetHealthyCheck(scaler, Config((ResourcesConfig.FleetGroupKey, "fleet-placeholder")));
+        var check = new FleetHealthyCheck(scaler, Groups((ResourcesOptions.FleetGroupKey, "fleet-placeholder")));
 
         var result = await check.EvaluateAsync(Context());
 
@@ -188,7 +191,7 @@ public class LoadPreflightTests
         Assert.Contains("3 instances in service but 1 heartbeat", result.Message);
 
         // With no scaler the heartbeats are the whole check.
-        var unreadable = new FleetHealthyCheck(new NullFleetScaler(), Config((ResourcesConfig.FleetGroupKey, "fleet-placeholder")));
+        var unreadable = new FleetHealthyCheck(new NullFleetScaler(), Groups((ResourcesOptions.FleetGroupKey, "fleet-placeholder")));
         Assert.Equal(PreflightStatus.Green, (await unreadable.EvaluateAsync(Context())).Status);
     }
 
@@ -316,7 +319,7 @@ public class LoadPreflightTests
     {
         var scaler = new FakeFleetScaler();
         scaler.Templates["fleet-template-placeholder"] = new FleetLaunchTemplate("lt-placeholder", 4, instanceType);
-        var check = new FleetClassCheck(scaler, Config((ResourcesConfig.FleetTemplateKey, "fleet-template-placeholder")));
+        var check = new FleetClassCheck(scaler, Config((ResourcesOptions.FleetTemplateKey, "fleet-template-placeholder")));
 
         var result = await check.EvaluateAsync(Context());
 
@@ -327,7 +330,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetClass_AmberUnknown_WithTheNullScaler_OrNoTemplate()
     {
-        var configured = Config((ResourcesConfig.FleetTemplateKey, "fleet-template-placeholder"));
+        var configured = Config((ResourcesOptions.FleetTemplateKey, "fleet-template-placeholder"));
 
         var nullScaler = await new FleetClassCheck(new NullFleetScaler(), configured).EvaluateAsync(Context());
         Assert.Equal(PreflightStatus.Amber, nullScaler.Status);

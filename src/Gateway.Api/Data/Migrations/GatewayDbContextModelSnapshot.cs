@@ -590,6 +590,53 @@ namespace Gateway.Api.Data.Migrations
                     b.ToTable("load_scenario_version", (string)null);
                 });
 
+            modelBuilder.Entity("Gateway.Api.Data.ResourceAudit", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Action")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("action");
+
+                    b.Property<string>("Actor")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("actor");
+
+                    b.Property<string>("After")
+                        .HasColumnType("text")
+                        .HasColumnName("after");
+
+                    b.Property<DateTimeOffset>("At")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("at");
+
+                    b.Property<string>("Before")
+                        .HasColumnType("text")
+                        .HasColumnName("before");
+
+                    b.Property<string>("Detail")
+                        .HasColumnType("text")
+                        .HasColumnName("detail");
+
+                    b.Property<string>("Resource")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("resource");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Resource", "Id");
+
+                    b.ToTable("resource_audit", (string)null);
+                });
+
             modelBuilder.Entity("Gateway.Api.Data.ServiceManifest", b =>
                 {
                     b.Property<string>("Name")

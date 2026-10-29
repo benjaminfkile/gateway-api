@@ -14,10 +14,14 @@ fleet metrics, the 100k ladder) is listed in section 13 and is not part of v1.
 Part 1 built (build plan item 2): the data model and the `AddLoad` migration,
 `ILoadStore` (EF and no-database), the `/mgmt/load` API with the OpsLoad policy,
 the two generator endpoints, pre-flight behind `ILoadPreflight` with
-`IDatabaseHeadroom` and the `IFleetScaler` seam (only `NullFleetScaler` is
-registered, so `generator_group` is red and `fleet_class` amber until the
-resources task lands), the `ops:load` events and the `Load` options. No
-scheduler yet: a started run stays `queued`.
+`IDatabaseHeadroom` and the `IFleetScaler` seam, the `ops:load` events and the
+`Load` options. No scheduler yet: a started run stays `queued`.
+Resources built (build plan item 3): `IFleetScaler`, `ICacheScaler` and
+`IDatabaseScaler` with AWS SDK implementations registered when their keys are
+set (null ones otherwise), the `/mgmt/resources` API, the `resource_audit` table
+(migration `AddResourceAudit`), the `ops:resources` events and the fleet refresh
+watcher; `generator_group` and `fleet_class` now read through the AWS fleet
+scaler.
 
 ## 1. What a load run is
 
@@ -422,6 +426,60 @@ Everything in this section goes through `IFleetScaler`, `ICacheScaler` and
 `IDatabaseScaler` interfaces with AWS SDK implementations and fakes for the
 tests. The load scheduler uses `IFleetScaler` for both groups.
 
+Details of the built API:
+
+- Registration: `AwsFleetScaler` when `Resources:FleetGroup`,
+  `Resources:FleetTemplate` or `Load:GeneratorGroup` is set, `ElastiCacheScaler`
+  when `Resources:CacheReplicationGroup` is set, `RdsDatabaseScaler` when
+  `Resources:DatabaseInstance` is set; the null scaler, which refuses every call,
+  otherwise. `Resources:FleetMaxSize` (default 50) bounds `fleet/size`. When
+  `Resources:FleetGroup` is unset and `Resources:FleetTemplate` is set, the group
+  is read from the instance's `aws:autoscaling:groupName` tag through IMDS
+  (instance metadata tags must be on).
+- Order of the answers on a mutation: `503 resource_unconfigured`, `400` on the
+  body (`class_not_allowed`, `confirm_mismatch`, `version_not_found`, a size
+  outside `1..Resources:FleetMaxSize`), `409 run_active`, `409
+  refresh_in_progress` (fleet size, class and rollback, while the group's newest
+  refresh is in flight whoever started it), `409 downgrade_unsafe`. An AWS error
+  is `502 { error: "aws_error", detail }`. Only a change that reaches AWS writes
+  an audit row; a class change whose refresh fails to start writes one with the
+  error, since `$Default` already moved, and puts the max straight back.
+- `GET /mgmt/resources` adds `runActive`, the allow lists (`classes`,
+  `nodeTypes`), the fleet `maxSize`, the database `documentedMaxConnections`,
+  and an `error` per block for a failed AWS read. The database block's
+  `maxConnections` is the parameter group's value when it is a plain number, else
+  null; `connectionsInUse` is `pg_stat_activity` on the gateway's connection.
+- `fleet/class`, in order: create the version from `$Default` with only
+  `InstanceType` changed, make it `$Default`, raise the group's max by one, start
+  the refresh with min healthy 100, max healthy 150, warmup 300 s. Rollback skips
+  the create and does the rest. The audit row's `detail` holds `{ group,
+  refreshId, restoreMax, templateVersion, previousVersion }`.
+- The refresh watcher (a hosted service, every 30 s, the fresh leader only, or
+  any instance with the reconciler disabled) finds the gateway's refreshes
+  through those audit rows, publishes `refresh`, and when one ends (any terminal
+  status, or Auto Scaling no longer knows it) sets the max back to `restoreMax`
+  (never below min or desired) and writes a `refresh_ended` row. Keeping the
+  pending refresh in the database lets a successor finish the job when the
+  refresh replaces the instance that started it.
+- `GET /mgmt/resources/audit` rows carry `id`, and `detail` as a JSON object.
+
+Documented `max_connections`, the table the downgrade rule reads
+(`DatabaseClassConnections` in code). Operator-maintained: each value is the RDS
+Postgres default `LEAST({DBInstanceClassMemory/9531392}, 5000)` over the class's
+nominal memory, so the live value is a little lower. A class missing here is
+unknown and never a safe downgrade target; add its row before adding it to
+`Resources:DatabaseClasses`.
+
+| Classes | Memory | `max_connections` |
+|---|---|---|
+| `db.t3.micro`, `db.t4g.micro` | 1 GiB | 112 |
+| `db.t3.small`, `db.t4g.small` | 2 GiB | 225 |
+| `db.t3.medium`, `db.t4g.medium` | 4 GiB | 450 |
+| `db.t3.large`, `db.t4g.large`, `db.m6g.large`, `db.m7g.large` | 8 GiB | 901 |
+| `db.t3.xlarge`, `db.t4g.xlarge`, `db.m6g.xlarge`, `db.m7g.xlarge`, `db.r6g.large`, `db.r7g.large` | 16 GiB | 1802 |
+| `db.t3.2xlarge`, `db.t4g.2xlarge`, `db.m6g.2xlarge`, `db.m7g.2xlarge`, `db.r6g.xlarge`, `db.r7g.xlarge` | 32 GiB | 3604 |
+| `db.m6g.4xlarge`, `db.m7g.4xlarge`, `db.r6g.2xlarge`, `db.r7g.2xlarge` | 64 GiB | 5000 |
+
 ## 10. Real-time
 
 Two ops channels beside `ops:jobs`, same gate:
@@ -489,7 +547,8 @@ dialog tests with testing-library, the hub mock for live events.
   `DescribeLaunchTemplateVersions`, `DescribeLaunchTemplates` on the fleet
   template; `elasticache:ModifyReplicationGroup`, `DescribeReplicationGroups`,
   `DescribeCacheClusters` on the backplane; `rds:ModifyDBInstance`,
-  `DescribeDBInstances` on the one instance; `secretsmanager:PutSecretValue` on
+  `DescribeDBInstances` on the one instance and `rds:DescribeDBParameters` on its
+  parameter group; `secretsmanager:PutSecretValue` on
   the generator spec secret. Operator step.
 - The generator stack, the spec secret (created with a placeholder value), the
   `mgmt/load` scope on the ops pool's resource server, and the

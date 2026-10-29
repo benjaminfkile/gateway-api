@@ -4,6 +4,7 @@ using Gateway.Api.Data;
 using Gateway.Api.Instances;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
+using Gateway.Api.Resources;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -21,8 +22,8 @@ namespace Gateway.Api.Tests;
 /// <summary>
 /// Test host for the fleet-aware Management API (tech-spec §4.5): a real
 /// <see cref="Program"/> pipeline with the Cognito authority set (plane configured),
-/// backed by Sqlite for the manifest / instance-status / deploy-history / job / load stores and
-/// fakes for the AWS seams (image registry, log store). Tokens are locally signed
+/// backed by Sqlite for the manifest / instance-status / deploy-history / job / load / resource audit
+/// stores and fakes for the AWS seams (image registry, log store, fleet group tag). Tokens are locally signed
 /// (see <see cref="TestManagementAuth"/>) so the authz matrix is exercised without a
 /// network JWKS fetch.
 /// </summary>
@@ -32,6 +33,7 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
 
     public FakeImageRegistry ImageRegistry { get; } = new();
     public FakeLogStore LogStore { get; } = new();
+    public FakeFleetGroupSource FleetGroupSource { get; } = new();
 
     public ManagementApiFactory()
     {
@@ -81,6 +83,13 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
 
             services.RemoveAll<ILoadStore>();
             services.AddScoped<ILoadStore, EfLoadStore>();
+
+            services.RemoveAll<IResourceAuditStore>();
+            services.AddScoped<IResourceAuditStore, EfResourceAuditStore>();
+
+            // Never reach the instance metadata service for the fleet group tag.
+            services.RemoveAll<IFleetGroupSource>();
+            services.AddSingleton<IFleetGroupSource>(FleetGroupSource);
 
             services.RemoveAll<IImageRegistry>();
             services.AddSingleton<IImageRegistry>(ImageRegistry);

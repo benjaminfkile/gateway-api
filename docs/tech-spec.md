@@ -378,6 +378,12 @@ balancer routes the dashboard's request to.
 | `PUT  /mgmt/load/runs/{id}/verdict` · `DELETE /mgmt/load/runs/{id}` | Verdict on, or removal of, a terminal run and its stats (OpsLoad) |
 | `POST /mgmt/load/runs/{id}/checkin` · `/stats` | Generator check-in and stats intake: anonymous, run token in `X-Gateway-Load-Token`, 64 KiB cap, 5 per second per address |
 | `GET  /mgmt/load/runs/{id}/log?index=&tail=500` | Generator log from group `/gateway/load`, stream `run-{id}-{index}` (OpsAdmin) |
+| `GET  /mgmt/resources` | Fleet, generator, cache and database blocks, each null when unconfigured; the fleet block reports `refreshInProgress` (OpsDeploy; docs/load.md section 9) |
+| `GET  /mgmt/resources/fleet/refresh` · `GET /mgmt/resources/audit?limit=50` | The fleet group's newest instance refresh, and the `resource_audit` rows newest first (OpsDeploy) |
+| `PUT  /mgmt/resources/fleet/size` | `{ size }`: min, desired and max together, `202` (OpsAdmin) |
+| `PUT  /mgmt/resources/fleet/class` · `/fleet/class/rollback` | New launch template version from `$Default` with only `InstanceType` changed (or an existing version), made `$Default`, then an instance refresh with the deploy preferences and the max raised by one until it ends; `202 { templateVersion, refreshId }`, `409 refresh_in_progress` (OpsAdmin) |
+| `PUT  /mgmt/resources/cache/node-type` | Backplane node type, applied immediately; `202` with the degradation `note` (OpsAdmin) |
+| `PUT  /mgmt/resources/database/class` | `{ instanceClass, confirm }`: `400 confirm_mismatch`, `409 downgrade_unsafe` below the margin; `202` with every manifest service and the reboot `note` (OpsAdmin). Every resources mutation: `503 resource_unconfigured`, `400 class_not_allowed`, `409 run_active`, an audit row and an `ops:resources` event |
 | `WS   /hub` (`ops` channel) | Live status pushes to the dashboard — Redis backplane means events from *any* instance reach the dashboard's single connection |
 
 Guardrails: `stop` (and `delete`) on a health-check dependency requires a

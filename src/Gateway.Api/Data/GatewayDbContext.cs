@@ -25,6 +25,7 @@ public class GatewayDbContext : DbContext
     public DbSet<LoadScenarioVersion> LoadScenarioVersions => Set<LoadScenarioVersion>();
     public DbSet<LoadRun> LoadRuns => Set<LoadRun>();
     public DbSet<LoadRunStat> LoadRunStats => Set<LoadRunStat>();
+    public DbSet<ResourceAudit> ResourceAudit => Set<ResourceAudit>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -236,6 +237,21 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.At).HasColumnName("at");
             e.Property(x => x.Body).HasColumnName("body").IsRequired();
             e.HasIndex(x => new { x.RunId, x.At });
+        });
+
+        modelBuilder.Entity<ResourceAudit>(e =>
+        {
+            e.ToTable("resource_audit");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).HasColumnName("id").UseIdentityAlwaysColumn();
+            e.Property(x => x.At).HasColumnName("at");
+            e.Property(x => x.Actor).HasColumnName("actor").IsRequired();
+            e.Property(x => x.Resource).HasColumnName("resource").IsRequired();
+            e.Property(x => x.Action).HasColumnName("action").IsRequired();
+            e.Property(x => x.Before).HasColumnName("before");
+            e.Property(x => x.After).HasColumnName("after");
+            e.Property(x => x.Detail).HasColumnName("detail");
+            e.HasIndex(x => new { x.Resource, x.Id });
         });
     }
 }
