@@ -22,8 +22,11 @@ namespace Gateway.Api.Load;
 /// <item>Claim the queued run (one load run at a time, so there is at most one) with
 /// the store's conditional claim, then run pre-flight again; a red check fails it.</item>
 /// <item>Gaining leadership: a non-terminal run this process is not driving is adopted
-/// when it is ramping or holding with fresh generator stats, or already draining;
-/// any other goes to <c>draining</c> with reason <c>leader_restart</c>.</item>
+/// when it is in <c>fleet_up</c> or <c>generators_up</c> (both are state checks any
+/// leader can continue; a fleet grown by the run itself hands leadership to a new node
+/// whenever that node's instance id sorts lower), when it is ramping or holding with
+/// fresh generator stats, or already draining; any other goes to <c>draining</c> with
+/// reason <c>leader_restart</c>.</item>
 /// <item>Drive the run one step through the state table: the exits (hard clock, stale
 /// stats, operator stop) first, then the step of its status.</item>
 /// <item>Write a fleet sample every <see cref="LoadOptions.FleetSampleInterval"/>.</item>
@@ -303,7 +306,7 @@ public sealed class LoadSchedulerService : BackgroundService
 
     private async Task AdoptOrDrainAsync(ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
     {
-        var adopt = run.Status == LoadRunStatus.Draining
+        var adopt = run.Status is LoadRunStatus.Draining or LoadRunStatus.FleetUp or LoadRunStatus.GeneratorsUp
             || (run.Status is LoadRunStatus.Ramping or LoadRunStatus.Holding && !await StatsStaleAsync(store, run, now, ct));
         if (adopt)
         {

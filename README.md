@@ -455,9 +455,11 @@ and a run with `stopRequestedAt` (`operator`). Every path into `draining` sets
 the generator group's desired to 0 first. With no run non-terminal, a generator
 group above desired 0 is set to 0 and audited as `generators`/`orphan_guard` on
 `/mgmt/resources/audit`. On gaining leadership (also after a process restart), a
-non-terminal run this process is not driving is adopted when it is ramping or
-holding with fresh stats, or already draining; anything else drains with
-`leader_restart`. A scaler or secret call that throws is retried on the next
+non-terminal run this process is not driving is adopted when it is in `fleet_up`
+or `generators_up`, ramping or holding with fresh stats, or already draining;
+anything else drains with `leader_restart`. (A fleet the run grows hands
+leadership to the new node whenever its instance id sorts lower, so those two
+states must survive a leader change.) A scaler or secret call that throws is retried on the next
 tick; after `Load:ScaleRetryLimit` failed ticks in a row the run fails, with the
 generator group set to 0 regardless. A succeeded validation run records itself
 as the scenario's `lastValidationRunId`.

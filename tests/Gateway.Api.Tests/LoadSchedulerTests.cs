@@ -651,8 +651,44 @@ public class LoadSchedulerTests
         Assert.Equal(LoadRunStatus.Succeeded, h.StatusOf(run.Id));
     }
 
+    // A fleet the run grows hands leadership to the new node whenever its instance id
+    // sorts lower (the leader is the lowest live id), so the bring-up states must survive
+    // a leader change: run 10 of the load ladder was lost exactly this way.
     [Theory]
-    [InlineData(LoadRunStatus.GeneratorsUp, false)]
+    [InlineData(LoadRunStatus.FleetUp)]
+    [InlineData(LoadRunStatus.GeneratorsUp)]
+    public async Task LeaderRestart_AdoptsARunStillBringingTheFleetOrGeneratorsUp(string state)
+    {
+        var h = new Harness();
+        h.Heartbeat(2);
+        var run = h.Queue(ramp: 600, hold: 600, fleet: state == LoadRunStatus.FleetUp ? 3 : null);
+        await h.TickAsync();
+        if (state != LoadRunStatus.FleetUp)
+        {
+            await h.DriveToAsync(run, state);
+        }
+
+        Assert.Equal(state, h.StatusOf(run.Id));
+        var sets = h.Sets.Length;
+
+        h.NewScheduler();
+        await h.TickAsync();
+
+        Assert.Equal(state, h.StatusOf(run.Id));
+        Assert.Null(h.Store.Run(run.Id).StopReason);
+        Assert.Equal(new[] { run.Id }, h.Scheduler.DrivenRunIds);
+        Assert.Equal(sets, h.Sets.Length);
+
+        if (state == LoadRunStatus.GeneratorsUp)
+        {
+            // And the new leader carries it on: the check-ins take it to ramping.
+            await h.CheckInAllAsync(run);
+            await h.TickAsync();
+            Assert.Equal(LoadRunStatus.Ramping, h.StatusOf(run.Id));
+        }
+    }
+
+    [Theory]
     [InlineData(LoadRunStatus.Ramping, true)]
     public async Task LeaderRestart_DrainsARunItCannotReattach(string state, bool staleStats)
     {
@@ -690,7 +726,10 @@ public class LoadSchedulerTests
 
         h.Leader.IsLeader = true;
         await h.TickAsync();
-        Assert.Equal(LoadStopReason.LeaderRestart, h.Store.Run(run.Id).StopReason);
+        // Gained again: the generators_up run is adopted rather than driven on blindly.
+        Assert.Equal(new[] { run.Id }, h.Scheduler.DrivenRunIds);
+        Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
+        Assert.Null(h.Store.Run(run.Id).StopReason);
     }
 
     // ---------- the orphan guard ----------

@@ -162,9 +162,11 @@ Leader duties, every tick:
 3. Expire a run past `hard_stop_at`; mark a run `lost` when ramp or hold has
    had no generator stats line for 60 s.
 4. Reconcile on gaining leadership: a non-terminal run with no driver on this
-   instance is driven to `draining` with reason `leader_restart` unless it is
-   in `ramping` or `holding` and stats are still arriving, in which case it is
-   adopted and continues.
+   instance is adopted and continues when it is in `fleet_up` or
+   `generators_up` (state checks any leader can carry on; a fleet the run grows
+   hands leadership to a new node whenever its instance id sorts lower), or in
+   `ramping` or `holding` with stats still arriving, or already `draining`;
+   anything else is driven to `draining` with reason `leader_restart`.
 5. Guard: when no run is non-terminal and the generator group's desired
    capacity is above 0, set it to 0 and write an audit row (reason
    `orphan_guard`). This is the backstop for anything that slipped.
@@ -177,8 +179,9 @@ Built as (`LoadSchedulerService`):
   actor `gateway`, a `change` on `ops:resources`); the claim of the queued run
   followed by pre-flight with `confirm` set to the target (a red check drains the
   run with reason `failed` and the check's name in `detail`); the gaining-leadership
-  rule for a run this process is not driving (adopted when ramping or holding with
-  fresh stats, or already draining; otherwise drained with `leader_restart`); then
+  rule for a run this process is not driving (adopted in `fleet_up`, `generators_up`
+  and `draining`, and when ramping or holding with fresh stats; otherwise drained with
+  `leader_restart`); then
   one step; then the fleet sample.
 - Exits are checked first in `fleet_up`, `generators_up`, `ramping` and `holding`:
   `hard_clock` past `hard_stop_at`, `lost` when ramping or holding and the newest
