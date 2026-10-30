@@ -205,9 +205,6 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.RampSeconds).HasColumnName("ramp_seconds");
             e.Property(x => x.HoldSeconds).HasColumnName("hold_seconds");
             e.Property(x => x.Params).HasColumnName("params").IsRequired();
-            e.Property(x => x.FleetSizeRequested).HasColumnName("fleet_size_requested");
-            e.Property(x => x.FleetSizeBefore).HasColumnName("fleet_size_before");
-            e.Property(x => x.RestoreFleet).HasColumnName("restore_fleet");
             e.Property(x => x.HardStopAt).HasColumnName("hard_stop_at");
             e.Property(x => x.TokenHash).HasColumnName("token_hash").IsRequired();
             e.Property(x => x.SpecToken).HasColumnName("spec_token");

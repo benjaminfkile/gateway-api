@@ -196,7 +196,7 @@ public sealed class FakeLoadStore : ILoadStore
                 return Task.FromResult<LoadRun?>(null);
             }
 
-            run.Status = run.FleetSizeRequested is null ? LoadRunStatus.GeneratorsUp : LoadRunStatus.FleetUp;
+            run.Status = LoadRunStatus.GeneratorsUp;
             run.StartedAt = now;
             run.Timeline = LoadJson.AppendTimeline(run.Timeline, now, run.Status, by);
             return Task.FromResult<LoadRun?>(Copy(run));
@@ -221,7 +221,6 @@ public sealed class FakeLoadStore : ILoadStore
             run.Timeline = next.Timeline;
             run.RampStartedAt = next.RampStartedAt;
             run.FinishedAt = next.FinishedAt;
-            run.FleetSizeBefore = next.FleetSizeBefore;
             run.StopReason = next.StopReason;
             run.Detail = next.Detail;
             run.SpecToken = next.SpecToken;

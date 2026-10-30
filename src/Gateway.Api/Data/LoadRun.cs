@@ -42,15 +42,6 @@ public class LoadRun
     /// <summary>JSON object of strings: the scenario's defaults merged with the run's overrides.</summary>
     public string Params { get; set; } = "{}";
 
-    /// <summary>Fleet size the run asks for, or null to leave the fleet alone.</summary>
-    public int? FleetSizeRequested { get; set; }
-
-    /// <summary>The fleet group's desired size when the run started, or null.</summary>
-    public int? FleetSizeBefore { get; set; }
-
-    /// <summary>Whether draining restores the fleet to <see cref="FleetSizeBefore"/>.</summary>
-    public bool RestoreFleet { get; set; }
-
     /// <summary>The absolute clock the run cannot outlive.</summary>
     public DateTimeOffset HardStopAt { get; set; }
 

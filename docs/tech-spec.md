@@ -201,13 +201,15 @@ advisory locks, no session state.
   nothing on a follower. Every `Load:TickInterval` (10 s) the leader guards the
   generator group (desired above 0 with no run non-terminal is set to 0 and audited as
   `orphan_guard`), claims the queued load run, re-runs pre-flight, and drives the run
-  one step through `fleet_up`, `generators_up`, `ramping`, `holding` and `draining`
-  through `IFleetScaler`, writing the generator spec secret through `ISecretWriter`
+  one step through `generators_up`, `ramping`, `holding` and `draining` through
+  `IGeneratorGroupScaler` (the generator group only; a load run never touches the
+  fleet group), writing the generator spec secret through `ISecretWriter`
   and a fleet sample every `Load:FleetSampleInterval`. Every status change is one
   conditional update on the run's status and timeline, so two leaders in one tick
   cannot both act, and every exit sets the generator group to 0 first. A run without
-  a driver on a new leader is adopted when it is ramping or holding with fresh stats,
-  otherwise drained with reason `leader_restart` (docs/load.md section 3).
+  a driver on a new leader is adopted when it is in `generators_up`, ramping or
+  holding with fresh stats, or draining, otherwise drained with reason
+  `leader_restart` (docs/load.md section 3).
 
 ### 4.4 Desired-state manifest (PostgreSQL)
 Single source of truth, mutated only by the Management API, consumed by reconcilers.
@@ -304,15 +306,12 @@ load_run (
   target                text not null,            -- manifest service name
   validation            boolean not null,
   actor                 text not null,
-  status                text not null,            -- queued | fleet_up | generators_up | ramping | holding | draining | succeeded | stopped | expired | failed | lost
+  status                text not null,            -- queued | generators_up | ramping | holding | draining | succeeded | stopped | expired | failed | lost
   generators            int  not null,
   vus_per_generator     int  not null,
   ramp_seconds          int  not null,
   hold_seconds          int  not null,
   params                text not null,            -- JSON object of strings
-  fleet_size_requested  int,
-  fleet_size_before     int,
-  restore_fleet         boolean not null,
   hard_stop_at          timestamptz not null,
   token_hash            text not null,            -- sha256 of the run token
   spec_token            text,                     -- the run token until the leader writes the spec secret, then null
@@ -394,12 +393,7 @@ balancer routes the dashboard's request to.
 | `PUT  /mgmt/load/runs/{id}/verdict` · `DELETE /mgmt/load/runs/{id}` | Verdict on, or removal of, a terminal run and its stats (OpsLoad) |
 | `POST /mgmt/load/runs/{id}/checkin` · `/stats` | Generator check-in and stats intake: anonymous, run token in `X-Gateway-Load-Token`, 64 KiB cap, 5 per second per address |
 | `GET  /mgmt/load/runs/{id}/log?index=&tail=500` | Generator log from group `/gateway/load`, stream `run-{id}-{index}` (OpsAdmin) |
-| `GET  /mgmt/resources` | Fleet, generator, cache and database blocks, each null when unconfigured; the fleet block reports `refreshInProgress` (OpsDeploy; docs/load.md section 9) |
-| `GET  /mgmt/resources/fleet/refresh` · `GET /mgmt/resources/audit?limit=50` | The fleet group's newest instance refresh, and the `resource_audit` rows newest first (OpsDeploy) |
-| `PUT  /mgmt/resources/fleet/size` | `{ size }`: min, desired and max together, `202` (OpsAdmin) |
-| `PUT  /mgmt/resources/fleet/class` · `/fleet/class/rollback` | New launch template version from `$Default` with only `InstanceType` changed (or an existing version), made `$Default`, then an instance refresh with the deploy preferences and the max raised by one until it ends; `202 { templateVersion, refreshId }`, `409 refresh_in_progress` (OpsAdmin) |
-| `PUT  /mgmt/resources/cache/node-type` | Backplane node type, applied immediately; `202` with the degradation `note` (OpsAdmin) |
-| `PUT  /mgmt/resources/database/class` | `{ instanceClass, confirm }`: `400 confirm_mismatch`, `409 downgrade_unsafe` below the margin; `202` with every manifest service and the reboot `note` (OpsAdmin). Every resources mutation: `503 resource_unconfigured`, `400 class_not_allowed`, `409 run_active`, an audit row and an `ops:resources` event |
+| `GET  /mgmt/load/audit?limit=50` | The `resource_audit` rows newest first, `limit` 1..500, among them the orphan guard's (OpsDeploy) |
 | `WS   /hub` (`ops` channel) | Live status pushes to the dashboard — Redis backplane means events from *any* instance reach the dashboard's single connection |
 
 Guardrails: `stop` (and `delete`) on a health-check dependency requires a

@@ -34,6 +34,7 @@ public class LoadAuthMatrixTests
         { "GET", "/mgmt/load/runs/1", null, Access.Read, false },
         { "GET", "/mgmt/load/runs/1/stats", null, Access.Read, false },
         { "GET", "/mgmt/load/runs/1/stats.csv", null, Access.Read, false },
+        { "GET", "/mgmt/load/audit", null, Access.Read, false },
         { "GET", "/mgmt/load/runs/1/log", null, Access.Admin, false },
         { "PUT", "/mgmt/load/scenarios/tracker", """{"maxVusPerGenerator":100}""", Access.Mutate, false },
         { "PUT", "/mgmt/load/scenarios/fresh", """{"repository":"example-org/example-app","script":"export default function () {}","maxVusPerGenerator":10}""", Access.Mutate, false },

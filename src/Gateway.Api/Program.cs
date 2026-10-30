@@ -10,7 +10,6 @@ using Gateway.Api.Manifest;
 using Gateway.Api.Proxy;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
-using Gateway.Api.Resources;
 using Gateway.Api.Systemd;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.EntityFrameworkCore;
@@ -44,11 +43,8 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     builder.Services.AddScoped<IJobStore, EfJobStore>();
 
     // Load runs (docs/load.md): scenarios, script history, the run ledger and stats,
-    // and the database headroom read on the gateway's own connection.
+    // and the resource audit the orphan guard writes to.
     builder.Services.AddScoped<ILoadStore, EfLoadStore>();
-    builder.Services.AddScoped<IDatabaseHeadroom, EfDatabaseHeadroom>();
-
-    // Resources page (docs/load.md section 9): the audit of every resource change.
     builder.Services.AddScoped<IResourceAuditStore, EfResourceAuditStore>();
 
     // Job executor (docs/jobs.md section 3): claims and drives runs from that ledger.
@@ -56,7 +52,7 @@ if (!string.IsNullOrWhiteSpace(dbConnection))
     builder.Services.AddJobScheduler(builder.Configuration);
 
     // Load scheduler (docs/load.md section 3): the leader drives load runs from the
-    // ledger above through the fleet scaler and writes the generator spec secret.
+    // ledger above through the generator group scaler and writes the generator spec secret.
     builder.Services.AddLoadScheduler();
 
     // Fleet awareness (tech-spec §4.3, §4.4): every reconcile loop upserts this
@@ -127,16 +123,11 @@ builder.Services.AddManagementAuthentication();
 // DB branch above wired the EF-backed one.
 builder.Services.AddManagementServices();
 
-// Load runs (docs/load.md): options, pre-flight, the run-token rate limiter and the
-// metrics. The store defaults to a no-op unless the DB branch above wired the EF-backed
-// one, together with the load scheduler.
+// Load runs (docs/load.md): options, the generator group scaler (AWS when
+// Load:GeneratorGroup is set, null otherwise), pre-flight, the run-token rate limiter
+// and the metrics. The store defaults to a no-op and the resource audit to memory
+// unless the DB branch above wired the EF-backed ones, together with the load scheduler.
 builder.Services.AddLoad();
-
-// Resources page (docs/load.md section 9): the fleet, cache and database scalers (AWS
-// when their Resources: keys are set, null otherwise), the audit store default and
-// the fleet refresh watcher. The load pre-flight reads both groups through the fleet
-// scaler registered here.
-builder.Services.AddResources();
 
 // Cross-origin access for the ops dashboard (tech-spec §4.6): the SPA is served
 // from its own origin, so browsers require CORS on /mgmt/* and the /hub
@@ -357,10 +348,6 @@ app.MapJobEndpoints();
 // Load runs under /mgmt/load (docs/load.md section 8): scenarios, runs, pre-flight,
 // and the two run-token endpoints the generators call.
 app.MapLoadEndpoints();
-
-// Resources under /mgmt/resources (docs/load.md section 9): scale the fleet, the
-// backplane and the database that already exist, with an audit of every change.
-app.MapResourceEndpoints();
 
 // Application traffic is proxied with NO authentication of any kind (design
 // invariant, tech-spec §1): no auth middleware sits in front of MapReverseProxy.

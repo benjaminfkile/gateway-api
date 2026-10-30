@@ -71,12 +71,8 @@ public class LoadStoreTests
             .ConfigureWarnings(w => w.Ignore(RelationalEventId.PendingModelChangesWarning))
             .Options);
 
-    private static LoadRun NewRun(string status = LoadRunStatus.Queued, int generators = 2, int? fleet = null, string scenario = "tracker")
-    {
-        var run = LoadTestHost.Run(0, status, scenario: scenario, generators: generators);
-        run.FleetSizeRequested = fleet;
-        return run;
-    }
+    private static LoadRun NewRun(string status = LoadRunStatus.Queued, int generators = 2, string scenario = "tracker") =>
+        LoadTestHost.Run(0, status, scenario: scenario, generators: generators);
 
     // ---------- runs ----------
 
@@ -129,7 +125,7 @@ public class LoadStoreTests
 
     [Theory]
     [MemberData(nameof(Stores))]
-    public async Task Claim_MovesQueuedToGeneratorsUpOrFleetUp_Once(string kind)
+    public async Task Claim_MovesQueuedToGeneratorsUp_Once(string kind)
     {
         using var handle = new StoreHandle(kind);
         var store = handle.Store;
@@ -143,16 +139,6 @@ public class LoadStoreTests
         Assert.Null(await store.ClaimQueuedRunAsync(run.Id, "leader", T0));
 
         Assert.Null(await store.ClaimQueuedRunAsync(999, "leader", T0));
-    }
-
-    [Theory]
-    [MemberData(nameof(Stores))]
-    public async Task Claim_ARunThatAsksForAFleetSizeGoesToFleetUp(string kind)
-    {
-        using var handle = new StoreHandle(kind);
-        var run = await handle.Store.TryCreateRunAsync(NewRun(fleet: 3));
-
-        Assert.Equal(LoadRunStatus.FleetUp, (await handle.Store.ClaimQueuedRunAsync(run!.Id, "leader", T0))?.Status);
     }
 
     [Theory]
@@ -306,14 +292,13 @@ public class LoadStoreTests
         var next = run.Clone();
         next.Status = LoadRunStatus.Ramping;
         next.RampStartedAt = T0.AddMinutes(1);
-        next.FleetSizeBefore = 4;
         next.SpecToken = null;
         next.Detail = "note";
         next.Timeline = LoadJson.AppendTimeline(run.Timeline, T0.AddMinutes(1), LoadRunStatus.Ramping, "leader");
 
         var after = await store.TryAdvanceRunAsync(run, next);
         Assert.NotNull(after);
-        Assert.Equal((LoadRunStatus.Ramping, T0.AddMinutes(1), 4, "note"), (after!.Status, after.RampStartedAt, after.FleetSizeBefore, after.Detail));
+        Assert.Equal((LoadRunStatus.Ramping, T0.AddMinutes(1), "note"), (after!.Status, after.RampStartedAt, after.Detail));
         // Check-in columns are never written by an advance.
         Assert.Equal(1, after.CheckedIn);
 

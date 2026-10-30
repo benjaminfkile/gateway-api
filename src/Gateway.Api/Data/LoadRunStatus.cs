@@ -4,7 +4,6 @@ namespace Gateway.Api.Data;
 public static class LoadRunStatus
 {
     public const string Queued = "queued";
-    public const string FleetUp = "fleet_up";
     public const string GeneratorsUp = "generators_up";
     public const string Ramping = "ramping";
     public const string Holding = "holding";
@@ -19,7 +18,7 @@ public static class LoadRunStatus
     public static readonly string[] Terminal = { Succeeded, Stopped, Expired, Failed, Lost };
 
     /// <summary>The statuses that hold the single load-run slot.</summary>
-    public static readonly string[] NonTerminal = { Queued, FleetUp, GeneratorsUp, Ramping, Holding, Draining };
+    public static readonly string[] NonTerminal = { Queued, GeneratorsUp, Ramping, Holding, Draining };
 
     /// <summary>True for <c>succeeded</c>, <c>stopped</c>, <c>expired</c>, <c>failed</c> and <c>lost</c>.</summary>
     public static bool IsTerminal(string status) => status is Succeeded or Stopped or Expired or Failed or Lost;

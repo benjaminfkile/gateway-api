@@ -1,19 +1,18 @@
 using Gateway.Api.Instances;
-using Gateway.Api.Resources;
 
 namespace Gateway.Api.Load;
 
 /// <summary>
 /// <c>generator_group</c>: green when the generator group has desired 0, nothing in
 /// service, and a max that fits the run's generator count. Read through
-/// <see cref="IFleetScaler"/> (the AWS one whenever <c>Load:GeneratorGroup</c> is set);
-/// a group that cannot be read is red.
+/// <see cref="IGeneratorGroupScaler"/> (the AWS one whenever <c>Load:GeneratorGroup</c>
+/// is set); a group that cannot be read is red.
 /// </summary>
 public sealed class GeneratorGroupCheck : ILoadPreflightCheck
 {
-    private readonly IFleetScaler _scaler;
+    private readonly IGeneratorGroupScaler _scaler;
 
-    public GeneratorGroupCheck(IFleetScaler scaler)
+    public GeneratorGroupCheck(IGeneratorGroupScaler scaler)
     {
         _scaler = scaler;
     }
@@ -28,14 +27,14 @@ public sealed class GeneratorGroupCheck : ILoadPreflightCheck
             return Red("Load:GeneratorGroup is not set.", "Set Load:GeneratorGroup to the generator Auto Scaling group name.");
         }
 
-        FleetGroupSize? size;
+        GeneratorGroupSize? size;
         try
         {
-            size = await _scaler.DescribeGroupAsync(group, ct);
+            size = await _scaler.DescribeAsync(group, ct);
         }
         catch (NotSupportedException ex)
         {
-            return Red($"The generator group cannot be read: {ex.Message}", "Set Load:GeneratorGroup so the AWS fleet scaler is registered.");
+            return Red($"The generator group cannot be read: {ex.Message}", "Set Load:GeneratorGroup so the AWS generator group scaler is registered.");
         }
 
         if (size is null)
@@ -68,24 +67,13 @@ public sealed class GeneratorGroupCheck : ILoadPreflightCheck
 /// <summary>
 /// <c>fleet_healthy</c>: green when every <c>instance_status</c> row has a fresh
 /// heartbeat and the target service is running on each (read the way the Instances
-/// endpoint reads them). When the fleet group is known (<see cref="FleetGroupResolver"/>)
-/// and can be read through <see cref="IFleetScaler"/>, the group's in-service count
-/// must not exceed the instances that heartbeat.
+/// endpoint reads them).
 /// </summary>
 public sealed class FleetHealthyCheck : ILoadPreflightCheck
 {
-    private readonly IFleetScaler _scaler;
-    private readonly FleetGroupResolver _groups;
-
-    public FleetHealthyCheck(IFleetScaler scaler, FleetGroupResolver groups)
-    {
-        _scaler = scaler;
-        _groups = groups;
-    }
-
     public string Name => "fleet_healthy";
 
-    public async Task<PreflightCheckResult> EvaluateAsync(LoadPreflightContext context, CancellationToken ct = default)
+    public Task<PreflightCheckResult> EvaluateAsync(LoadPreflightContext context, CancellationToken ct = default)
     {
         if (context.StaleInstances.Count > 0)
         {
@@ -114,32 +102,12 @@ public sealed class FleetHealthyCheck : ILoadPreflightCheck
                 "Start or deploy the target service and wait for every instance to converge.");
         }
 
-        var group = await _groups.GetAsync(ct);
-        if (group is not null)
-        {
-            FleetGroupSize? size = null;
-            try
-            {
-                size = await _scaler.DescribeGroupAsync(group, ct);
-            }
-            catch (NotSupportedException)
-            {
-                // The null scaler: the heartbeats above are the whole check.
-            }
-
-            if (size is not null && size.InService > context.FreshInstances.Count)
-            {
-                return Red(
-                    $"The fleet group has {size.InService} instances in service but {context.FreshInstances.Count} heartbeat.",
-                    "Wait for the new instances to boot and report.");
-            }
-        }
-
-        return new PreflightCheckResult(Name, PreflightStatus.Green,
-            $"{context.FreshInstances.Count} fleet instances heartbeat and run {target}.", null);
+        return Task.FromResult(new PreflightCheckResult(Name, PreflightStatus.Green,
+            $"{context.FreshInstances.Count} fleet instances heartbeat and run {target}.", null));
     }
 
-    private PreflightCheckResult Red(string message, string fix) => new(Name, PreflightStatus.Red, message, fix);
+    private Task<PreflightCheckResult> Red(string message, string fix) =>
+        Task.FromResult(new PreflightCheckResult(Name, PreflightStatus.Red, message, fix));
 }
 
 /// <summary><c>target_known</c>: green when the target is a manifest service.</summary>
@@ -218,111 +186,6 @@ public sealed class PresenceOffCheck : ILoadPreflightCheck
                 "Turn realtime presence off for the service before the run.")
             : new PreflightCheckResult(Name, PreflightStatus.Green, $"{service.Name} has realtime presence off.", null));
     }
-}
-
-/// <summary>
-/// <c>database_headroom</c>: green when
-/// <c>max_connections - in use &gt;= added nodes * Load:DbConnectionsPerNode + Load:DbConnectionMargin</c>,
-/// where added nodes is how many instances the run's requested fleet size would add
-/// beyond those that heartbeat now (zero when no size is requested or it is not
-/// larger): the live nodes' connections are already counted in "in use". Amber when
-/// there is no database to ask.
-/// </summary>
-public sealed class DatabaseHeadroomCheck : ILoadPreflightCheck
-{
-    private readonly IDatabaseHeadroom _headroom;
-
-    public DatabaseHeadroomCheck(IDatabaseHeadroom headroom)
-    {
-        _headroom = headroom;
-    }
-
-    public string Name => "database_headroom";
-
-    public async Task<PreflightCheckResult> EvaluateAsync(LoadPreflightContext context, CancellationToken ct = default)
-    {
-        var connections = await _headroom.GetAsync(ct);
-        if (connections is null)
-        {
-            return new PreflightCheckResult(Name, PreflightStatus.Amber, "Unknown: no database to ask.", null);
-        }
-
-        var live = context.FreshInstances.Count;
-        var added = Math.Max(0, (context.Request.FleetSize ?? live) - live);
-        var perNode = context.Options.DbConnectionsPerNode;
-        var margin = context.Options.DbConnectionMargin;
-        var needed = (added * perNode) + margin;
-        var free = connections.MaxConnections - connections.InUse;
-        var numbers = $"max_connections {connections.MaxConnections}, in use {connections.InUse}, free {free}; "
-            + $"{live} live nodes, {added} added x {perNode} + {margin} needs {needed}.";
-
-        return free >= needed
-            ? new PreflightCheckResult(Name, PreflightStatus.Green, numbers, null)
-            : new PreflightCheckResult(Name, PreflightStatus.Red, numbers,
-                "Raise the database class on the Resources page (the database card), or ask for a smaller fleet.");
-    }
-}
-
-/// <summary>
-/// <c>fleet_class</c>: the fleet launch template's <c>$Default</c> instance type is
-/// not a burstable family (<c>t2</c>, <c>t3</c>, <c>t3a</c>, <c>t4g</c>). Amber, never
-/// red, in v1; amber "unknown" when <c>Resources:FleetTemplate</c> is unset or the
-/// template cannot be read through <see cref="IFleetScaler"/> (the AWS one whenever the
-/// template is set).
-/// </summary>
-public sealed class FleetClassCheck : ILoadPreflightCheck
-{
-    private static readonly string[] Burstable = { "t2", "t3", "t3a", "t4g" };
-
-    private readonly IFleetScaler _scaler;
-    private readonly ResourcesOptions _resources;
-
-    public FleetClassCheck(IFleetScaler scaler, ResourcesOptions resources)
-    {
-        _scaler = scaler;
-        _resources = resources;
-    }
-
-    public string Name => "fleet_class";
-
-    public async Task<PreflightCheckResult> EvaluateAsync(LoadPreflightContext context, CancellationToken ct = default)
-    {
-        var template = _resources.FleetTemplate;
-        if (template is null)
-        {
-            return Unknown("Resources:FleetTemplate is not set.");
-        }
-
-        FleetLaunchTemplate? described;
-        try
-        {
-            described = await _scaler.DescribeLaunchTemplateAsync(template, ct);
-        }
-        catch (Exception ex) when (ex is NotSupportedException or Amazon.Runtime.AmazonServiceException)
-        {
-            return Unknown(ex.Message);
-        }
-
-        if (described is null)
-        {
-            return Unknown($"the launch template {template} does not exist.");
-        }
-
-        if (described.InstanceType is not { Length: > 0 } instanceType)
-        {
-            return Unknown("the template's $Default sets no instance type.");
-        }
-
-        var family = instanceType.Split('.')[0];
-        return Burstable.Contains(family, StringComparer.OrdinalIgnoreCase)
-            ? new PreflightCheckResult(Name, PreflightStatus.Amber,
-                $"The fleet runs {instanceType}, a burstable class: CPU credits can run out under sustained load.",
-                "Change the fleet class on the Resources page for a large run.")
-            : new PreflightCheckResult(Name, PreflightStatus.Green, $"The fleet runs {instanceType}.", null);
-    }
-
-    private PreflightCheckResult Unknown(string why) =>
-        new(Name, PreflightStatus.Amber, $"Unknown: {why}", null);
 }
 
 /// <summary><c>target_confirmed</c>: green when <c>confirm</c> equals the target name exactly.</summary>

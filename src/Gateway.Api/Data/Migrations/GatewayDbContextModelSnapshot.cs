@@ -349,14 +349,6 @@ namespace Gateway.Api.Data.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("finished_at");
 
-                    b.Property<int?>("FleetSizeBefore")
-                        .HasColumnType("integer")
-                        .HasColumnName("fleet_size_before");
-
-                    b.Property<int?>("FleetSizeRequested")
-                        .HasColumnType("integer")
-                        .HasColumnName("fleet_size_requested");
-
                     b.Property<int>("Generators")
                         .HasColumnType("integer")
                         .HasColumnName("generators");
@@ -390,10 +382,6 @@ namespace Gateway.Api.Data.Migrations
                     b.Property<DateTimeOffset?>("RampStartedAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("ramp_started_at");
-
-                    b.Property<bool>("RestoreFleet")
-                        .HasColumnType("boolean")
-                        .HasColumnName("restore_fleet");
 
                     b.Property<string>("Scenario")
                         .IsRequired()

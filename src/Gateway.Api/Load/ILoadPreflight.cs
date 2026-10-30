@@ -11,7 +11,7 @@ public static class PreflightStatus
 }
 
 /// <summary>One pre-flight answer: <c>{ name, status, message, fix }</c>.</summary>
-/// <param name="Name">The check name, e.g. <c>database_headroom</c>.</param>
+/// <param name="Name">The check name, e.g. <c>generator_group</c>.</param>
 /// <param name="Status"><c>green</c>, <c>amber</c> or <c>red</c> (see <see cref="PreflightStatus"/>).</param>
 /// <param name="Message">What the check found.</param>
 /// <param name="Fix">What to do about it, or null when nothing is needed.</param>
@@ -23,7 +23,6 @@ public sealed record PreflightCheckResult(string Name, string Status, string Mes
 /// <param name="Confirm">What the operator typed to confirm the target.</param>
 /// <param name="Generators">Generator count.</param>
 /// <param name="VusPerGenerator">Virtual users per generator.</param>
-/// <param name="FleetSize">Requested fleet size, or null to leave the fleet alone.</param>
 /// <param name="Validation">True for a validation run.</param>
 public sealed record LoadPreflightRequest(
     string? Scenario,
@@ -31,7 +30,6 @@ public sealed record LoadPreflightRequest(
     string? Confirm,
     int Generators,
     int VusPerGenerator,
-    int? FleetSize,
     bool Validation);
 
 /// <summary>

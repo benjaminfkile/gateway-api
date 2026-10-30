@@ -3,8 +3,9 @@ using Gateway.Api.Data;
 namespace Gateway.Api.Management;
 
 /// <summary>
-/// Read/write access to <c>resource_audit</c> (docs/load.md section 9): one row per
-/// Resources API change and per fleet refresh the watcher closed. Two implementations:
+/// Read/write access to <c>resource_audit</c> (docs/load.md sections 3 and 8): one row
+/// each time the load scheduler's orphan guard sets the generator group to 0, beside
+/// the older rows the table keeps from earlier releases. Two implementations:
 /// <see cref="EfResourceAuditStore"/> over the gateway database and
 /// <see cref="InMemoryResourceAuditStore"/> for a box with no database.
 /// </summary>

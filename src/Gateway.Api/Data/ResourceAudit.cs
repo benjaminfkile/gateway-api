@@ -1,8 +1,9 @@
 namespace Gateway.Api.Data;
 
 /// <summary>
-/// One change the Resources API made to a scaled resource, or one fleet refresh the
-/// gateway saw end (docs/load.md section 9). Table <c>resource_audit</c>.
+/// One change the gateway made to a resource: today the orphan guard setting the
+/// generator group to 0 (docs/load.md section 3). Rows written by earlier releases (fleet,
+/// cache and database changes) stay as history. Table <c>resource_audit</c>.
 /// </summary>
 public class ResourceAudit
 {
@@ -12,13 +13,13 @@ public class ResourceAudit
     /// <summary>When the change was made.</summary>
     public DateTimeOffset At { get; set; }
 
-    /// <summary>Cognito username or client id, or <c>gateway</c> for a refresh the watcher closed.</summary>
+    /// <summary>Cognito username or client id, or <c>gateway</c> for a change the gateway made itself.</summary>
     public string Actor { get; set; } = default!;
 
-    /// <summary><c>fleet</c>, <c>cache</c> or <c>database</c>.</summary>
+    /// <summary><c>generators</c>; older rows also carry <c>fleet</c>, <c>cache</c> or <c>database</c>.</summary>
     public string Resource { get; set; } = default!;
 
-    /// <summary><c>size</c>, <c>class</c>, <c>class_rollback</c>, <c>refresh_ended</c>, <c>node_type</c>.</summary>
+    /// <summary><c>orphan_guard</c>; older rows also carry <c>size</c>, <c>class</c>, <c>class_rollback</c>, <c>refresh_ended</c>, <c>node_type</c>.</summary>
     public string Action { get; set; } = default!;
 
     /// <summary>The resource's state before the change, as one line of text.</summary>

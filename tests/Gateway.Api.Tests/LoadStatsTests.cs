@@ -172,6 +172,6 @@ public class LoadStatsTests
         var timeline = LoadJson.AppendTimeline("broken", T0, LoadRunStatus.Queued, "alice", "note");
         var entry = Assert.Single(LoadJson.ParseTimeline(timeline));
         Assert.Equal((T0, "queued", "alice", "note"), (entry.At, entry.Status, entry.By, entry.Note));
-        Assert.Equal(2, LoadJson.ParseTimeline(LoadJson.AppendTimeline(timeline, T0, LoadRunStatus.FleetUp, "leader")).Count);
+        Assert.Equal(2, LoadJson.ParseTimeline(LoadJson.AppendTimeline(timeline, T0, LoadRunStatus.GeneratorsUp, "leader")).Count);
     }
 }
