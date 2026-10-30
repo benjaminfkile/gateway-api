@@ -662,7 +662,7 @@ posted. Nothing touches the fleet until an operator merges main.
    tracker visitor (raw websocket SignalR handshake and `JoinChannel`, one
    location event per second measured as `event_lag_ms` from `publishedAt`,
    `event_gap_ms` and `seq_regressions` (seq values are not consecutive on the hub: every stored fix of the event takes one, spare beacons included, so only a repeat or a step back is a fault), CDN poll of the live object at the poll cadence for the poll
-   fraction, keepalive pings, re-join on `channelEvicted`), offline tests with
+   fraction (zero since scenario version 2: the CDN is not under test and polls cost money), keepalive pings, re-join on `channelEvicted`), offline tests with
    a fake socket, README. The signed-in pick is phase 2.
 1. **gateway-job-runner: k6 and the load mode.** Section 7, smoke test with
    a two-metric scenario against a fake stats intake.
