@@ -5,7 +5,7 @@ namespace Gateway.Api.Management;
 /// <summary>
 /// <see cref="IResourceAuditStore"/> for a gateway with no database: the newest
 /// <see cref="Capacity"/> rows in process memory, lost on restart. Registered as a
-/// singleton so the fleet refresh watcher still finds the refresh a request started.
+/// singleton so the audit route sees the rows the load scheduler wrote.
 /// </summary>
 public sealed class InMemoryResourceAuditStore : IResourceAuditStore
 {

@@ -4,7 +4,6 @@ using Gateway.Api.Instances;
 using Gateway.Api.Load;
 using Gateway.Api.Management;
 using Gateway.Api.Reconcile;
-using Gateway.Api.Resources;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -13,7 +12,7 @@ namespace Gateway.Api.Tests;
 
 /// <summary>
 /// The load scheduler (docs/load.md section 3) against fakes: <see cref="FakeLoadStore"/>,
-/// <see cref="FakeFleetScaler"/> for both groups, <see cref="FakeSecretWriter"/>,
+/// <see cref="FakeGeneratorGroupScaler"/>, <see cref="FakeSecretWriter"/>,
 /// <see cref="FakePresenceRegistry"/>, <see cref="FakeInstanceStatusStore"/>, a stub
 /// pre-flight and leader, and a hand-cranked clock. Every tick is driven directly with
 /// <see cref="LoadSchedulerService.RunOnceAsync"/>.
@@ -21,7 +20,6 @@ namespace Gateway.Api.Tests;
 public class LoadSchedulerTests
 {
     private const string GeneratorGroup = "load-generators-placeholder";
-    private const string FleetGroup = "gateway-fleet-placeholder";
     private const string SpecSecret = "load-generator-spec-placeholder";
     private const string BaseUrl = "https://gateway.example.com";
     private const string Token = "run-token-placeholder-value";
@@ -99,8 +97,7 @@ public class LoadSchedulerTests
             };
             configure?.Invoke(Options);
 
-            Scaler.Groups[GeneratorGroup] = new FleetGroupSize(Min: 0, Desired: 0, Max: 2, InService: 0);
-            Scaler.Groups[FleetGroup] = new FleetGroupSize(Min: 2, Desired: 2, Max: 2, InService: 2);
+            Scaler.Groups[GeneratorGroup] = new GeneratorGroupSize(Desired: 0, Max: 2, InService: 0);
             var scenario = LoadTestHost.Scenario(Scenario);
             scenario.Image = "registry.example.com/gateway-job-runner";
             scenario.Tag = "v7";
@@ -117,7 +114,7 @@ public class LoadSchedulerTests
         }
 
         public FakeLoadStore Store { get; } = new();
-        public FakeFleetScaler Scaler { get; } = new();
+        public FakeGeneratorGroupScaler Scaler { get; } = new();
         public FakeSecretWriter Secrets { get; } = new();
         public FakePresenceRegistry Presence { get; } = new();
         public FakeInstanceStatusStore Status { get; } = new();
@@ -138,7 +135,6 @@ public class LoadSchedulerTests
                 _provider.GetRequiredService<IServiceScopeFactory>(),
                 Scaler,
                 Secrets,
-                new FleetGroupResolver(new ResourcesOptions { FleetGroup = FleetGroup }, new FakeFleetGroupSource(), Clock),
                 Leader,
                 Options,
                 Reconciler,
@@ -165,8 +161,6 @@ public class LoadSchedulerTests
             int generators = 2,
             int ramp = 60,
             int hold = 120,
-            int? fleet = null,
-            bool restore = true,
             string runParams = "{}",
             bool validation = false,
             DateTimeOffset? hardStopAt = null)
@@ -174,8 +168,6 @@ public class LoadSchedulerTests
             var run = LoadTestHost.Run(0, LoadRunStatus.Queued, scenario: Scenario, generators: generators, validation: validation, token: Token);
             run.RampSeconds = ramp;
             run.HoldSeconds = hold;
-            run.FleetSizeRequested = fleet;
-            run.RestoreFleet = restore;
             run.Params = runParams;
             run.QueuedAt = Clock.Now;
             run.HardStopAt = hardStopAt ?? Clock.Now + TimeSpan.FromSeconds(ramp + hold) + TimeSpan.FromMinutes(10);
@@ -261,37 +253,25 @@ public class LoadSchedulerTests
     // ---------- the happy path ----------
 
     [Fact]
-    public async Task HappyPath_WithAFleetSize_WalksEveryState_WithTheExactScalerCalls_AndRestoresTheFleet()
+    public async Task HappyPath_WalksEveryState_WithTheExactScalerCalls()
     {
         var h = new Harness();
         h.Heartbeat(2);
-        var run = h.Queue(generators: 2, ramp: 60, hold: 120, fleet: 3, restore: true);
+        var run = h.Queue(generators: 2, ramp: 60, hold: 120);
 
-        await h.TickAsync();
-        Assert.Equal(LoadRunStatus.FleetUp, h.StatusOf(run.Id));
-        Assert.Equal(LoadSchedulerService.Actor, LoadJson.ParseTimeline(h.Store.Run(run.Id).Timeline)[1].By);
-        var preflight = Assert.Single(h.Preflight.Requests);
-        Assert.Equal((Scenario, LoadTestHost.Target, LoadTestHost.Target, 2, 3), (preflight.Scenario, preflight.Target, preflight.Confirm, preflight.Generators, preflight.FleetSize));
-        Assert.Empty(h.Sets);
-
-        // fleet_up: the size before is recorded, then min, max and desired together.
-        await h.TickAsync();
-        Assert.Equal(2, h.Store.Run(run.Id).FleetSizeBefore);
-        Assert.Equal(new[] { $"set-group-size {FleetGroup} 3 3 3" }, h.Sets);
-
-        // Waits until the requested count heartbeats.
-        await h.TickAsync();
-        Assert.Equal(LoadRunStatus.FleetUp, h.StatusOf(run.Id));
-        h.Heartbeat();
+        // The claim goes straight to generators_up.
         await h.TickAsync();
         Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
-        Assert.Single(h.Sets);
+        Assert.Equal(LoadSchedulerService.Actor, LoadJson.ParseTimeline(h.Store.Run(run.Id).Timeline)[1].By);
+        var preflight = Assert.Single(h.Preflight.Requests);
+        Assert.Equal((Scenario, LoadTestHost.Target, LoadTestHost.Target, 2, 100), (preflight.Scenario, preflight.Target, preflight.Confirm, preflight.Generators, preflight.VusPerGenerator));
+        Assert.Empty(h.Sets);
 
         // generators_up: the secret, then desired only for the generator group.
         await h.TickAsync();
         Assert.Single(h.Secrets.Writes);
         Assert.Null(h.Store.Run(run.Id).SpecToken);
-        Assert.Equal($"set-desired {GeneratorGroup} 2", h.Sets[^1]);
+        Assert.Equal(new[] { $"set-desired {GeneratorGroup} 2" }, h.Sets);
         h.InService(GeneratorGroup, 2);
         await h.TickAsync();
         Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
@@ -324,26 +304,20 @@ public class LoadSchedulerTests
         Assert.Null(h.Store.Run(run.Id).StopReason);
         Assert.Equal($"set-desired {GeneratorGroup} 0", h.Sets[^1]);
 
-        // draining: the fleet goes back, and the run waits for zero in service.
+        // draining waits for zero in service.
         await h.TickAsync();
         Assert.Equal(LoadRunStatus.Draining, h.StatusOf(run.Id));
-        Assert.Equal($"set-group-size {FleetGroup} 2 2 2", h.Sets[^1]);
         h.InService(GeneratorGroup, 0);
         await h.TickAsync();
         Assert.Equal(LoadRunStatus.Succeeded, h.StatusOf(run.Id));
 
-        Assert.Equal(new[]
-        {
-            $"set-group-size {FleetGroup} 3 3 3",
-            $"set-desired {GeneratorGroup} 2",
-            $"set-desired {GeneratorGroup} 0",
-            $"set-group-size {FleetGroup} 2 2 2",
-        }, h.Sets);
+        Assert.Equal(new[] { $"set-desired {GeneratorGroup} 2", $"set-desired {GeneratorGroup} 0" }, h.Sets);
+        Assert.All(h.Scaler.CallLog, c => Assert.Equal(GeneratorGroup, c.Split(' ')[1]));
 
         var finished = h.Store.Run(run.Id);
         Assert.Equal(h.Clock.Now, finished.FinishedAt);
-        Assert.Equal(new[] { "queued", "fleet_up", "generators_up", "ramping", "holding", "draining", "succeeded" }, h.Timeline(run.Id));
-        Assert.Equal(new[] { "fleet_up", "generators_up", "ramping", "holding", "draining", "succeeded" }, h.RunEvents(run.Id));
+        Assert.Equal(new[] { "queued", "generators_up", "ramping", "holding", "draining", "succeeded" }, h.Timeline(run.Id));
+        Assert.Equal(new[] { "generators_up", "ramping", "holding", "draining", "succeeded" }, h.RunEvents(run.Id));
 
         var metric = Assert.Single(h.Metrics.Runs);
         Assert.Equal((Scenario, LoadRunStatus.Succeeded), (metric.Scenario, metric.Status));
@@ -354,47 +328,6 @@ public class LoadSchedulerTests
         var calls = h.Sets.Length;
         await h.TickAsync();
         Assert.Equal(calls, h.Sets.Length);
-    }
-
-    [Fact]
-    public async Task HappyPath_WithoutAFleetSize_SkipsFleetUp_AndNeverTouchesTheFleet()
-    {
-        var h = new Harness();
-        var run = h.Queue(ramp: 0, hold: 10);
-
-        await h.TickAsync();
-        Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
-        await h.DriveToAsync(run, LoadRunStatus.Holding);
-        h.Advance(TimeSpan.FromSeconds(10));
-        await h.LineAsync(run.Id);
-        await h.TickAsync();
-        await h.TickAsync();
-
-        Assert.Equal(LoadRunStatus.Succeeded, h.StatusOf(run.Id));
-        Assert.Equal(new[] { $"set-desired {GeneratorGroup} 2", $"set-desired {GeneratorGroup} 0" }, h.Sets);
-        Assert.DoesNotContain(h.Scaler.CallLog, c => c.Contains(FleetGroup, StringComparison.Ordinal));
-        Assert.DoesNotContain("fleet_up", h.Timeline(run.Id));
-    }
-
-    [Fact]
-    public async Task FleetSize_WithoutRestore_LeavesTheFleetAtTheRequestedSize()
-    {
-        var h = new Harness();
-        h.Heartbeat(3);
-        var run = h.Queue(ramp: 0, hold: 0, fleet: 3, restore: false);
-
-        await h.DriveToAsync(run, LoadRunStatus.Holding);
-        await h.LineAsync(run.Id);
-        await h.TickAsync(2);
-
-        Assert.Equal(LoadRunStatus.Succeeded, h.StatusOf(run.Id));
-        Assert.Equal(2, h.Store.Run(run.Id).FleetSizeBefore);
-        Assert.Equal(new[]
-        {
-            $"set-group-size {FleetGroup} 3 3 3",
-            $"set-desired {GeneratorGroup} 2",
-            $"set-desired {GeneratorGroup} 0",
-        }, h.Sets);
     }
 
     [Fact]
@@ -595,7 +528,6 @@ public class LoadSchedulerTests
     }
 
     [Theory]
-    [InlineData(LoadRunStatus.FleetUp)]
     [InlineData(LoadRunStatus.GeneratorsUp)]
     [InlineData(LoadRunStatus.Ramping)]
     [InlineData(LoadRunStatus.Holding)]
@@ -603,13 +535,10 @@ public class LoadSchedulerTests
     {
         var h = new Harness();
         h.Heartbeat(2);
-        var run = h.Queue(ramp: 600, hold: 600, fleet: state == LoadRunStatus.FleetUp ? 3 : null);
+        var run = h.Queue(ramp: 600, hold: 600);
         await h.TickAsync();
-        if (state != LoadRunStatus.FleetUp)
-        {
-            await h.DriveToAsync(run, state);
-            await h.LineAsync(run.Id);
-        }
+        await h.DriveToAsync(run, state);
+        await h.LineAsync(run.Id);
 
         Assert.Equal(state, h.StatusOf(run.Id));
         await h.Store.RequestStopAsync(run.Id, "alice-admin", h.Clock.Now);
@@ -651,41 +580,31 @@ public class LoadSchedulerTests
         Assert.Equal(LoadRunStatus.Succeeded, h.StatusOf(run.Id));
     }
 
-    // A fleet the run grows hands leadership to the new node whenever its instance id
-    // sorts lower (the leader is the lowest live id), so the bring-up states must survive
-    // a leader change: run 10 of the load ladder was lost exactly this way.
-    [Theory]
-    [InlineData(LoadRunStatus.FleetUp)]
-    [InlineData(LoadRunStatus.GeneratorsUp)]
-    public async Task LeaderRestart_AdoptsARunStillBringingTheFleetOrGeneratorsUp(string state)
+    // generators_up is a state check any leader can continue, so a run bringing its
+    // generators up survives a leader change.
+    [Fact]
+    public async Task LeaderRestart_AdoptsARunStillBringingGeneratorsUp()
     {
         var h = new Harness();
         h.Heartbeat(2);
-        var run = h.Queue(ramp: 600, hold: 600, fleet: state == LoadRunStatus.FleetUp ? 3 : null);
-        await h.TickAsync();
-        if (state != LoadRunStatus.FleetUp)
-        {
-            await h.DriveToAsync(run, state);
-        }
+        var run = h.Queue(ramp: 600, hold: 600);
+        await h.TickAsync(2);
 
-        Assert.Equal(state, h.StatusOf(run.Id));
+        Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
         var sets = h.Sets.Length;
 
         h.NewScheduler();
         await h.TickAsync();
 
-        Assert.Equal(state, h.StatusOf(run.Id));
+        Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
         Assert.Null(h.Store.Run(run.Id).StopReason);
         Assert.Equal(new[] { run.Id }, h.Scheduler.DrivenRunIds);
         Assert.Equal(sets, h.Sets.Length);
 
-        if (state == LoadRunStatus.GeneratorsUp)
-        {
-            // And the new leader carries it on: the check-ins take it to ramping.
-            await h.CheckInAllAsync(run);
-            await h.TickAsync();
-            Assert.Equal(LoadRunStatus.Ramping, h.StatusOf(run.Id));
-        }
+        // And the new leader carries it on: the check-ins take it to ramping.
+        await h.CheckInAllAsync(run);
+        await h.TickAsync();
+        Assert.Equal(LoadRunStatus.Ramping, h.StatusOf(run.Id));
     }
 
     [Theory]
@@ -739,7 +658,7 @@ public class LoadSchedulerTests
     {
         var h = new Harness();
         h.Store.Seed(LoadTestHost.Run(0, LoadRunStatus.Succeeded, scenario: Scenario));
-        h.Scaler.Groups[GeneratorGroup] = new FleetGroupSize(0, 2, 2, 1);
+        h.Scaler.Groups[GeneratorGroup] = new GeneratorGroupSize(Desired: 2, Max: 2, InService: 1);
 
         await h.TickAsync();
 
@@ -749,7 +668,7 @@ public class LoadSchedulerTests
             (row.Actor, row.Resource, row.Action));
         Assert.Equal("desired 0", row.After);
         Assert.Contains(GeneratorGroup, row.Detail);
-        Assert.Contains(h.Events.All, e => e.Channel == ResourceEndpoints.OpsResourcesChannel && e.Event == "change");
+        Assert.Contains(h.Events.All, e => e.Channel == LoadAudit.OpsResourcesChannel && e.Event == "change");
 
         // Desired is 0 now: nothing more to do.
         await h.TickAsync();
@@ -761,7 +680,7 @@ public class LoadSchedulerTests
     public async Task OrphanGuard_LeavesTheGroupAlone_WhileARunIsNonTerminal()
     {
         var h = new Harness();
-        h.Scaler.Groups[GeneratorGroup] = new FleetGroupSize(0, 2, 2, 2);
+        h.Scaler.Groups[GeneratorGroup] = new GeneratorGroupSize(Desired: 2, Max: 2, InService: 2);
         var run = h.Queue(ramp: 600);
         await h.TickAsync(2);
         await h.CheckInAllAsync(run);
@@ -859,13 +778,14 @@ public class LoadSchedulerTests
     public async Task ScalerError_PastTheRetryLimit_FailsTheRun_WithTheGeneratorsDrivenToZero()
     {
         var h = new Harness(o => o.ScaleRetryLimit = 3);
-        h.Heartbeat(2);
-        var run = h.Queue(fleet: 3);
+        var run = h.Queue();
         await h.TickAsync();
 
-        h.Scaler.Failing.Add(FleetGroup);
+        // The group reads as missing: generators_up throws on every tick.
+        var group = h.Scaler.Groups[GeneratorGroup];
+        h.Scaler.Groups.Remove(GeneratorGroup);
         await h.TickAsync(2);
-        Assert.Equal(LoadRunStatus.FleetUp, h.StatusOf(run.Id));
+        Assert.Equal(LoadRunStatus.GeneratorsUp, h.StatusOf(run.Id));
 
         await h.TickAsync();
         var draining = h.Store.Run(run.Id);
@@ -873,6 +793,7 @@ public class LoadSchedulerTests
         Assert.Contains("3 ticks in a row", draining.Detail);
         Assert.Equal(new[] { $"set-desired {GeneratorGroup} 0" }, h.Sets);
 
+        h.Scaler.Groups[GeneratorGroup] = group;
         await h.TickAsync();
         Assert.Equal(LoadRunStatus.Failed, h.StatusOf(run.Id));
     }

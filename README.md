@@ -360,13 +360,25 @@ failure never fails the request.
 
 A load run ramps a fleet of k6 generators against a service behind the gateway,
 collects their stats every five seconds, and can never outlive its hard clock.
-The design is [`docs/load.md`](docs/load.md). Built: parts 1 and 2 and
-resources: the load model, the store, the management API, the two generator
-endpoints, pre-flight, the `ops:load` events and the load scheduler that drives
-a run on the fleet leader.
-The `generator_group` and `fleet_class` checks read through the fleet scaler of
-the Resources section below (the AWS one once `Load:GeneratorGroup` or a
-`Resources:Fleet*` key is set, `NullFleetScaler` otherwise).
+The design is [`docs/load.md`](docs/load.md): the load model, the store, the
+management API, the two generator endpoints, pre-flight, the `ops:load` events
+and the load scheduler that drives a run on the fleet leader.
+
+A load run never touches the fleet. The only AWS resource the gateway steers is
+the generator Auto Scaling group, through `IGeneratorGroupScaler`: it reads the
+group's desired, max and in-service counts and sets its desired capacity
+(`AwsGeneratorGroupScaler` once `Load:GeneratorGroup` is set, default credential
+chain and region from the environment; `NullGeneratorGroupScaler`, which refuses
+every call, otherwise). The fleet Auto Scaling group and its launch template, the
+ElastiCache backplane and the RDS instance are sized by hand in the AWS console;
+a `Resources:*` key left in the environment is ignored.
+
+**IAM (instance role)** for load runs: `autoscaling:DescribeAutoScalingGroups`
+and `autoscaling:SetDesiredCapacity` on the generator group,
+`secretsmanager:PutSecretValue` on the generator spec secret, and the ECR and
+CloudWatch Logs rights the gateway already holds (the generator log route reads
+group `/gateway/load`). Nothing else: an inline policy that still grants launch
+template, ElastiCache or RDS rights can be trimmed by hand.
 
 State lives in four tables (tech-spec §4.4): `load_scenario` (the current k6
 script, repository, image, default params, users per generator, last validation
@@ -382,8 +394,8 @@ the spec secret) and `load_run_stat` (every stats line, indexed on `(run_id, at)
 | `PUT /mgmt/load/scenarios/{name}` | OpsLoad | Create (`201`, needs `repository`, `script`, `maxVusPerGenerator`) or update (`200`). Body `{ repository?, commitSha?, script?, image?, tag?, paramsDefault?, maxVusPerGenerator? }`. A changed script bumps `scriptVersion`, adds a history row and clears `lastValidationRunId`. `400 { error, field }` on a bad name, repository (`owner/name`), commit, script (non-empty, at most 256 KiB), params (a flat object of strings) or users (1..100000) |
 | `DELETE /mgmt/load/scenarios/{name}` | OpsLoad | `204`; `409 run_active` while a run of it is non-terminal. History and runs stay |
 | `GET /mgmt/load/scenarios/{name}/script/versions` and `/script/versions/{v}` | OpsDeploy | `[{ version, sha256, updatedBy, updatedAt }]` newest first, and `{ version, script }` |
-| `GET /mgmt/load/preflight?scenario=&target=&confirm=&generators=&vus=&fleet=&validation=` | OpsDeploy | `{ ok, checks: [{ name, status, message, fix }] }` |
-| `POST /mgmt/load/runs` | OpsLoad | Start. Body `{ scenario, target, confirm, generators, vusPerGenerator, rampSeconds, holdSeconds, params?, fleetSize?, restoreFleet?, validation? }`. `202 { runId }`; `400 { error, field }`; `503 load_unconfigured` when `Load:GeneratorGroup` is unset; `409 run_active` while any run is non-terminal; `409 preflight_failed { checks }` when a check is red |
+| `GET /mgmt/load/preflight?scenario=&target=&confirm=&generators=&vus=&validation=` | OpsDeploy | `{ ok, checks: [{ name, status, message, fix }] }` |
+| `POST /mgmt/load/runs` | OpsLoad | Start. Body `{ scenario, target, confirm, generators, vusPerGenerator, rampSeconds, holdSeconds, params?, validation? }`. `202 { runId }`; `400 { error, field }`; `503 load_unconfigured` when `Load:GeneratorGroup` is unset; `409 run_active` while any run is non-terminal; `409 preflight_failed { checks }` when a check is red |
 | `GET /mgmt/load/runs?limit=50&before={id}` | OpsDeploy | Runs newest first, with peaks, without timeline or stats |
 | `GET /mgmt/load/runs/{id}` | OpsDeploy | One run with timeline, peaks and check-ins |
 | `GET /mgmt/load/runs/{id}/stats?from=&to=&source=&index=&step=` | OpsDeploy | Stats rows; `step` downsamples to one row per bucket, the maximum of each numeric leaf |
@@ -394,9 +406,10 @@ the spec secret) and `load_run_stat` (every stats line, indexed on `(run_id, at)
 | `POST /mgmt/load/runs/{id}/checkin` | run token | `{ instanceId }` to `200 { index, count, vus, rampSeconds, holdSeconds, scenario, target, script, params, statsUrl }`, `409 run_full` or `409 run_not_accepting` |
 | `POST /mgmt/load/runs/{id}/stats` | run token | A generator stats line: `200 { action: "continue" \| "stop" }`, `409 run_terminal` |
 | `GET /mgmt/load/runs/{id}/log?index=0&tail=500` | OpsAdmin | `[{ ts, message }]` from log group `/gateway/load`, stream `run-{id}-{index}` |
+| `GET /mgmt/load/audit?limit=50` | OpsDeploy | `[{ id, at, actor, resource, action, before, after, detail }]` from `resource_audit`, newest first, `limit` 1..500 (`400 { error, field }` outside it): the orphan guard's rows, and the rows earlier releases wrote |
 
 **OpsLoad policy:** a member of `ops-admin`, or a client-credentials token
-carrying the scope `mgmt/load`. Start scales the fleet, so `ops-deploy`, the CI
+carrying the scope `mgmt/load`. Start scales the generator group, so `ops-deploy`, the CI
 `mgmt/deploy` scope and the `mgmt/jobs` scope do not qualify; a repository whose
 CI pushes its scenario script uses a separate client an operator creates with
 `mgmt/load`.
@@ -418,17 +431,13 @@ of each generator (counters and gauges summed, trends by the worst value). The
 answer is `stop` once a stop is requested or the run is draining.
 
 **Pre-flight** checks, each `green`, `amber` or `red`: `generator_group` (the
-generator group is empty and its max fits the run, read through `IFleetScaler`),
+generator group is empty and its max fits the run, read through `IGeneratorGroupScaler`),
 `fleet_healthy` (every `instance_status` row heartbeats and runs the target),
 `target_known`, `scenario_validated` (the last validation ran the current
 script version; skipped for a validation run), `presence_off` (the target's
-`realtime_presence` is off), `database_headroom` (`max_connections` minus
-`pg_stat_activity` covers the nodes a requested fleet size would add times
-`Load:DbConnectionsPerNode` plus `Load:DbConnectionMargin`, read on the
-gateway's own connection; the live nodes are already counted in use), `fleet_class`
-(amber for a burstable `$Default` instance type of `Resources:FleetTemplate`,
-amber "unknown" when the template is unset or cannot be read; never red in v1)
-and `target_confirmed` (`confirm` equals the target).
+`realtime_presence` is off) and `target_confirmed` (`confirm` equals the
+target). A load test is meant to find resource limits, so pre-flight does not
+check database, cache or fleet capacity.
 
 ### Load scheduler
 
@@ -442,25 +451,23 @@ status and timeline, appends a timeline entry by `gateway` and publishes `run` o
 | Status | The leader | Leaves when |
 |---|---|---|
 | `queued` | claims it (one run at a time) and runs pre-flight again with `confirm` = target | claimed; a red check drains it with reason `failed`, `detail` = the check name |
-| `fleet_up` (only with `fleetSize`) | records `fleet_size_before`, sets min, max and desired of the fleet group together | that many instances heartbeat |
 | `generators_up` | writes the generator spec secret once, then sets only the generator group's desired to `generators` | every generator checked in (`ramp_started_at` stamped); `failed`/`checkin_timeout` after `Load:CheckInTimeout` |
 | `ramping` | | `ramp_seconds` after `ramp_started_at` |
 | `holding` | | `hold_seconds` after it began |
-| `draining` | keeps the generator group at 0; restores the fleet group's min, max and desired to `fleet_size_before` when `restoreFleet` | the generator group has zero in service, then `succeeded` (no reason), `stopped` (operator), `expired` (hard_clock), `failed` or `lost` (lost, leader_restart) |
+| `draining` | keeps the generator group at 0 | the generator group has zero in service, then `succeeded` (no reason), `stopped` (operator), `expired` (hard_clock), `failed` or `lost` (lost, leader_restart) |
 
-**Exits and guards:** in `fleet_up`, `generators_up`, `ramping` and `holding`
+**Exits and guards:** in `generators_up`, `ramping` and `holding`
 the leader drains a run past `hard_stop_at` (`hard_clock`), a ramping or holding
 run whose newest generator line is older than `Load:StatsStaleAfter` (`lost`),
 and a run with `stopRequestedAt` (`operator`). Every path into `draining` sets
 the generator group's desired to 0 first. With no run non-terminal, a generator
-group above desired 0 is set to 0 and audited as `generators`/`orphan_guard` on
-`/mgmt/resources/audit`. On gaining leadership (also after a process restart), a
-non-terminal run this process is not driving is adopted when it is in `fleet_up`
-or `generators_up`, ramping or holding with fresh stats, or already draining;
-anything else drains with `leader_restart`. (A fleet the run grows hands
-leadership to the new node whenever its instance id sorts lower, so those two
-states must survive a leader change.) A scaler or secret call that throws is retried on the next
-tick; after `Load:ScaleRetryLimit` failed ticks in a row the run fails, with the
+group above desired 0 is set to 0, audited as `generators`/`orphan_guard` in
+`resource_audit` (listed by `GET /mgmt/load/audit`) and published as `change` on
+`ops:resources`. On gaining leadership (also after a process restart), a
+non-terminal run this process is not driving is adopted when it is in
+`generators_up`, ramping or holding with fresh stats, or already draining;
+anything else drains with `leader_restart`. A generator group or secret call that
+throws is retried on the next tick; after `Load:ScaleRetryLimit` failed ticks in a row the run fails, with the
 generator group set to 0 regardless. A succeeded validation run records itself
 as the scenario's `lastValidationRunId`.
 
@@ -492,9 +499,6 @@ same EMF path and namespace as the job metrics (`Jobs:MetricsEndpoint`,
 | `Load:CheckInTimeout` | `00:05:00` | How long `generators_up` waits for every generator |
 | `Load:StatsStaleAfter` | `00:01:00` | Ramp or hold with no generator line for this long marks the run `lost` |
 | `Load:ValidationHoldSeconds` | `300` | Hold of a validation run |
-| `Load:DbConnectionsPerNode` | `20` | Per-node database connections the headroom check assumes |
-| `Load:DbConnectionMargin` | `10` | Spare connections the headroom check requires |
-| `Load:DbDowngradeMarginPercent` | `25` | Resources: a smaller database class must exceed connections in use by this much |
 | `Load:FleetSampleInterval` | `00:00:10` | How often the leader writes a fleet sample |
 | `Load:TickInterval` | `00:00:10` | How often the load scheduler ticks |
 | `Load:GatewayBaseUrl` | unset | Public origin the generators reach the gateway at, e.g. `https://gateway.example.com`; written into the spec secret, and a run fails in `generators_up` while it is unset |
@@ -506,71 +510,9 @@ same EMF path and namespace as the job metrics (`Jobs:MetricsEndpoint`,
 status, actor, generators, vusPerGenerator, startedAt, finishedAt, stopReason }`
 on Start, on a stop request and on every status change, `stats` `{ runId, at,
 aggregate }` after every stored generator line, and `fleet` `{ runId, at, sample }`
-after every fleet sample. Publishing is best-effort: a backplane failure never
-fails the request.
-
-## Resources
-
-The Resources page scales what already exists: the fleet Auto Scaling group and
-its launch template, the realtime backplane's ElastiCache replication group, and
-the RDS instance every service shares. The design is section 9 of
-[`docs/load.md`](docs/load.md). Every AWS call goes through `IFleetScaler`,
-`ICacheScaler` or `IDatabaseScaler`; each is the AWS SDK implementation
-(`AwsFleetScaler`, `ElastiCacheScaler`, `RdsDatabaseScaler`: default credential
-chain, region from the environment, one client per service) when its keys are
-set, and a null one that refuses every call otherwise, so a box without AWS
-still boots. Reads need OpsDeploy; every mutation needs OpsAdmin, so neither
-`ops-deploy`, the CI scope, the `mgmt/jobs` client nor the `mgmt/load` client
-can change a resource.
-
-| Endpoint | Policy | Action |
-|---|---|---|
-| `GET /mgmt/resources` | OpsDeploy | `{ runActive, fleet: { group, min, desired, max, inService, instanceClass, templateVersion, refreshInProgress, classes, maxSize, error }, generators: { group, desired, inService, max, error }, cache: { id, nodeType, status, nodeTypes, error }, database: { id, instanceClass, status, maxConnections, connectionsInUse, documentedMaxConnections, classes, error } }`; a block is null when its key is unset, and `error` carries an AWS read failure |
-| `GET /mgmt/resources/fleet/refresh` | OpsDeploy | The fleet group's newest instance refresh: `{ group, refreshId, status, percentComplete, inProgress }` |
-| `GET /mgmt/resources/audit?limit=50` | OpsDeploy | `[{ id, at, actor, resource, action, before, after, detail }]` newest first, `limit` 1..500 |
-| `PUT /mgmt/resources/fleet/size` | OpsAdmin | `{ size }` (1..`Resources:FleetMaxSize`): sets min, desired and max together (never desired alone: target tracking scales an idle fleet back in). `202 { group, min, desired, max }` |
-| `PUT /mgmt/resources/fleet/class` | OpsAdmin | `{ instanceClass }` from `Resources:FleetClasses`: creates a template version from `$Default` with only `InstanceType` changed, makes it `$Default`, raises the group's max by one and starts an instance refresh with the deploy preferences (min healthy 100, max healthy 150, warmup 300 s). `202 { templateVersion, refreshId }` |
-| `PUT /mgmt/resources/fleet/class/rollback` | OpsAdmin | `{ templateVersion }` of a version that exists (`400 version_not_found` otherwise): makes it `$Default` and starts a refresh the same way |
-| `PUT /mgmt/resources/cache/node-type` | OpsAdmin | `{ nodeType }` from `Resources:CacheNodeTypes`: modifies the replication group, applied immediately. `202 { id, nodeType, note }`; the note (also in the audit row) says publishes are dropped while the backplane is degraded |
-| `PUT /mgmt/resources/database/class` | OpsAdmin | `{ instanceClass, confirm }` from `Resources:DatabaseClasses`, `confirm` equal to `Resources:DatabaseInstance` (`400 confirm_mismatch`). Class only, applied immediately. A downgrade is `409 downgrade_unsafe` unless the target's documented `max_connections` is at least connections in use plus `Load:DbDowngradeMarginPercent`. `202 { id, instanceClass, services, note }`: every manifest service and the reboot warning |
-
-Every mutation answers, in order: `503 resource_unconfigured` when the
-resource's key is unset, `400` on the body (`class_not_allowed` outside the allow
-list), `409 run_active` while a load run is non-terminal, then
-`409 refresh_in_progress` (fleet size, class and rollback, while the fleet group's
-newest refresh is in flight, whoever started it) or `409 downgrade_unsafe`. An
-AWS error answers `502 { error: "aws_error", detail }`. A change that reaches AWS
-writes a `resource_audit` row (migration `AddResourceAudit`) and publishes on
-`ops:resources`.
-
-**Downgrade rule:** a class is a downgrade when its documented `max_connections`
-is lower than the current class's, or when either class is missing from the
-operator-maintained table in `DatabaseClassConnections` (the RDS Postgres default
-`LEAST({DBInstanceClassMemory/9531392}, 5000)` over each class's nominal memory,
-listed in docs/load.md section 9). An unknown target, or unknown connections in
-use, refuses the downgrade.
-
-**Refresh watcher:** a hosted service polls every 30 s. It finds the refreshes
-the gateway started through their audit rows (so the instance that started a
-refresh may be replaced by it), publishes `refresh` progress, and when the
-refresh ends (successful, failed, cancelled, rolled back, or unknown to Auto
-Scaling) puts the group's max back to its value before the raise and writes a
-`refresh_ended` row. Only the fresh leader acts; an instance with the reconciler
-disabled acts alone.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `Resources:FleetGroup` | unset | Fleet Auto Scaling group name. When unset and `Resources:FleetTemplate` is set, read from the instance's `aws:autoscaling:groupName` tag through IMDS (needs instance metadata tags on) |
-| `Resources:FleetTemplate` | unset | Fleet launch template name, or id when it starts with `lt-` |
-| `Resources:FleetClasses` | empty | Allowed fleet instance types, comma separated |
-| `Resources:FleetMaxSize` | `50` | Largest size `fleet/size` accepts |
-| `Resources:CacheReplicationGroup`, `Resources:CacheNodeTypes` | unset, empty | The backplane replication group and its allowed node types |
-| `Resources:DatabaseInstance`, `Resources:DatabaseClasses` | unset, empty | The database instance identifier and its allowed classes |
-
-**Real-time:** the `ops:resources` hub channel (same gate as `ops:deploys`)
-carries `change` `{ resource, action, by, before, after }` after every audited
-change and `refresh` `{ refreshId, status, percentComplete }` when a class change
-or rollback starts its refresh and on every watcher poll until it ends.
+after every fleet sample. The `ops:resources` channel carries `change`
+`{ resource, action, by, before, after }` when the orphan guard writes its audit
+row. Publishing is best-effort: a backplane failure never fails the request.
 
 ## Internal listener (containers only)
 

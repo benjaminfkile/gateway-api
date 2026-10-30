@@ -144,7 +144,7 @@ public sealed class EfLoadStore : ILoadStore
             return null;
         }
 
-        var next = run.FleetSizeRequested is null ? LoadRunStatus.GeneratorsUp : LoadRunStatus.FleetUp;
+        const string next = LoadRunStatus.GeneratorsUp;
         var timeline = LoadJson.AppendTimeline(run.Timeline, now, next, by);
 
         // The claim: still queued, timeline unchanged since the read (so a concurrent
@@ -173,7 +173,6 @@ public sealed class EfLoadStore : ILoadStore
                 .SetProperty(x => x.Timeline, next.Timeline)
                 .SetProperty(x => x.RampStartedAt, next.RampStartedAt)
                 .SetProperty(x => x.FinishedAt, next.FinishedAt)
-                .SetProperty(x => x.FleetSizeBefore, next.FleetSizeBefore)
                 .SetProperty(x => x.StopReason, next.StopReason)
                 .SetProperty(x => x.Detail, next.Detail)
                 .SetProperty(x => x.SpecToken, next.SpecToken), ct);

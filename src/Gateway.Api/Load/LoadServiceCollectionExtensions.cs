@@ -1,3 +1,4 @@
+using Amazon.AutoScaling;
 using Amazon.SecretsManager;
 using Gateway.Api.Data;
 using Gateway.Api.Instances;
@@ -5,19 +6,18 @@ using Gateway.Api.Jobs;
 using Gateway.Api.Management;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
-using Gateway.Api.Resources;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Gateway.Api.Load;
 
 /// <summary>
 /// Registration for the load feature (docs/load.md sections 3, 6, 8 and 12).
-/// <see cref="AddLoad"/>: the options, the store default, the pre-flight and its
-/// checks, the database headroom reader, the run-token rate limiter, the load clock and
-/// the metrics. <see cref="AddLoadScheduler"/>: the secret writer and the load
-/// scheduler, which <c>Program</c> adds only with a database. The fleet scaler both
-/// read through is registered by <c>AddResources</c>. <c>TryAdd</c> throughout so
-/// <c>Program</c>'s database branch and tests substitute their own.
+/// <see cref="AddLoad"/>: the options, the store and audit store defaults, the
+/// generator group scaler, the pre-flight and its checks, the run-token rate limiter,
+/// the load clock and the metrics. <see cref="AddLoadScheduler"/>: the secret writer
+/// and the load scheduler, which <c>Program</c> adds only with a database.
+/// <c>TryAdd</c> throughout so <c>Program</c>'s database branch and tests substitute
+/// their own.
 /// </summary>
 public static class LoadServiceCollectionExtensions
 {
@@ -30,7 +30,20 @@ public static class LoadServiceCollectionExtensions
         // No-op defaults until Program wires the EF-backed implementations for a
         // configured database.
         services.TryAddScoped<ILoadStore, NullLoadStore>();
-        services.TryAddScoped<IDatabaseHeadroom, NullDatabaseHeadroom>();
+
+        // No database: the newest audit rows in memory. Program registers the EF store
+        // first when a database is configured.
+        services.TryAddSingleton<IResourceAuditStore, InMemoryResourceAuditStore>();
+
+        // The generator group scaler: the AWS one when Load:GeneratorGroup is set, the
+        // null one otherwise, decided when first resolved so a test host's late-bound
+        // configuration is honoured. The Auto Scaling client is built lazily from the
+        // default credential chain and the environment's region.
+        services.TryAddSingleton<IAmazonAutoScaling>(_ => new AmazonAutoScalingClient());
+        services.TryAddSingleton<IGeneratorGroupScaler>(sp =>
+            sp.GetRequiredService<LoadOptions>().IsConfigured
+                ? new AwsGeneratorGroupScaler(sp.GetRequiredService<IAmazonAutoScaling>())
+                : new NullGeneratorGroupScaler());
 
         // Clock for run timestamps, the hard stop and pre-flight freshness. Keyed so a
         // test can fix it without moving the clock the rest of the host reads.
@@ -44,8 +57,6 @@ public static class LoadServiceCollectionExtensions
         services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, TargetKnownCheck>());
         services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, ScenarioValidatedCheck>());
         services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, PresenceOffCheck>());
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, DatabaseHeadroomCheck>());
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, FleetClassCheck>());
         services.TryAddEnumerable(ServiceDescriptor.Scoped<ILoadPreflightCheck, TargetConfirmedCheck>());
         services.TryAddScoped<ILoadPreflight, LoadPreflight>();
 
@@ -75,9 +86,8 @@ public static class LoadServiceCollectionExtensions
 
         services.AddHostedService(sp => new LoadSchedulerService(
             sp.GetRequiredService<IServiceScopeFactory>(),
-            sp.GetRequiredService<IFleetScaler>(),
+            sp.GetRequiredService<IGeneratorGroupScaler>(),
             sp.GetRequiredService<ISecretWriter>(),
-            sp.GetRequiredService<FleetGroupResolver>(),
             sp.GetRequiredService<ILeaderStatus>(),
             sp.GetRequiredService<LoadOptions>(),
             sp.GetRequiredService<ReconcilerOptions>(),

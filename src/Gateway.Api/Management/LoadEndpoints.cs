@@ -43,8 +43,6 @@ public sealed record StartLoadRunRequest(
     int? RampSeconds = null,
     int? HoldSeconds = null,
     JsonElement? Params = null,
-    int? FleetSize = null,
-    bool? RestoreFleet = null,
     bool? Validation = null);
 
 /// <summary>Body of <c>PUT /mgmt/load/runs/{id}/verdict</c>; null or empty clears it.</summary>
@@ -56,7 +54,8 @@ public sealed record LoadVerdictRequest(string? Verdict = null);
 /// generator endpoints (<c>checkin</c> and <c>stats</c>) take the run token instead
 /// of Cognito: anonymous, rate limited per source address, a 64 KiB body cap, and the
 /// same <c>401</c> for a wrong token and an unknown run. Every mutation publishes a
-/// best-effort event on <see cref="OpsLoadChannel"/>. A queued run stays queued until
+/// best-effort event on <see cref="OpsLoadChannel"/>. <c>GET /mgmt/load/audit</c> lists
+/// the <c>resource_audit</c> rows, the orphan guard's among them. A queued run stays queued until
 /// <see cref="LoadSchedulerService"/> on the leader claims it.
 /// </summary>
 public static partial class LoadEndpoints
@@ -120,6 +119,7 @@ public static partial class LoadEndpoints
         load.MapGet("/runs/{id:long}", GetRunAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
         load.MapGet("/runs/{id:long}/stats", GetStatsAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
         load.MapGet("/runs/{id:long}/stats.csv", GetStatsCsvAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
+        load.MapGet("/audit", GetAuditAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
 
         load.MapGet("/runs/{id:long}/log", GetRunLogAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
 
@@ -365,7 +365,6 @@ public static partial class LoadEndpoints
         string? confirm,
         int? generators,
         int? vus,
-        int? fleet,
         bool? validation,
         ILoadPreflight preflight,
         CancellationToken ct)
@@ -377,7 +376,6 @@ public static partial class LoadEndpoints
             confirm,
             isValidation ? 1 : generators ?? 1,
             isValidation ? 1 : vus ?? 1,
-            fleet,
             isValidation), ct);
 
         return Results.Json(new
@@ -385,6 +383,20 @@ public static partial class LoadEndpoints
             ok = checks.All(c => c.Status != PreflightStatus.Red),
             checks = checks.Select(CheckView).ToList(),
         });
+    }
+
+    // ---------- audit (OpsDeploy) ----------
+
+    private static async Task<IResult> GetAuditAsync(int? limit, IResourceAuditStore audit, CancellationToken ct)
+    {
+        var take = limit ?? LoadAudit.DefaultLimit;
+        if (take < 1 || take > LoadAudit.MaxLimit)
+        {
+            return Invalid("limit", $"limit must be in the range 1..{LoadAudit.MaxLimit}.");
+        }
+
+        var rows = await audit.ListAsync(take, ct: ct);
+        return Results.Json(rows.Select(LoadAudit.View).ToList());
     }
 
     // ---------- runs: reads (OpsDeploy) ----------
@@ -539,11 +551,6 @@ public static partial class LoadEndpoints
             (generators, vus, ramp, hold) = (g, v, r, h);
         }
 
-        if (request.FleetSize is < 1)
-        {
-            return Invalid("fleetSize", "fleetSize must be at least 1, or absent to leave the fleet alone.");
-        }
-
         // The run's params: the scenario's defaults with the run's overrides on top.
         var runParams = new Dictionary<string, string>(StringComparer.Ordinal);
         if (TryFlatStrings(LoadJson.Element(scenario.ParamsDefault), out var defaults))
@@ -579,7 +586,7 @@ public static partial class LoadEndpoints
 
         var target = request.Target.Trim();
         var checks = await preflight.EvaluateAsync(new LoadPreflightRequest(
-            scenario.Name, target, request.Confirm, generators, vus, request.FleetSize, validation), ct);
+            scenario.Name, target, request.Confirm, generators, vus, validation), ct);
         if (checks.Any(c => c.Status == PreflightStatus.Red))
         {
             return Results.Json(
@@ -608,8 +615,6 @@ public static partial class LoadEndpoints
             RampSeconds = ramp,
             HoldSeconds = hold,
             Params = WriteParams(runParams),
-            FleetSizeRequested = request.FleetSize,
-            RestoreFleet = request.RestoreFleet ?? true,
             HardStopAt = now + (lifetime < HardStopCeiling ? lifetime : HardStopCeiling),
             TokenHash = TokenHash(token),
             SpecToken = token,
@@ -1093,9 +1098,6 @@ public static partial class LoadEndpoints
         ["rampSeconds"] = r.RampSeconds,
         ["holdSeconds"] = r.HoldSeconds,
         ["params"] = LoadJson.Element(r.Params),
-        ["fleetSizeRequested"] = r.FleetSizeRequested,
-        ["fleetSizeBefore"] = r.FleetSizeBefore,
-        ["restoreFleet"] = r.RestoreFleet,
         ["hardStopAt"] = r.HardStopAt,
         ["checkedIn"] = r.CheckedIn,
         ["queuedAt"] = r.QueuedAt,

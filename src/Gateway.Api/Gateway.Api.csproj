@@ -15,10 +15,7 @@
   <ItemGroup>
     <PackageReference Include="AWSSDK.AutoScaling" Version="3.7.506.25" />
     <PackageReference Include="AWSSDK.CloudWatchLogs" Version="3.7.509.3" />
-    <PackageReference Include="AWSSDK.EC2" Version="3.7.556.5" />
     <PackageReference Include="AWSSDK.ECR" Version="3.7.509.8" />
-    <PackageReference Include="AWSSDK.ElastiCache" Version="3.7.502.56" />
-    <PackageReference Include="AWSSDK.RDS" Version="3.7.515.4" />
     <PackageReference Include="AWSSDK.SecretsManager" Version="3.7.504.43" />
     <PackageReference Include="Cronos" Version="0.13.0" />
     <PackageReference Include="Docker.DotNet" Version="3.125.15" />

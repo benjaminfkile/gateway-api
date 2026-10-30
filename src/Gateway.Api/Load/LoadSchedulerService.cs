@@ -7,7 +7,6 @@ using Gateway.Api.Instances;
 using Gateway.Api.Management;
 using Gateway.Api.RealTime;
 using Gateway.Api.Reconcile;
-using Gateway.Api.Resources;
 
 namespace Gateway.Api.Load;
 
@@ -22,11 +21,9 @@ namespace Gateway.Api.Load;
 /// <item>Claim the queued run (one load run at a time, so there is at most one) with
 /// the store's conditional claim, then run pre-flight again; a red check fails it.</item>
 /// <item>Gaining leadership: a non-terminal run this process is not driving is adopted
-/// when it is in <c>fleet_up</c> or <c>generators_up</c> (both are state checks any
-/// leader can continue; a fleet grown by the run itself hands leadership to a new node
-/// whenever that node's instance id sorts lower), when it is ramping or holding with
-/// fresh generator stats, or already draining; any other goes to <c>draining</c> with
-/// reason <c>leader_restart</c>.</item>
+/// when it is in <c>generators_up</c> (a state check any leader can continue), when it
+/// is ramping or holding with fresh generator stats, or already draining; any other
+/// goes to <c>draining</c> with reason <c>leader_restart</c>.</item>
 /// <item>Drive the run one step through the state table: the exits (hard clock, stale
 /// stats, operator stop) first, then the step of its status.</item>
 /// <item>Write a fleet sample every <see cref="LoadOptions.FleetSampleInterval"/>.</item>
@@ -34,7 +31,7 @@ namespace Gateway.Api.Load;
 /// Every status change is one <see cref="ILoadStore.TryAdvanceRunAsync"/> with a
 /// timeline entry, followed by a <c>run</c> event on <c>ops:load</c>. Every path into
 /// <c>draining</c> sets the generator group's desired capacity to 0 first. A step whose
-/// scaler or secret call throws is retried on the next tick; after
+/// generator group or secret call throws is retried on the next tick; after
 /// <see cref="LoadOptions.ScaleRetryLimit"/> failed ticks in a row the run fails, with
 /// the generator group set to 0 whether or not that call succeeds.
 /// </summary>
@@ -55,9 +52,8 @@ public sealed class LoadSchedulerService : BackgroundService
     private static readonly JsonSerializerOptions Web = new(JsonSerializerDefaults.Web);
 
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IFleetScaler _scaler;
+    private readonly IGeneratorGroupScaler _scaler;
     private readonly ISecretWriter _secrets;
-    private readonly FleetGroupResolver _fleetGroup;
     private readonly ILeaderStatus _leader;
     private readonly LoadOptions _options;
     private readonly ReconcilerOptions _reconciler;
@@ -81,9 +77,8 @@ public sealed class LoadSchedulerService : BackgroundService
 
     public LoadSchedulerService(
         IServiceScopeFactory scopeFactory,
-        IFleetScaler scaler,
+        IGeneratorGroupScaler scaler,
         ISecretWriter secrets,
-        FleetGroupResolver fleetGroup,
         ILeaderStatus leader,
         LoadOptions options,
         ReconcilerOptions reconciler,
@@ -97,7 +92,6 @@ public sealed class LoadSchedulerService : BackgroundService
         _scopeFactory = scopeFactory;
         _scaler = scaler;
         _secrets = secrets;
-        _fleetGroup = fleetGroup;
         _leader = leader;
         _options = options;
         _reconciler = reconciler;
@@ -196,7 +190,7 @@ public sealed class LoadSchedulerService : BackgroundService
         }
         else
         {
-            await StepAsync(run, () => DriveAsync(scope.ServiceProvider, store, run, now, ct));
+            await StepAsync(run, () => DriveAsync(store, run, now, ct));
         }
 
         await GuardStepAsync("write a fleet sample", () => SampleFleetAsync(scope.ServiceProvider, store, run.Id, now, ct));
@@ -252,7 +246,7 @@ public sealed class LoadSchedulerService : BackgroundService
     private async Task OrphanGuardAsync(IServiceProvider services, CancellationToken ct)
     {
         var group = _options.GeneratorGroup!;
-        var size = await _scaler.DescribeGroupAsync(group, ct);
+        var size = await _scaler.DescribeAsync(group, ct);
         if (size is null || size.Desired <= 0)
         {
             return;
@@ -262,11 +256,11 @@ public sealed class LoadSchedulerService : BackgroundService
         _logger.LogWarning(
             "No load run is active but generator group {Group} had desired {Desired}; set it to 0.", group, size.Desired);
 
-        await ResourceEndpoints.RecordAsync(
+        await LoadAudit.RecordAsync(
             services.GetRequiredService<IResourceAuditStore>(),
             _publisher ?? NoPublisher.Instance,
             _time,
-            user: null,
+            Actor,
             GeneratorsResource,
             OrphanGuardAction,
             string.Create(CultureInfo.InvariantCulture, $"desired {size.Desired}, in service {size.InService}"),
@@ -294,7 +288,6 @@ public sealed class LoadSchedulerService : BackgroundService
             claimed.Target,
             claimed.Generators,
             claimed.VusPerGenerator,
-            claimed.FleetSizeRequested,
             claimed.Validation), ct);
         var red = checks.FirstOrDefault(c => c.Status == PreflightStatus.Red);
         if (red is not null)
@@ -306,7 +299,7 @@ public sealed class LoadSchedulerService : BackgroundService
 
     private async Task AdoptOrDrainAsync(ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
     {
-        var adopt = run.Status is LoadRunStatus.Draining or LoadRunStatus.FleetUp or LoadRunStatus.GeneratorsUp
+        var adopt = run.Status is LoadRunStatus.Draining or LoadRunStatus.GeneratorsUp
             || (run.Status is LoadRunStatus.Ramping or LoadRunStatus.Holding && !await StatsStaleAsync(store, run, now, ct));
         if (adopt)
         {
@@ -325,9 +318,9 @@ public sealed class LoadSchedulerService : BackgroundService
 
     // ---------- the state table ----------
 
-    private async Task DriveAsync(IServiceProvider services, ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
+    private async Task DriveAsync(ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
     {
-        if (run.Status is LoadRunStatus.FleetUp or LoadRunStatus.GeneratorsUp or LoadRunStatus.Ramping or LoadRunStatus.Holding)
+        if (run.Status is LoadRunStatus.GeneratorsUp or LoadRunStatus.Ramping or LoadRunStatus.Holding)
         {
             var reason = await ExitReasonAsync(store, run, now, ct);
             if (reason is not null)
@@ -339,10 +332,6 @@ public sealed class LoadSchedulerService : BackgroundService
 
         switch (run.Status)
         {
-            case LoadRunStatus.FleetUp:
-                await FleetUpAsync(services, store, run, now, ct);
-                break;
-
             case LoadRunStatus.GeneratorsUp:
                 await GeneratorsUpAsync(store, run, now, ct);
                 break;
@@ -409,52 +398,6 @@ public sealed class LoadSchedulerService : BackgroundService
         return now - newest > _options.StatsStaleAfter;
     }
 
-    private async Task FleetUpAsync(IServiceProvider services, ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
-    {
-        var requested = run.FleetSizeRequested ?? 0;
-        var group = await _fleetGroup.GetAsync(ct);
-        if (group is null || requested < 1)
-        {
-            await DrainAsync(store, run, LoadStopReason.Failed, "fleet group is not configured", now, ct);
-            return;
-        }
-
-        var size = await _scaler.DescribeGroupAsync(group, ct)
-            ?? throw new InvalidOperationException($"fleet group {group} was not found");
-
-        if (run.FleetSizeBefore is null)
-        {
-            // Recorded before the fleet moves, so a retried step never takes the raised
-            // size for the original.
-            var next = run.Clone();
-            next.FleetSizeBefore = size.Desired;
-            var recorded = await store.TryAdvanceRunAsync(run, next, ct);
-            if (recorded is null)
-            {
-                return;
-            }
-
-            run = recorded;
-        }
-
-        if (size.Min != requested || size.Desired != requested || size.Max != requested)
-        {
-            // Min, max and desired together: the group's scaling policy would take a
-            // raised desired alone back within minutes.
-            await _scaler.SetGroupSizeAsync(group, requested, requested, requested, ct);
-            _logger.LogInformation("Load run {RunId}: fleet group {Group} set to {Size}.", run.Id, group, requested);
-            return;
-        }
-
-        var cutoff = now - _reconciler.InstanceStaleThreshold;
-        var fresh = (await services.GetRequiredService<IInstanceStatusStore>().GetAllAsync(ct))
-            .Count(i => i.HeartbeatAt >= cutoff);
-        if (fresh == requested)
-        {
-            await AdvanceAsync(store, run, r => r.Status = LoadRunStatus.GeneratorsUp, now, null, ct);
-        }
-    }
-
     private async Task GeneratorsUpAsync(ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
     {
         if (run.SpecToken is not null)
@@ -488,7 +431,7 @@ public sealed class LoadSchedulerService : BackgroundService
         }
 
         var group = _options.GeneratorGroup!;
-        var size = await _scaler.DescribeGroupAsync(group, ct)
+        var size = await _scaler.DescribeAsync(group, ct)
             ?? throw new InvalidOperationException($"generator group {group} was not found");
         if (size.Desired != run.Generators)
         {
@@ -556,26 +499,11 @@ public sealed class LoadSchedulerService : BackgroundService
     private async Task DrainingAsync(ILoadStore store, LoadRun run, DateTimeOffset now, CancellationToken ct)
     {
         var group = _options.GeneratorGroup!;
-        var size = await _scaler.DescribeGroupAsync(group, ct)
+        var size = await _scaler.DescribeAsync(group, ct)
             ?? throw new InvalidOperationException($"generator group {group} was not found");
         if (size.Desired > 0)
         {
             await _scaler.SetDesiredAsync(group, 0, ct);
-        }
-
-        if (run.RestoreFleet && run.FleetSizeBefore is { } before)
-        {
-            var fleet = await _fleetGroup.GetAsync(ct);
-            if (fleet is not null)
-            {
-                var fleetSize = await _scaler.DescribeGroupAsync(fleet, ct);
-                if (fleetSize is not null
-                    && (fleetSize.Min != before || fleetSize.Desired != before || fleetSize.Max != before))
-                {
-                    await _scaler.SetGroupSizeAsync(fleet, before, before, before, ct);
-                    _logger.LogInformation("Load run {RunId}: fleet group {Group} restored to {Size}.", run.Id, fleet, before);
-                }
-            }
         }
 
         if (size.InService == 0)

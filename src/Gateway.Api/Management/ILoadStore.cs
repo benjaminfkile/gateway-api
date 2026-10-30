@@ -86,8 +86,7 @@ public interface ILoadStore
 
     /// <summary>
     /// Claim a queued run with one conditional update: <c>queued</c> to
-    /// <c>fleet_up</c> (when the run asks for a fleet size) or <c>generators_up</c>,
-    /// <c>started_at</c> = <paramref name="now"/> and a timeline entry, only while the
+    /// <c>generators_up</c>, <c>started_at</c> = <paramref name="now"/> and a timeline entry, only while the
     /// run is still queued and no other run is non-terminal. Returns the run after the
     /// claim, or null when the update matched nothing.
     /// </summary>
@@ -96,8 +95,8 @@ public interface ILoadStore
     /// <summary>
     /// The load scheduler's one conditional update per step (docs/load.md section 3).
     /// Writes <paramref name="next"/>'s <c>status</c>, <c>timeline</c>,
-    /// <c>ramp_started_at</c>, <c>finished_at</c>, <c>fleet_size_before</c>,
-    /// <c>stop_reason</c>, <c>detail</c> and <c>spec_token</c>, only while the stored row
+    /// <c>ramp_started_at</c>, <c>finished_at</c>, <c>stop_reason</c>, <c>detail</c> and
+    /// <c>spec_token</c>, only while the stored row
     /// still has <paramref name="expected"/>'s status and timeline. A stop request and
     /// every other step append to the timeline, so a step decided on an older read
     /// matches nothing and two leaders ticking together cannot both act. Check-in

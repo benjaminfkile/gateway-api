@@ -2,7 +2,9 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Gateway.Api.Data;
+using Gateway.Api.Load;
 using Gateway.Api.Management;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Gateway.Api.Tests;
 
@@ -10,8 +12,8 @@ namespace Gateway.Api.Tests;
 /// Integration coverage for the Cognito-gated <c>/mgmt/load</c> routes (docs/load.md
 /// section 8): scenario upsert rules (create vs update, script versions, validation
 /// reset, defaults), run Start validation and every 409, the run reads, stop, verdict
-/// and delete rules, the stats reads (raw, downsampled, CSV), the generator log, and
-/// the <c>ops:load</c> events.
+/// and delete rules, the stats reads (raw, downsampled, CSV), the generator log, the
+/// resource audit list, and the <c>ops:load</c> events.
 /// </summary>
 public class LoadEndpointsTests
 {
@@ -252,6 +254,7 @@ public class LoadEndpointsTests
         await using var host = await ReadyHostAsync(clock);
         var body = StartBody();
         body["params"] = new { baseUrl = "https://dev.example.com" };
+        // Unknown fields are ignored, not refused.
         body["fleetSize"] = 3;
         body["restoreFleet"] = false;
 
@@ -263,8 +266,6 @@ public class LoadEndpointsTests
         Assert.Equal(LoadRunStatus.Queued, run.Status);
         Assert.Equal(("tracker", 1, LoadTestHost.Target), (run.Scenario, run.ScenarioVersion, run.Target));
         Assert.Equal((2, 100, 60, 120), (run.Generators, run.VusPerGenerator, run.RampSeconds, run.HoldSeconds));
-        Assert.Equal(3, run.FleetSizeRequested);
-        Assert.False(run.RestoreFleet);
         Assert.False(run.Validation);
         Assert.Equal("alice-admin", run.Actor);
         Assert.Equal(Now, run.QueuedAt);
@@ -294,6 +295,7 @@ public class LoadEndpointsTests
         // The token is shown to nobody: not in the run view either.
         var view = await host.Admin().GetStringAsync($"/mgmt/load/runs/{runId}");
         Assert.DoesNotContain("token", view, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("fleet", view, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -323,7 +325,6 @@ public class LoadEndpointsTests
         var run = host.Store.Run((await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("runId").GetInt64());
         Assert.True(run.Validation);
         Assert.Equal((1, 1, 0, 240), (run.Generators, run.VusPerGenerator, run.RampSeconds, run.HoldSeconds));
-        Assert.True(run.RestoreFleet);
     }
 
     public static TheoryData<string, string> InvalidStarts => new()
@@ -341,7 +342,6 @@ public class LoadEndpointsTests
         { """{"scenario":"tracker","target":"svc-a","generators":1,"vusPerGenerator":1,"rampSeconds":0}""", "holdSeconds" },
         { """{"scenario":"tracker","target":"svc-a","generators":1,"vusPerGenerator":1,"rampSeconds":0,"holdSeconds":10801}""", "holdSeconds" },
         { """{"scenario":"tracker","target":"svc-a","generators":1,"vusPerGenerator":1,"rampSeconds":0,"holdSeconds":0,"params":{"a":1}}""", "params" },
-        { """{"scenario":"tracker","target":"svc-a","generators":1,"vusPerGenerator":1,"rampSeconds":0,"holdSeconds":0,"fleetSize":0}""", "fleetSize" },
     };
 
     [Theory]
@@ -371,7 +371,6 @@ public class LoadEndpointsTests
 
     [Theory]
     [InlineData(LoadRunStatus.Queued)]
-    [InlineData(LoadRunStatus.FleetUp)]
     [InlineData(LoadRunStatus.GeneratorsUp)]
     [InlineData(LoadRunStatus.Ramping)]
     [InlineData(LoadRunStatus.Holding)]
@@ -404,8 +403,7 @@ public class LoadEndpointsTests
             c => c.GetProperty("name").GetString()!, c => c.GetProperty("status").GetString());
         Assert.Equal("red", checks["target_confirmed"]);
         Assert.Equal("green", checks["target_known"]);
-        Assert.Equal("amber", checks["fleet_class"]);
-        Assert.Equal(8, checks.Count);
+        Assert.Equal(6, checks.Count);
         Assert.Single(host.Store.Runs);
     }
 
@@ -437,7 +435,7 @@ public class LoadEndpointsTests
         Assert.Equal(new[]
         {
             "generator_group", "fleet_healthy", "target_known", "scenario_validated",
-            "presence_off", "database_headroom", "fleet_class", "target_confirmed",
+            "presence_off", "target_confirmed",
         }, names);
         Assert.All(json.GetProperty("checks").EnumerateArray(), c =>
         {
@@ -447,6 +445,65 @@ public class LoadEndpointsTests
 
         var red = await host.Admin().GetFromJsonAsync<JsonElement>("/mgmt/load/preflight?scenario=tracker&target=svc-a");
         Assert.False(red.GetProperty("ok").GetBoolean());
+    }
+
+    // ---------- audit ----------
+
+    [Fact]
+    public async Task Audit_ListsTheOrphanGuardRow_NewestFirst_WithTheLimit()
+    {
+        var clock = new TestClock();
+        await using var host = await ReadyHostAsync(clock);
+        using (var scope = host.Services.CreateScope())
+        {
+            var audit = scope.ServiceProvider.GetRequiredService<IResourceAuditStore>();
+            await audit.AddAsync(new ResourceAudit
+            {
+                At = Now.AddDays(-1),
+                Actor = "alice-admin",
+                Resource = "fleet",
+                Action = "size",
+                Before = "min 2, desired 2, max 2",
+                After = "min 3, desired 3, max 3",
+            });
+
+            // The row the orphan guard writes, written the way the scheduler writes it.
+            clock.At = Now;
+            await LoadAudit.RecordAsync(audit, host.Events, clock, LoadSchedulerService.Actor,
+                LoadSchedulerService.GeneratorsResource, LoadSchedulerService.OrphanGuardAction,
+                "desired 1, in service 1", "desired 0",
+                new { group = LoadTestHost.GeneratorGroup, reason = "no load run is non-terminal" }, CancellationToken.None);
+        }
+
+        var rows = await host.Admin().GetFromJsonAsync<JsonElement>("/mgmt/load/audit");
+
+        Assert.Equal(2, rows.GetArrayLength());
+        var guard = rows[0];
+        Assert.Equal(("gateway", "generators", "orphan_guard"), (
+            guard.GetProperty("actor").GetString(),
+            guard.GetProperty("resource").GetString(),
+            guard.GetProperty("action").GetString()));
+        Assert.Equal(("desired 1, in service 1", "desired 0"), (guard.GetProperty("before").GetString(), guard.GetProperty("after").GetString()));
+        Assert.Equal(Now, guard.GetProperty("at").GetDateTimeOffset());
+        Assert.True(guard.GetProperty("id").GetInt64() > rows[1].GetProperty("id").GetInt64());
+        Assert.Equal(LoadTestHost.GeneratorGroup, guard.GetProperty("detail").GetProperty("group").GetString());
+        Assert.Equal("fleet", rows[1].GetProperty("resource").GetString());
+
+        var one = await host.Admin().GetFromJsonAsync<JsonElement>("/mgmt/load/audit?limit=1");
+        Assert.Equal("orphan_guard", Assert.Single(one.EnumerateArray()).GetProperty("action").GetString());
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(501)]
+    public async Task Audit_400_OnALimitOutOfRange(int limit)
+    {
+        await using var host = new LoadTestHost();
+
+        var response = await host.Admin().GetAsync($"/mgmt/load/audit?limit={limit}");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("limit", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("field").GetString());
     }
 
     // ---------- run reads ----------

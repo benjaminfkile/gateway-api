@@ -4,7 +4,6 @@ using Gateway.Api.Data;
 using Gateway.Api.Load;
 using Gateway.Api.Management;
 using Gateway.Api.RealTime;
-using Gateway.Api.Resources;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,8 +13,8 @@ namespace Gateway.Api.Tests;
 
 /// <summary>
 /// A <see cref="ManagementApiFactory"/> for the load endpoints: a
-/// <see cref="FakeLoadStore"/>, <see cref="FakeFleetScaler"/> and
-/// <see cref="FakeDatabaseHeadroom"/> in place of the real seams, a
+/// <see cref="FakeLoadStore"/> and <see cref="FakeGeneratorGroupScaler"/> in place of
+/// the real seams, a
 /// <see cref="FakeLoadMetrics"/>, a recording publisher
 /// (so <c>ops:load</c> events can be asserted), fixed <see cref="LoadOptions"/>, a
 /// generous run-token rate limiter unless a test passes its own, and an optional fixed
@@ -41,7 +40,7 @@ public sealed class LoadTestHost : IAsyncDisposable
     {
         Options = new LoadOptions { GeneratorGroup = GeneratorGroup };
         configure?.Invoke(Options);
-        Scaler.Groups[GeneratorGroup] = new FleetGroupSize(Min: 0, Desired: 0, Max: 2, InService: 0);
+        Scaler.Groups[GeneratorGroup] = new GeneratorGroupSize(Desired: 0, Max: 2, InService: 0);
 
         _app = Factory.WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
         {
@@ -51,11 +50,8 @@ public sealed class LoadTestHost : IAsyncDisposable
             services.RemoveAll<ILoadStore>();
             services.AddSingleton<ILoadStore>(Store);
 
-            services.RemoveAll<IFleetScaler>();
-            services.AddSingleton<IFleetScaler>(Scaler);
-
-            services.RemoveAll<IDatabaseHeadroom>();
-            services.AddSingleton<IDatabaseHeadroom>(Headroom);
+            services.RemoveAll<IGeneratorGroupScaler>();
+            services.AddSingleton<IGeneratorGroupScaler>(Scaler);
 
             services.RemoveAll<ILoadMetrics>();
             services.AddSingleton<ILoadMetrics>(Metrics);
@@ -79,13 +75,14 @@ public sealed class LoadTestHost : IAsyncDisposable
 
     public FakeLoadStore Store { get; } = new();
 
-    public FakeFleetScaler Scaler { get; } = new();
-
-    public FakeDatabaseHeadroom Headroom { get; } = new();
+    public FakeGeneratorGroupScaler Scaler { get; } = new();
 
     public FakeLoadMetrics Metrics { get; } = new();
 
     public LoadOptions Options { get; }
+
+    /// <summary>The host's services, for seeding through the real scoped stores.</summary>
+    public IServiceProvider Services => _app.Services;
 
     /// <summary>A client carrying <paramref name="token"/>, or anonymous when null.</summary>
     public HttpClient Client(string? token)
@@ -220,7 +217,6 @@ public sealed class LoadTestHost : IAsyncDisposable
         RampSeconds = 60,
         HoldSeconds = 120,
         Params = "{\"channel\":\"tracker\"}",
-        RestoreFleet = true,
         HardStopAt = DateTimeOffset.UnixEpoch.AddHours(1),
         TokenHash = LoadEndpoints.TokenHash(token),
         QueuedAt = DateTimeOffset.UnixEpoch,

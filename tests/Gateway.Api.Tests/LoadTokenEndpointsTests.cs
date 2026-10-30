@@ -206,7 +206,7 @@ public class LoadTokenEndpointsTests
 
     [Theory]
     [InlineData(LoadRunStatus.Queued)]
-    [InlineData(LoadRunStatus.FleetUp)]
+    [InlineData(LoadRunStatus.Holding)]
     [InlineData(LoadRunStatus.Ramping)]
     [InlineData(LoadRunStatus.Draining)]
     [InlineData(LoadRunStatus.Succeeded)]

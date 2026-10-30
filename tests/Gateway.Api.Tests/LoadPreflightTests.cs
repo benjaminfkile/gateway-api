@@ -2,8 +2,6 @@ using Gateway.Api.Data;
 using Gateway.Api.Load;
 using Gateway.Api.Manifest;
 using Gateway.Api.Reconcile;
-using Gateway.Api.Resources;
-using Microsoft.Extensions.Configuration;
 
 namespace Gateway.Api.Tests;
 
@@ -47,11 +45,10 @@ public class LoadPreflightTests
     private static LoadPreflightRequest Request(
         int generators = 2,
         int vus = 100,
-        int? fleet = null,
         bool validation = false,
         string target = LoadTestHost.Target,
         string? confirm = LoadTestHost.Target) =>
-        new("tracker", target, confirm, generators, vus, fleet, validation);
+        new("tracker", target, confirm, generators, vus, validation);
 
     private static ServiceManifest Service(bool? presence = null) => new()
     {
@@ -63,18 +60,10 @@ public class LoadPreflightTests
         UpdatedBy = "seed",
     };
 
-    private static ResourcesOptions Config(params (string Key, string Value)[] pairs) =>
-        ResourcesOptions.FromConfiguration(new ConfigurationBuilder()
-            .AddInMemoryCollection(pairs.ToDictionary(p => p.Key, p => (string?)p.Value))
-            .Build());
-
-    private static FleetGroupResolver Groups(params (string Key, string Value)[] pairs) =>
-        new(Config(pairs), new FakeFleetGroupSource(), new FixedClock());
-
-    private static FakeFleetScaler Scaler(FleetGroupSize? generators = null)
+    private static FakeGeneratorGroupScaler Scaler(GeneratorGroupSize? generators = null)
     {
-        var scaler = new FakeFleetScaler();
-        scaler.Groups[Group] = generators ?? new FleetGroupSize(0, 0, 2, 0);
+        var scaler = new FakeGeneratorGroupScaler();
+        scaler.Groups[Group] = generators ?? new GeneratorGroupSize(Desired: 0, Max: 2, InService: 0);
         return scaler;
     }
 
@@ -90,13 +79,13 @@ public class LoadPreflightTests
     }
 
     [Theory]
-    [InlineData(0, 1, 2, 0, 1, "desired 1")]
-    [InlineData(0, 0, 2, 1, 1, "1 in service")]
-    [InlineData(0, 0, 1, 0, 2, "max is 1")]
+    [InlineData(1, 2, 0, 1, "desired 1")]
+    [InlineData(0, 2, 1, 1, "1 in service")]
+    [InlineData(0, 1, 0, 2, "max is 1")]
     public async Task GeneratorGroup_Red_WhenAPreviousRunLeftInstances_OrTheGroupIsTooSmall(
-        int min, int desired, int max, int inService, int generators, string says)
+        int desired, int max, int inService, int generators, string says)
     {
-        var check = new GeneratorGroupCheck(Scaler(new FleetGroupSize(min, desired, max, inService)));
+        var check = new GeneratorGroupCheck(Scaler(new GeneratorGroupSize(desired, max, inService)));
 
         var result = await check.EvaluateAsync(Context(Request(generators: generators)));
 
@@ -108,7 +97,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task GeneratorGroup_AValidationRunCountsAsOneGenerator()
     {
-        var check = new GeneratorGroupCheck(Scaler(new FleetGroupSize(0, 0, 1, 0)));
+        var check = new GeneratorGroupCheck(Scaler(new GeneratorGroupSize(Desired: 0, Max: 1, InService: 0)));
 
         var result = await check.EvaluateAsync(Context(Request(generators: 2, validation: true)));
 
@@ -122,13 +111,13 @@ public class LoadPreflightTests
         Assert.Equal(PreflightStatus.Red, unset.Status);
         Assert.Contains("Load:GeneratorGroup", unset.Message);
 
-        var missing = await new GeneratorGroupCheck(new FakeFleetScaler()).EvaluateAsync(Context());
+        var missing = await new GeneratorGroupCheck(new FakeGeneratorGroupScaler()).EvaluateAsync(Context());
         Assert.Equal(PreflightStatus.Red, missing.Status);
         Assert.Contains("does not exist", missing.Message);
 
-        var nullScaler = await new GeneratorGroupCheck(new NullFleetScaler()).EvaluateAsync(Context());
+        var nullScaler = await new GeneratorGroupCheck(new NullGeneratorGroupScaler()).EvaluateAsync(Context());
         Assert.Equal(PreflightStatus.Red, nullScaler.Status);
-        Assert.Contains(NullFleetScaler.NotConfiguredMessage, nullScaler.Message);
+        Assert.Contains(NullGeneratorGroupScaler.NotConfiguredMessage, nullScaler.Message);
     }
 
     // ---------- fleet_healthy ----------
@@ -136,7 +125,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetHealthy_Green_WhenEveryInstanceHeartbeatsAndRunsTheTarget()
     {
-        var check = new FleetHealthyCheck(new FakeFleetScaler(), Groups());
+        var check = new FleetHealthyCheck();
 
         var result = await check.EvaluateAsync(Context(fresh: new[]
         {
@@ -151,7 +140,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetHealthy_Red_NamesTheStaleInstance()
     {
-        var check = new FleetHealthyCheck(new FakeFleetScaler(), Groups());
+        var check = new FleetHealthyCheck();
 
         var result = await check.EvaluateAsync(Context(stale: new[] { LoadTestHost.Instance("i-0stale", Now.AddMinutes(-5)) }));
 
@@ -162,7 +151,7 @@ public class LoadPreflightTests
     [Fact]
     public async Task FleetHealthy_Red_WhenTheTargetIsNotRunningOnAnInstance_OrNoInstanceHeartbeats()
     {
-        var check = new FleetHealthyCheck(new FakeFleetScaler(), Groups());
+        var check = new FleetHealthyCheck();
 
         var notRunning = await check.EvaluateAsync(Context(fresh: new[]
         {
@@ -176,23 +165,6 @@ public class LoadPreflightTests
 
         var empty = await check.EvaluateAsync(Context(fresh: Array.Empty<InstanceStatus>()));
         Assert.Equal(PreflightStatus.Red, empty.Status);
-    }
-
-    [Fact]
-    public async Task FleetHealthy_Red_WhenTheFleetGroupHasMoreInServiceThanHeartbeat()
-    {
-        var scaler = new FakeFleetScaler();
-        scaler.Groups["fleet-placeholder"] = new FleetGroupSize(2, 3, 4, 3);
-        var check = new FleetHealthyCheck(scaler, Groups((ResourcesOptions.FleetGroupKey, "fleet-placeholder")));
-
-        var result = await check.EvaluateAsync(Context());
-
-        Assert.Equal(PreflightStatus.Red, result.Status);
-        Assert.Contains("3 instances in service but 1 heartbeat", result.Message);
-
-        // With no scaler the heartbeats are the whole check.
-        var unreadable = new FleetHealthyCheck(new NullFleetScaler(), Groups((ResourcesOptions.FleetGroupKey, "fleet-placeholder")));
-        Assert.Equal(PreflightStatus.Green, (await unreadable.EvaluateAsync(Context())).Status);
     }
 
     // ---------- target_known, presence_off, target_confirmed ----------
@@ -264,87 +236,6 @@ public class LoadPreflightTests
         Assert.Equal(PreflightStatus.Green, validation.Status);
 
         Assert.Equal(PreflightStatus.Red, (await check.EvaluateAsync(Context())).Status);
-    }
-
-    // ---------- database_headroom ----------
-
-    [Theory]
-    // No fleet change: only the margin of 10 is needed; free 50.
-    [InlineData(100, 50, 2, null, PreflightStatus.Green)]
-    // No fleet change but free 5 against the margin of 10.
-    [InlineData(100, 95, 2, null, PreflightStatus.Red)]
-    // A requested fleet of 3 adds one node: 1 x 20 + 10 = 30 against free 25.
-    [InlineData(100, 75, 2, 3, PreflightStatus.Red)]
-    // The same request against free 30: exactly enough.
-    [InlineData(100, 70, 2, 3, PreflightStatus.Green)]
-    // A requested fleet smaller than the live one adds nothing.
-    [InlineData(100, 95, 2, 1, PreflightStatus.Red)]
-    // No instance heartbeats and no request: only the margin, free 30.
-    [InlineData(40, 10, 0, null, PreflightStatus.Green)]
-    public async Task DatabaseHeadroom_Arithmetic(int max, int inUse, int nodes, int? fleet, string status)
-    {
-        var headroom = new FakeDatabaseHeadroom { Connections = new DatabaseConnections(max, inUse) };
-        var fresh = Enumerable.Range(0, nodes).Select(i => LoadTestHost.Instance($"i-0{i}", Now)).ToList();
-
-        var result = await new DatabaseHeadroomCheck(headroom).EvaluateAsync(Context(Request(fleet: fleet), fresh: fresh));
-
-        Assert.Equal(status, result.Status);
-        Assert.Contains($"max_connections {max}, in use {inUse}, free {max - inUse}", result.Message);
-        Assert.Equal(status == PreflightStatus.Red, result.Fix?.Contains("database card") == true);
-    }
-
-    [Fact]
-    public async Task DatabaseHeadroom_UsesTheConfiguredPerNodeAndMargin_AmberWithoutADatabase()
-    {
-        var headroom = new FakeDatabaseHeadroom { Connections = new DatabaseConnections(100, 0) };
-        var options = new LoadOptions { GeneratorGroup = Group, DbConnectionsPerNode = 45, DbConnectionMargin = 11 };
-
-        var result = await new DatabaseHeadroomCheck(headroom).EvaluateAsync(Context(
-            Request(fleet: 4),
-            fresh: new[] { LoadTestHost.Instance("i-0a", Now), LoadTestHost.Instance("i-0b", Now) },
-            options: options));
-        Assert.Equal(PreflightStatus.Red, result.Status);
-        Assert.Contains("2 live nodes, 2 added x 45 + 11 needs 101", result.Message);
-
-        headroom.Connections = null;
-        Assert.Equal(PreflightStatus.Amber, (await new DatabaseHeadroomCheck(headroom).EvaluateAsync(Context())).Status);
-    }
-
-    // ---------- fleet_class ----------
-
-    [Theory]
-    [InlineData("t4g.small", PreflightStatus.Amber)]
-    [InlineData("t3a.medium", PreflightStatus.Amber)]
-    [InlineData("t2.micro", PreflightStatus.Amber)]
-    [InlineData("m7g.large", PreflightStatus.Green)]
-    [InlineData("c7g.xlarge", PreflightStatus.Green)]
-    public async Task FleetClass_AmberForABurstableFamily_NeverRed(string instanceType, string status)
-    {
-        var scaler = new FakeFleetScaler();
-        scaler.Templates["fleet-template-placeholder"] = new FleetLaunchTemplate("lt-placeholder", 4, instanceType);
-        var check = new FleetClassCheck(scaler, Config((ResourcesOptions.FleetTemplateKey, "fleet-template-placeholder")));
-
-        var result = await check.EvaluateAsync(Context());
-
-        Assert.Equal(status, result.Status);
-        Assert.Contains(instanceType, result.Message);
-    }
-
-    [Fact]
-    public async Task FleetClass_AmberUnknown_WithTheNullScaler_OrNoTemplate()
-    {
-        var configured = Config((ResourcesOptions.FleetTemplateKey, "fleet-template-placeholder"));
-
-        var nullScaler = await new FleetClassCheck(new NullFleetScaler(), configured).EvaluateAsync(Context());
-        Assert.Equal(PreflightStatus.Amber, nullScaler.Status);
-        Assert.StartsWith("Unknown", nullScaler.Message);
-
-        var unset = await new FleetClassCheck(new FakeFleetScaler(), Config()).EvaluateAsync(Context());
-        Assert.Equal(PreflightStatus.Amber, unset.Status);
-        Assert.StartsWith("Unknown", unset.Message);
-
-        var missing = await new FleetClassCheck(new FakeFleetScaler(), configured).EvaluateAsync(Context());
-        Assert.Equal(PreflightStatus.Amber, missing.Status);
     }
 
     // ---------- the orchestrator ----------

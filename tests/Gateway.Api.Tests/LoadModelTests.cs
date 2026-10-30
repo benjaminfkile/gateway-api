@@ -1,6 +1,5 @@
 using Gateway.Api.Data;
 using Gateway.Api.Load;
-using Gateway.Api.Resources;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -14,8 +13,8 @@ namespace Gateway.Api.Tests;
 /// <summary>
 /// The load data model and its wiring (docs/load.md sections 2 and 12): the AddLoad
 /// migration and model snapshot agree with the DbContext, the migration applies and
-/// the tables are usable, the options bind with their defaults, the null fleet scaler
-/// refuses everything, and the host registers the part 1 seams.
+/// the tables are usable, the options bind with their defaults, the null generator
+/// group scaler refuses everything, and the host registers the load seams.
 /// </summary>
 public class LoadModelTests
 {
@@ -51,6 +50,19 @@ public class LoadModelTests
     }
 
     [Fact]
+    public void RemoveLoadFleet_DropsTheThreeFleetColumns()
+    {
+        using var db = new GatewayDbContextFactory().CreateDbContext(Array.Empty<string>());
+        Assert.Contains(db.Database.GetMigrations(), m => m.EndsWith("_RemoveLoadFleet", StringComparison.Ordinal));
+
+        var run = db.GetService<IMigrationsAssembly>().ModelSnapshot!.Model.FindEntityType(typeof(LoadRun).FullName!)!;
+        var columns = run.GetProperties().Select(p => p.GetColumnName()).ToList();
+        Assert.DoesNotContain("fleet_size_requested", columns);
+        Assert.DoesNotContain("fleet_size_before", columns);
+        Assert.DoesNotContain("restore_fleet", columns);
+    }
+
+    [Fact]
     public void Migration_Applies_OnSqlite_AndTheLoadTablesAreUsable()
     {
         using var connection = new SqliteConnection("DataSource=:memory:");
@@ -79,7 +91,10 @@ public class LoadModelTests
     [Fact]
     public void LoadRunStatus_TerminalAndNonTerminal_PartitionEveryStatus()
     {
-        Assert.Equal(11, LoadRunStatus.Terminal.Length + LoadRunStatus.NonTerminal.Length);
+        Assert.Equal(10, LoadRunStatus.Terminal.Length + LoadRunStatus.NonTerminal.Length);
+        Assert.Equal(
+            new[] { "queued", "generators_up", "ramping", "holding", "draining" },
+            LoadRunStatus.NonTerminal);
         Assert.All(LoadRunStatus.Terminal, s => Assert.True(LoadRunStatus.IsTerminal(s)));
         Assert.All(LoadRunStatus.NonTerminal, s => Assert.False(LoadRunStatus.IsTerminal(s)));
         Assert.Empty(LoadRunStatus.Terminal.Intersect(LoadRunStatus.NonTerminal));
@@ -97,9 +112,6 @@ public class LoadModelTests
         Assert.Equal(TimeSpan.FromMinutes(5), options.CheckInTimeout);
         Assert.Equal(TimeSpan.FromMinutes(1), options.StatsStaleAfter);
         Assert.Equal(300, options.ValidationHoldSeconds);
-        Assert.Equal(20, options.DbConnectionsPerNode);
-        Assert.Equal(10, options.DbConnectionMargin);
-        Assert.Equal(25, options.DbDowngradeMarginPercent);
         Assert.Equal(TimeSpan.FromSeconds(10), options.FleetSampleInterval);
         Assert.Equal("gateway-job-runner", options.DefaultImage);
         Assert.Equal("latest", options.DefaultTag);
@@ -116,9 +128,6 @@ public class LoadModelTests
             ["Load:CheckInTimeout"] = "00:02:00",
             ["Load:StatsStaleAfter"] = "00:00:30",
             ["Load:ValidationHoldSeconds"] = "120",
-            ["Load:DbConnectionsPerNode"] = "30",
-            ["Load:DbConnectionMargin"] = "5",
-            ["Load:DbDowngradeMarginPercent"] = "40",
             ["Load:FleetSampleInterval"] = "00:00:20",
             ["Jobs:DefaultImage"] = "registry.example.com/runner",
             ["Jobs:DefaultTag"] = "v3",
@@ -131,9 +140,6 @@ public class LoadModelTests
         Assert.Equal(TimeSpan.FromMinutes(2), options.CheckInTimeout);
         Assert.Equal(TimeSpan.FromSeconds(30), options.StatsStaleAfter);
         Assert.Equal(120, options.ValidationHoldSeconds);
-        Assert.Equal(30, options.DbConnectionsPerNode);
-        Assert.Equal(5, options.DbConnectionMargin);
-        Assert.Equal(40, options.DbDowngradeMarginPercent);
         Assert.Equal(TimeSpan.FromSeconds(20), options.FleetSampleInterval);
         Assert.Equal("registry.example.com/runner", options.DefaultImage);
         Assert.Equal("v3", options.DefaultTag);
@@ -148,39 +154,20 @@ public class LoadModelTests
     }
 
     [Fact]
-    public async Task NullFleetScaler_RefusesEveryCall()
+    public async Task NullGeneratorGroupScaler_RefusesEveryCall()
     {
-        var scaler = new NullFleetScaler();
+        var scaler = new NullGeneratorGroupScaler();
         var calls = new Func<Task>[]
         {
-            () => scaler.DescribeGroupAsync("g"),
-            () => scaler.SetGroupSizeAsync("g", 0, 0, 0),
+            () => scaler.DescribeAsync("g"),
             () => scaler.SetDesiredAsync("g", 0),
-            () => scaler.DescribeLaunchTemplateAsync("t"),
-            () => scaler.DescribeLaunchTemplateVersionAsync("t", 2),
-            () => scaler.CreateLaunchTemplateVersionAsync("t", "m7g.large"),
-            () => scaler.SetDefaultLaunchTemplateVersionAsync("t", 2),
-            () => scaler.StartInstanceRefreshAsync("g", new FleetRefreshPreferences(100, 150, 300)),
-            () => scaler.CancelInstanceRefreshAsync("g"),
-            () => scaler.DescribeInstanceRefreshesAsync("g"),
         };
 
         foreach (var call in calls)
         {
             var ex = await Assert.ThrowsAsync<NotSupportedException>(call);
-            Assert.Equal(NullFleetScaler.NotConfiguredMessage, ex.Message);
+            Assert.Equal(NullGeneratorGroupScaler.NotConfiguredMessage, ex.Message);
         }
-    }
-
-    [Fact]
-    public async Task EfDatabaseHeadroom_AnswersNull_OffPostgres()
-    {
-        using var connection = new SqliteConnection("DataSource=:memory:");
-        connection.Open();
-        using var db = new GatewayDbContext(new DbContextOptionsBuilder<GatewayDbContext>().UseSqlite(connection).Options);
-
-        Assert.Null(await new EfDatabaseHeadroom(db).GetAsync());
-        Assert.Null(await new NullDatabaseHeadroom().GetAsync());
     }
 
     [Fact]
@@ -189,13 +176,13 @@ public class LoadModelTests
         await using var factory = new ManagementApiFactory();
         using var scope = factory.Services.CreateScope();
 
-        Assert.IsType<NullFleetScaler>(scope.ServiceProvider.GetRequiredService<IFleetScaler>());
+        Assert.IsType<NullGeneratorGroupScaler>(scope.ServiceProvider.GetRequiredService<IGeneratorGroupScaler>());
         Assert.IsType<LoadPreflight>(scope.ServiceProvider.GetRequiredService<ILoadPreflight>());
         Assert.Equal(
             new[]
             {
                 "generator_group", "fleet_healthy", "target_known", "scenario_validated",
-                "presence_off", "database_headroom", "fleet_class", "target_confirmed",
+                "presence_off", "target_confirmed",
             },
             scope.ServiceProvider.GetServices<ILoadPreflightCheck>().Select(c => c.Name));
     }

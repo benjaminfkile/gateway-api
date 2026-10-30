@@ -4,7 +4,6 @@ using Gateway.Api.Data;
 using Gateway.Api.Instances;
 using Gateway.Api.Management;
 using Gateway.Api.Manifest;
-using Gateway.Api.Resources;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -33,7 +32,6 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
 
     public FakeImageRegistry ImageRegistry { get; } = new();
     public FakeLogStore LogStore { get; } = new();
-    public FakeFleetGroupSource FleetGroupSource { get; } = new();
 
     public ManagementApiFactory()
     {
@@ -86,10 +84,6 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
 
             services.RemoveAll<IResourceAuditStore>();
             services.AddScoped<IResourceAuditStore, EfResourceAuditStore>();
-
-            // Never reach the instance metadata service for the fleet group tag.
-            services.RemoveAll<IFleetGroupSource>();
-            services.AddSingleton<IFleetGroupSource>(FleetGroupSource);
 
             services.RemoveAll<IImageRegistry>();
             services.AddSingleton<IImageRegistry>(ImageRegistry);

@@ -33,18 +33,6 @@ public sealed class LoadOptions
     /// <summary>Hold of a validation run in seconds (<c>Load:ValidationHoldSeconds</c>, default 300).</summary>
     public int ValidationHoldSeconds { get; set; } = 300;
 
-    /// <summary>Per-node database connections the headroom check assumes (<c>Load:DbConnectionsPerNode</c>, default 20).</summary>
-    public int DbConnectionsPerNode { get; set; } = 20;
-
-    /// <summary>Spare connections the headroom check requires (<c>Load:DbConnectionMargin</c>, default 10).</summary>
-    public int DbConnectionMargin { get; set; } = 10;
-
-    /// <summary>
-    /// Resources: a smaller database class must exceed connections in use by this
-    /// percentage (<c>Load:DbDowngradeMarginPercent</c>, default 25).
-    /// </summary>
-    public int DbDowngradeMarginPercent { get; set; } = 25;
-
     /// <summary>How often the leader writes a fleet sample (<c>Load:FleetSampleInterval</c>, default 10 s).</summary>
     public TimeSpan FleetSampleInterval { get; set; } = TimeSpan.FromSeconds(10);
 
