@@ -49,6 +49,10 @@ public sealed class ReconcilerService : BackgroundService
     // reconciliation; on the leader the Redis backplane fans them out fleet-wide.
     private readonly IChannelEventPublisher? _publisher;
 
+    // Node stats carried on every heartbeat (cpu, memory, disk, hub connections;
+    // docs/load.md section 4). Null-object when not supplied, so every value is null.
+    private readonly INodeStats _nodeStats;
+
     // Service log groups whose 30-day retention has already been ensured this
     // process, so PutRetentionPolicy is issued at most once per group (tech-spec §9).
     private readonly HashSet<string> _retentionEnsured = new(StringComparer.Ordinal);
@@ -108,7 +112,8 @@ public sealed class ReconcilerService : BackgroundService
         ReconcilerOptions options,
         ILogger<ReconcilerService> logger,
         MigrationReadinessGate? migrationGate = null,
-        IChannelEventPublisher? publisher = null)
+        IChannelEventPublisher? publisher = null,
+        INodeStats? nodeStats = null)
     {
         _runtime = runtime;
         _proxyState = proxyState;
@@ -124,6 +129,7 @@ public sealed class ReconcilerService : BackgroundService
         _logger = logger;
         _migrationGate = migrationGate;
         _publisher = publisher;
+        _nodeStats = nodeStats ?? new NullNodeStats();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -316,7 +322,7 @@ public sealed class ReconcilerService : BackgroundService
 
     /// <summary>
     /// Upsert this instance's <c>instance_status</c> row (ips, gateway version,
-    /// leader flag, per-service inventory, heartbeat=now). When this instance is the
+    /// leader flag, per-service inventory, node stats, heartbeat=now). When this instance is the
     /// leader, also prune rows whose heartbeat has gone stale — the only fleet-wide
     /// duty in this task (tech-spec §4.3, §4.4).
     /// </summary>
@@ -326,6 +332,7 @@ public sealed class ReconcilerService : BackgroundService
         {
             var identity = await _metadata.GetAsync(ct);
             var containers = await _runtime.ListManagedContainersAsync(ct);
+            var stats = _nodeStats.Read();
 
             var status = new InstanceStatus
             {
@@ -335,6 +342,10 @@ public sealed class ReconcilerService : BackgroundService
                 GatewayVer = GatewayVersion.Current,
                 IsLeader = isLeader,
                 Services = InstanceServicesJson.Build(containers, SnapshotErrors(), SnapshotDegraded()),
+                Cpu = stats.Cpu,
+                Memory = stats.Memory,
+                Disk = stats.Disk,
+                HubConnections = stats.HubConnections,
                 HeartbeatAt = DateTimeOffset.UtcNow,
             };
 

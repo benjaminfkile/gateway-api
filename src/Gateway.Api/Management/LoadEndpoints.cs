@@ -120,6 +120,7 @@ public static partial class LoadEndpoints
         load.MapGet("/runs/{id:long}/stats", GetStatsAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
         load.MapGet("/runs/{id:long}/stats.csv", GetStatsCsvAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
         load.MapGet("/audit", GetAuditAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
+        load.MapGet("/generators", GetGeneratorsAsync).RequireAuthorization(ManagementAuth.OpsDeployPolicy);
 
         load.MapGet("/runs/{id:long}/log", GetRunLogAsync).RequireAuthorization(ManagementAuth.OpsAdminPolicy);
 
@@ -383,6 +384,46 @@ public static partial class LoadEndpoints
             ok = checks.All(c => c.Status != PreflightStatus.Red),
             checks = checks.Select(CheckView).ToList(),
         });
+    }
+
+    // ---------- generators (OpsDeploy) ----------
+
+    /// <summary>
+    /// The generator group's sizes for the dashboard banner (docs/load.md section 8):
+    /// <c>{ group, desired, inService, max }</c> read through the generator group
+    /// scaler. <c>503 load_unconfigured</c> when <c>Load:GeneratorGroup</c> is unset,
+    /// <c>404 generator_group_not_found</c> when no such group exists and
+    /// <c>502 generator_group_unreadable</c> when the read fails.
+    /// </summary>
+    private static async Task<IResult> GetGeneratorsAsync(
+        LoadOptions options,
+        IGeneratorGroupScaler scaler,
+        ILoggerFactory loggers,
+        CancellationToken ct)
+    {
+        if (!options.IsConfigured)
+        {
+            return Results.Json(new { error = "load_unconfigured" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        var group = options.GeneratorGroup!;
+        GeneratorGroupSize? size;
+        try
+        {
+            size = await scaler.DescribeAsync(group, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            loggers.CreateLogger(typeof(LoadEndpoints)).LogWarning(ex, "Reading generator group {Group} failed.", group);
+            return Results.Json(new { error = "generator_group_unreadable" }, statusCode: StatusCodes.Status502BadGateway);
+        }
+
+        if (size is null)
+        {
+            return Results.NotFound(new { error = "generator_group_not_found" });
+        }
+
+        return Results.Json(new { group, desired = size.Desired, inService = size.InService, max = size.Max });
     }
 
     // ---------- audit (OpsDeploy) ----------

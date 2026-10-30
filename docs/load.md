@@ -294,8 +294,19 @@ Built as: every `Load:FleetSampleInterval` while the run is non-terminal, one ro
 with source `fleet`, index null and body
 `{ at, instances: [{ instanceId, leader, heartbeatAt, gatewayVersion, runningServices, cpu, memory, disk, hubConnections }], channelMembers }`,
 then `fleet` on `ops:load`. `instances` lists the rows with a heartbeat within the
-stale threshold, by id. The heartbeat row carries no cpu, memory, disk or hub
-connection figures yet, so those four are null. `channelMembers` is the presence
+stale threshold, by id. `cpu`, `memory`, `disk` and `hubConnections` are the values
+the instance wrote on its last heartbeat row (`instance_status` columns `cpu`,
+`memory`, `disk`, `hub_connections`). Each gateway measures itself in process every
+reconcile loop, with no agent and no AWS call, behind `INodeStats`: `cpu` is the
+whole-box busy percent since the previous heartbeat from the aggregate `cpu` line of
+`/proc/stat` (idle is idle plus iowait; the first heartbeat after a start has none),
+`memory` is used of total from `/proc/meminfo` with used being `MemTotal` minus
+`MemAvailable`, `disk` is the root filesystem's used percent (total minus
+available) from `DriveInfo`, and `hubConnections` is the number of hub connections
+the instance holds, from the hub's own registry. Percents have one decimal. A read
+that fails leaves that value null and logs a warning once; off Linux every value
+is null. Memory runs out first on a small node, so it is the one to watch.
+`channelMembers` is the presence
 count of the channel named by the run's `params.channel` itself, null when the
 params name none.
 
@@ -409,6 +420,7 @@ two generator endpoints, which take the run token.
 | `POST /mgmt/load/runs/{id}/checkin` | run token | Section 5. |
 | `POST /mgmt/load/runs/{id}/stats` | run token | Section 4. Rejected with `401` on a bad token, `409` when the run is terminal (the reporter treats `409` as `stop`). Body at most 64 KiB. |
 | `GET /mgmt/load/runs/{id}/log?index=&tail=500` | OpsAdmin | Lines from group `/gateway/load`, stream `run-{id}-{index}`. |
+| `GET /mgmt/load/generators` | OpsDeploy | The generator group for the dashboard banner: `{ group, desired, inService, max }` read through the generator group scaler. `503 load_unconfigured` when `Load:GeneratorGroup` is unset, `404 generator_group_not_found` when no such group exists, `502 generator_group_unreadable` when the read fails. |
 | `GET /mgmt/load/audit?limit=50` | OpsDeploy | The `resource_audit` rows (section 2), newest first: `[{ id, at, actor, resource, action, before, after, detail }]` with `detail` as a JSON object. `limit` is 1..500, else `400 { error, field: "limit" }`. |
 
 **OpsLoad policy**: `ops-admin`, or a client-credentials token carrying scope

@@ -98,10 +98,13 @@ public sealed class GatewayHub : Hub
     /// <summary>
     /// Log every accepted connection with its id and authenticated user (or
     /// <c>anonymous</c>) at Information — no metrics infra, just a trail for
-    /// correlating dashboard reconnects and the token-expiry closes.
+    /// correlating dashboard reconnects and the token-expiry closes. The connection is
+    /// also counted in the membership registry, the heartbeat's hub connection count.
     /// </summary>
     public override async Task OnConnectedAsync()
     {
+        _membership.Connect(Context.ConnectionId);
+
         _logger.LogInformation(
             "Hub connection {ConnectionId} established for {User}.",
             Context.ConnectionId,

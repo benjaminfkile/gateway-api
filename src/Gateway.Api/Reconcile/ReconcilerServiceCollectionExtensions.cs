@@ -136,6 +136,15 @@ public static class ReconcilerServiceCollectionExtensions
         // migrate, so default to an already-open gate and boot with zero DB traffic.
         services.TryAddSingleton(_ => MigrationReadinessGate.AlreadyReady());
 
+        // Node stats on the heartbeat (docs/load.md section 4): measured in process from
+        // /proc, the root filesystem and the hub's connection registry on Linux; all
+        // null elsewhere (a Windows dev box).
+        services.TryAddSingleton<INodeStats>(sp => OperatingSystem.IsLinux()
+            ? new LinuxNodeStats(
+                sp.GetService<Gateway.Api.RealTime.HubChannelMembership>(),
+                sp.GetService<ILogger<LinuxNodeStats>>())
+            : new NullNodeStats());
+
         services.AddHostedService<ReconcilerService>();
         return services;
     }

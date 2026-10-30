@@ -110,6 +110,14 @@ namespace Gateway.Api.Data.Migrations
                         .HasColumnType("text")
                         .HasColumnName("instance_id");
 
+                    b.Property<double?>("Cpu")
+                        .HasColumnType("double precision")
+                        .HasColumnName("cpu");
+
+                    b.Property<double?>("Disk")
+                        .HasColumnType("double precision")
+                        .HasColumnName("disk");
+
                     b.Property<string>("GatewayVer")
                         .HasColumnType("text")
                         .HasColumnName("gateway_ver");
@@ -118,9 +126,17 @@ namespace Gateway.Api.Data.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("heartbeat_at");
 
+                    b.Property<int?>("HubConnections")
+                        .HasColumnType("integer")
+                        .HasColumnName("hub_connections");
+
                     b.Property<bool>("IsLeader")
                         .HasColumnType("boolean")
                         .HasColumnName("is_leader");
+
+                    b.Property<double?>("Memory")
+                        .HasColumnType("double precision")
+                        .HasColumnName("memory");
 
                     b.Property<string>("PrivateIp")
                         .HasColumnType("text")

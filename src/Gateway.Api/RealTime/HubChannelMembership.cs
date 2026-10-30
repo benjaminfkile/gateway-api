@@ -45,6 +45,11 @@ public sealed class HubChannelMembership
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string?>> _byConnection =
         new(StringComparer.Ordinal);
 
+    // Open hub connections on this instance, whether or not they joined a channel:
+    // added on connect, removed on disconnect (Drop). Its size is the instance's hub
+    // connection count on the heartbeat (docs/load.md section 4).
+    private readonly ConcurrentDictionary<string, byte> _connections = new(StringComparer.Ordinal);
+
     // Recently-dropped connection ids -> tombstone expiry.
     private readonly ConcurrentDictionary<string, DateTimeOffset> _tombstones = new(StringComparer.Ordinal);
 
@@ -52,6 +57,18 @@ public sealed class HubChannelMembership
     {
         _clock = clock ?? TimeProvider.System;
         _tombstoneTtl = tombstoneTtl ?? DefaultTombstoneTtl;
+    }
+
+    /// <summary>The number of hub connections this instance holds right now.</summary>
+    public int ConnectionCount => _connections.Count;
+
+    /// <summary>Record an open connection (called from <c>GatewayHub.OnConnectedAsync</c>).</summary>
+    public void Connect(string connectionId)
+    {
+        if (!IsTombstoned(connectionId))
+        {
+            _connections.TryAdd(connectionId, 0);
+        }
     }
 
     /// <summary>
@@ -134,6 +151,7 @@ public sealed class HubChannelMembership
         // Tombstone BEFORE removing so a join racing this disconnect observes it.
         _tombstones[connectionId] = _clock.GetUtcNow() + _tombstoneTtl;
         _byConnection.TryRemove(connectionId, out _);
+        _connections.TryRemove(connectionId, out _);
 
         // Amortized tombstone cleanup — connection ids are never reused, so expired
         // tombstones are pure garbage.

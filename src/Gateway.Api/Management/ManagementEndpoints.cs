@@ -157,6 +157,12 @@ public static partial class ManagementEndpoints
             isLeader = r.IsLeader,
             heartbeatAt = r.HeartbeatAt,
             stale = r.HeartbeatAt < cutoff,
+            // Node stats measured at the heartbeat (docs/load.md section 4), each null
+            // when the instance could not read it or runs a gateway without them.
+            cpu = r.Cpu,
+            memory = r.Memory,
+            disk = r.Disk,
+            hubConnections = r.HubConnections,
             services = InstanceServicesJson.Parse(r.Services).Select(s => new
             {
                 name = s.Name,

@@ -11,6 +11,24 @@ namespace Gateway.Api.Tests;
 public class HubChannelMembershipTests
 {
     [Fact]
+    public void ConnectionCount_CountsOpenConnections_JoinedOrNot_AndDropsOnDisconnect()
+    {
+        var m = new HubChannelMembership();
+        m.Connect("c1");
+        m.Connect("c2");
+        m.Connect("c2");
+        m.Join("c1", "app:feed", null);
+        Assert.Equal(2, m.ConnectionCount);
+
+        m.Drop("c1");
+        Assert.Equal(1, m.ConnectionCount);
+
+        // A connect resumed after its own disconnect does not resurrect the count.
+        m.Connect("c1");
+        Assert.Equal(1, m.ConnectionCount);
+    }
+
+    [Fact]
     public void Join_ThenTryGet_ReturnsIdentity()
     {
         var m = new HubChannelMembership();

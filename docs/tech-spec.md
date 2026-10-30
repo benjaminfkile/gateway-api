@@ -140,7 +140,9 @@ survive gateway restarts.
 - **Reconcile loop (every 30s ± jitter):** jitter prevents a large fleet from
   hitting the registry/DB in lockstep. Each loop the instance also **upserts
   its container inventory to `instance_status`** (heartbeat + per-service
-  digest/state) so any instance can answer fleet-wide queries. Compare running
+  digest/state + node stats: cpu, memory and disk percent and the hub connection
+  count, measured in process behind `INodeStats`, docs/load.md section 4) so any
+  instance can answer fleet-wide queries. Compare running
   containers (name, image digest, env hash, desired status) against the
   manifest; converge differences:
   - `running` → not running: blue-green start (see §7).
@@ -239,6 +241,10 @@ instance_status (
   gateway_ver   text,
   is_leader     boolean,
   services      jsonb,                 -- [{name, digest, state, startedAt, restarts}]
+  cpu           double precision,      -- whole-box cpu percent since the previous heartbeat (null when unread)
+  memory        double precision,      -- memory used percent, MemTotal minus MemAvailable of MemTotal
+  disk          double precision,      -- root filesystem used percent
+  hub_connections integer,             -- hub connections this instance holds (docs/load.md section 4)
   heartbeat_at  timestamptz not null
 )
 -- per-instance rollout progress for a deploy ("17/20 converged")
@@ -363,7 +369,7 @@ balancer routes the dashboard's request to.
 | Endpoint | Action |
 |---|---|
 | `GET  /mgmt/services` | Manifest + fleet rollup per service ("running on 20/20, digest abc123 on 20/20") |
-| `GET  /mgmt/instances` | Fleet list from `instance_status` (heartbeats, versions, leader, per-instance services) |
+| `GET  /mgmt/instances` | Fleet list from `instance_status` (heartbeats, versions, leader, per-instance services, node stats `cpu`, `memory`, `disk`, `hubConnections`, each nullable) |
 | `POST /mgmt/services/{name}/stop` · `/start` | Set desired status — **all** instances converge |
 | `POST /mgmt/services/{name}/restart` | Stamp `restart_requested_at`=now → every instance rolling-recreates its container via blue-green (same digest/tag; old serves until green is ready), fleet-wide. A container started after the stamp already satisfies the request (no restart loop). A restart on a stopped service starts it |
 | `POST /mgmt/services/{name}/deploy` | `{tag}` → resolve digest once, update manifest → every instance blue-greens locally |
