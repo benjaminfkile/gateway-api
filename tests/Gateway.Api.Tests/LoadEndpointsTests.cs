@@ -447,6 +447,53 @@ public class LoadEndpointsTests
         Assert.False(red.GetProperty("ok").GetBoolean());
     }
 
+    // ---------- generators ----------
+
+    [Fact]
+    public async Task Generators_ReadsTheGroupThroughTheScaler()
+    {
+        await using var host = new LoadTestHost();
+        host.Scaler.Groups[LoadTestHost.GeneratorGroup] = new GeneratorGroupSize(Desired: 3, Max: 4, InService: 2);
+
+        var response = await host.Client(ManagementApiFactory.DeployToken()).GetAsync("/mgmt/load/generators");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(LoadTestHost.GeneratorGroup, body.GetProperty("group").GetString());
+        Assert.Equal(3, body.GetProperty("desired").GetInt32());
+        Assert.Equal(2, body.GetProperty("inService").GetInt32());
+        Assert.Equal(4, body.GetProperty("max").GetInt32());
+        Assert.Equal(new[] { $"describe-group {LoadTestHost.GeneratorGroup}" }, host.Scaler.CallLog);
+    }
+
+    [Fact]
+    public async Task Generators_503_LoadUnconfigured_WhenTheGeneratorGroupIsUnset()
+    {
+        await using var host = new LoadTestHost(configure: o => o.GeneratorGroup = null);
+
+        var response = await host.Admin().GetAsync("/mgmt/load/generators");
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal("load_unconfigured", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("error").GetString());
+        Assert.Empty(host.Scaler.CallLog);
+    }
+
+    [Fact]
+    public async Task Generators_404_WhenTheGroupDoesNotExist_502_WhenTheReadFails()
+    {
+        await using var host = new LoadTestHost();
+        host.Scaler.Groups.Clear();
+
+        var missing = await host.Admin().GetAsync("/mgmt/load/generators");
+        Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+        Assert.Equal("generator_group_not_found", (await missing.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("error").GetString());
+
+        host.Scaler.Failing.Add(LoadTestHost.GeneratorGroup);
+        var failing = await host.Admin().GetAsync("/mgmt/load/generators");
+        Assert.Equal(HttpStatusCode.BadGateway, failing.StatusCode);
+        Assert.Equal("generator_group_unreadable", (await failing.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("error").GetString());
+    }
+
     // ---------- audit ----------
 
     [Fact]

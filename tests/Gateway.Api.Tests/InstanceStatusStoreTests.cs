@@ -112,6 +112,49 @@ public class InstanceStatusStoreTests
     }
 
     [Fact]
+    public async Task Reconciler_Heartbeat_StoresNodeStats_EveryBeat_ViaSqlite()
+    {
+        var stats = new FakeNodeStats { Next = new NodeStatsSnapshot(Cpu: 12.5, Memory: 71.2, Disk: 40.0, HubConnections: 17) };
+        using var fixture = new SqliteReconcilerFixture(isLeader: true, stats);
+
+        await fixture.Service.RunOnceAsync();
+
+        using (var verify = fixture.NewVerificationContext())
+        {
+            var row = Assert.Single(verify.InstanceStatus.ToList());
+            Assert.Equal((12.5, 71.2, 40.0, 17), (row.Cpu, row.Memory, row.Disk, row.HubConnections));
+        }
+
+        // The next beat takes a fresh reading; a value that could not be read is null.
+        stats.Next = new NodeStatsSnapshot(Cpu: null, Memory: 80.0, Disk: 41.0, HubConnections: 3);
+        await fixture.Service.RunOnceAsync();
+
+        using (var verify = fixture.NewVerificationContext())
+        {
+            var row = Assert.Single(verify.InstanceStatus.ToList());
+            Assert.Null(row.Cpu);
+            Assert.Equal((80.0, 41.0, 3), (row.Memory, row.Disk, row.HubConnections));
+        }
+
+        Assert.Equal(2, stats.Reads);
+    }
+
+    [Fact]
+    public async Task Reconciler_Heartbeat_WithoutNodeStats_StoresNulls_ViaSqlite()
+    {
+        using var fixture = new SqliteReconcilerFixture(isLeader: false);
+
+        await fixture.Service.RunOnceAsync();
+
+        using var verify = fixture.NewVerificationContext();
+        var row = Assert.Single(verify.InstanceStatus.ToList());
+        Assert.Null(row.Cpu);
+        Assert.Null(row.Memory);
+        Assert.Null(row.Disk);
+        Assert.Null(row.HubConnections);
+    }
+
+    [Fact]
     public async Task Reconciler_Leader_PrunesStaleRow_ViaSqlite()
     {
         using var fixture = new SqliteReconcilerFixture(isLeader: true);
@@ -166,7 +209,7 @@ public class InstanceStatusStoreTests
         public InMemoryManifestStore Manifests { get; } = new();
         public ReconcilerService Service { get; }
 
-        public SqliteReconcilerFixture(bool isLeader)
+        public SqliteReconcilerFixture(bool isLeader, INodeStats? nodeStats = null)
         {
             _conn = new SqliteConnection("DataSource=:memory:");
             _conn.Open();
@@ -206,7 +249,8 @@ public class InstanceStatusStoreTests
                 new InMemoryLeaderElection(isLeader),
                 new LeadershipState(),
                 new ReconcilerOptions { Enabled = true },
-                NullLogger<ReconcilerService>.Instance);
+                NullLogger<ReconcilerService>.Instance,
+                nodeStats: nodeStats);
         }
 
         public void SeedRow(InstanceStatus row)

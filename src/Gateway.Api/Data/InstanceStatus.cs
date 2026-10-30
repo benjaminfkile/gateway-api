@@ -31,6 +31,21 @@ public class InstanceStatus
     /// </summary>
     public string? Services { get; set; }
 
+    /// <summary>
+    /// Whole-box cpu busy percent since the previous heartbeat, or null when unread
+    /// (the first beat after a start has none). From <c>INodeStats</c>.
+    /// </summary>
+    public double? Cpu { get; set; }
+
+    /// <summary>Memory used percent (total minus available, of total), or null when unread.</summary>
+    public double? Memory { get; set; }
+
+    /// <summary>Root filesystem used percent, or null when unread.</summary>
+    public double? Disk { get; set; }
+
+    /// <summary>Hub connections this instance held at the heartbeat, or null when unread.</summary>
+    public int? HubConnections { get; set; }
+
     /// <summary>Timestamp of the last heartbeat.</summary>
     public DateTimeOffset HeartbeatAt { get; set; }
 }

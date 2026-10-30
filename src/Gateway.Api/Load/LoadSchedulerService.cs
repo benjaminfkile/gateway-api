@@ -723,9 +723,9 @@ public sealed class LoadSchedulerService : BackgroundService
 
     /// <summary>
     /// One instance of a fleet sample, from what its heartbeat row carries: id, leader
-    /// flag, heartbeat time, gateway version and the count of running containers. The
-    /// heartbeat row has no cpu, memory, disk or hub connection figures, so those fields
-    /// are null.
+    /// flag, heartbeat time, gateway version, the count of running containers and the
+    /// node stats the instance measured at that heartbeat (cpu, memory and disk percent
+    /// and its hub connection count, each null when the instance could not read it).
     /// </summary>
     private static JsonObject InstanceSample(InstanceStatus row) => new()
     {
@@ -734,10 +734,10 @@ public sealed class LoadSchedulerService : BackgroundService
         ["heartbeatAt"] = row.HeartbeatAt,
         ["gatewayVersion"] = row.GatewayVer,
         ["runningServices"] = InstanceServicesJson.Parse(row.Services).Count(s => s.State == "running"),
-        ["cpu"] = null,
-        ["memory"] = null,
-        ["disk"] = null,
-        ["hubConnections"] = null,
+        ["cpu"] = row.Cpu,
+        ["memory"] = row.Memory,
+        ["disk"] = row.Disk,
+        ["hubConnections"] = row.HubConnections,
     };
 
     private async Task<int?> ChannelMembersAsync(LoadRun run, CancellationToken ct)

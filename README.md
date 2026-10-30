@@ -203,7 +203,7 @@ edits require `ops-admin`.
 | Endpoint | Action |
 |---|---|
 | `GET  /mgmt/services` | Manifest + per-service fleet rollup |
-| `GET  /mgmt/instances` | Fleet list from `instance_status` |
+| `GET  /mgmt/instances` | Fleet list from `instance_status`, with each instance's node stats from its last heartbeat: `cpu`, `memory` and `disk` percent and `hubConnections`, each null when unread |
 | `GET  /mgmt/deploys` · `GET /mgmt/deploys/{id}` | Deploy history + live per-instance rollout progress |
 | `GET  /mgmt/services/{name}/logs` | Centralized logs for a service/instance |
 | `POST /mgmt/services/{name}/stop` · `/start` | Set desired status (fleet converges) |
@@ -406,6 +406,7 @@ the spec secret) and `load_run_stat` (every stats line, indexed on `(run_id, at)
 | `POST /mgmt/load/runs/{id}/checkin` | run token | `{ instanceId }` to `200 { index, count, vus, rampSeconds, holdSeconds, scenario, target, script, params, statsUrl }`, `409 run_full` or `409 run_not_accepting` |
 | `POST /mgmt/load/runs/{id}/stats` | run token | A generator stats line: `200 { action: "continue" \| "stop" }`, `409 run_terminal` |
 | `GET /mgmt/load/runs/{id}/log?index=0&tail=500` | OpsAdmin | `[{ ts, message }]` from log group `/gateway/load`, stream `run-{id}-{index}` |
+| `GET /mgmt/load/generators` | OpsDeploy | `{ group, desired, inService, max }` of the generator group, read through the generator group scaler, for the dashboard banner. `503 load_unconfigured` when `Load:GeneratorGroup` is unset, `404 generator_group_not_found`, `502 generator_group_unreadable` |
 | `GET /mgmt/load/audit?limit=50` | OpsDeploy | `[{ id, at, actor, resource, action, before, after, detail }]` from `resource_audit`, newest first, `limit` 1..500 (`400 { error, field }` outside it): the orphan guard's rows, and the rows earlier releases wrote |
 
 **OpsLoad policy:** a member of `ops-admin`, or a client-credentials token

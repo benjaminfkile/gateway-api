@@ -91,6 +91,36 @@ public class ManagementServicesReadTests
     }
 
     [Fact]
+    public async Task GetInstances_CarriesNodeStats_NullWhenTheRowHasNone()
+    {
+        await using var factory = new ManagementApiFactory();
+        await factory.WithDbAsync(async db =>
+        {
+            var measured = ManagementTestData.Instance("i-measured", isLeader: true);
+            measured.Cpu = 37.5;
+            measured.Memory = 81.2;
+            measured.Disk = 44.0;
+            measured.HubConnections = 250;
+            db.InstanceStatus.Add(measured);
+            db.InstanceStatus.Add(ManagementTestData.Instance("i-unmeasured"));
+            await db.SaveChangesAsync();
+        });
+
+        var client = factory.CreateClient(ManagementApiFactory.AdminToken());
+        var body = await client.GetFromJsonAsync<JsonElement>("/mgmt/instances");
+
+        var rows = body.EnumerateArray().ToDictionary(r => r.GetProperty("instanceId").GetString()!);
+        Assert.Equal(37.5, rows["i-measured"].GetProperty("cpu").GetDouble());
+        Assert.Equal(81.2, rows["i-measured"].GetProperty("memory").GetDouble());
+        Assert.Equal(44.0, rows["i-measured"].GetProperty("disk").GetDouble());
+        Assert.Equal(250, rows["i-measured"].GetProperty("hubConnections").GetInt32());
+        foreach (var field in new[] { "cpu", "memory", "disk", "hubConnections" })
+        {
+            Assert.Equal(JsonValueKind.Null, rows["i-unmeasured"].GetProperty(field).ValueKind);
+        }
+    }
+
+    [Fact]
     public async Task GetServices_RollsUpErrors_CountAndLatest()
     {
         // task #553: the fleet rollup exposes errorOn (instances whose entry carries a

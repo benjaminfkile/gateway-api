@@ -82,6 +82,10 @@ public class GatewayDbContext : DbContext
             e.Property(x => x.GatewayVer).HasColumnName("gateway_ver");
             e.Property(x => x.IsLeader).HasColumnName("is_leader");
             e.Property(x => x.Services).HasColumnName("services").HasColumnType(jsonType);
+            e.Property(x => x.Cpu).HasColumnName("cpu");
+            e.Property(x => x.Memory).HasColumnName("memory");
+            e.Property(x => x.Disk).HasColumnName("disk");
+            e.Property(x => x.HubConnections).HasColumnName("hub_connections");
             e.Property(x => x.HeartbeatAt).HasColumnName("heartbeat_at");
         });
 

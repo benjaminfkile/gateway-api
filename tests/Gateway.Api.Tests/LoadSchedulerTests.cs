@@ -177,8 +177,9 @@ public class LoadSchedulerTests
         }
 
         /// <summary><paramref name="count"/> more fleet instances with a heartbeat now.</summary>
-        public void Heartbeat(int count = 1, DateTimeOffset? at = null)
+        public void Heartbeat(int count = 1, DateTimeOffset? at = null, NodeStatsSnapshot? stats = null)
         {
+            stats ??= NodeStatsSnapshot.Empty;
             for (var i = 0; i < count; i++)
             {
                 Status.Seed(new InstanceStatus
@@ -187,6 +188,10 @@ public class LoadSchedulerTests
                     IsLeader = _instances == 1,
                     HeartbeatAt = at ?? Clock.Now,
                     Services = "[{\"name\":\"svc-a\",\"digest\":null,\"state\":\"running\",\"startedAt\":null,\"restarts\":0}]",
+                    Cpu = stats.Cpu,
+                    Memory = stats.Memory,
+                    Disk = stats.Disk,
+                    HubConnections = stats.HubConnections,
                 });
             }
         }
@@ -697,7 +702,8 @@ public class LoadSchedulerTests
     public async Task FleetSamples_AreWrittenEveryInterval_FromFreshHeartbeats_WithTheChannelCount_AndPublished()
     {
         var h = new Harness();
-        h.Heartbeat(2);
+        h.Heartbeat(stats: new NodeStatsSnapshot(Cpu: 41.5, Memory: 72.3, Disk: 30.0, HubConnections: 120));
+        h.Heartbeat();
         h.Heartbeat(1, at: T0 - TimeSpan.FromMinutes(10));
         h.Presence.Counts["tracker:location"] = 42;
         var run = h.Queue(ramp: 600, runParams: "{\"channel\":\"tracker:location\"}");
@@ -717,9 +723,14 @@ public class LoadSchedulerTests
         Assert.True(instances[0].GetProperty("leader").GetBoolean());
         Assert.False(instances[1].GetProperty("leader").GetBoolean());
         Assert.Equal(1, instances[0].GetProperty("runningServices").GetInt32());
+        // The node stats come from each heartbeat row; a row without them reads null.
+        Assert.Equal(41.5, instances[0].GetProperty("cpu").GetDouble());
+        Assert.Equal(72.3, instances[0].GetProperty("memory").GetDouble());
+        Assert.Equal(30.0, instances[0].GetProperty("disk").GetDouble());
+        Assert.Equal(120, instances[0].GetProperty("hubConnections").GetInt32());
         foreach (var field in new[] { "cpu", "memory", "disk", "hubConnections" })
         {
-            Assert.Equal(JsonValueKind.Null, instances[0].GetProperty(field).ValueKind);
+            Assert.Equal(JsonValueKind.Null, instances[1].GetProperty(field).ValueKind);
         }
 
         var published = Assert.Single(h.Events.All, e => e.Channel == LoadEndpoints.OpsLoadChannel && e.Event == "fleet");
