@@ -223,7 +223,7 @@ public class BootstrapStepTests
     }
 
     [Fact]
-    public async Task CloudWatchConfig_disk_and_mem_measurements_unchanged()
+    public async Task CloudWatchConfig_disk_and_mem_measurements()
     {
         var host = new FakeLinuxHost();
         var options = Options();
@@ -241,7 +241,7 @@ public class BootstrapStepTests
             disk.GetProperty("resources").EnumerateArray().Select(e => e.GetString()).ToArray());
 
         var mem = collected.GetProperty("mem");
-        Assert.Equal(new[] { "mem_used_percent" },
+        Assert.Equal(new[] { "mem_used_percent", "mem_available_percent" },
             mem.GetProperty("measurement").EnumerateArray().Select(e => e.GetString()).ToArray());
     }
 

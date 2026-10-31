@@ -113,7 +113,12 @@ public sealed class CloudWatchAgentConfigStep : IBootstrapStep
                     },
                     ["mem"] = new JsonObject
                     {
-                        ["measurement"] = new JsonArray { "mem_used_percent" },
+                        // mem_used_percent is gopsutil used (total minus free, buffers,
+                        // cached and reclaimable slab): it counts shared memory the
+                        // kernel cannot reclaim as free. mem_available_percent is the
+                        // kernel MemAvailable, the figure the Node stats page uses and
+                        // the one that predicts an OOM, so the dashboard plots 100 - it.
+                        ["measurement"] = new JsonArray { "mem_used_percent", "mem_available_percent" },
                     },
                 },
             },
